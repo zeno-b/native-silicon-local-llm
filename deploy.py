@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-local_llm.py
+deploy.py
 
 All-in-one local LLM trainer/server/feedback loop for Apple Silicon.
 
@@ -17,10 +17,10 @@ Designed for:
    restart server
 
 Usage:
-   python3 local_llm.py --seed-demo
-   python3 local_llm.py --export-only --format csv
-   python3 local_llm.py --list-feedback
-   python3 local_llm.py --system-prompt "You are a pirate"
+   python3 deploy.py --seed-demo
+   python3 deploy.py --export-only --export-format csv
+   python3 deploy.py --list-feedback
+   python3 deploy.py --system-prompt "You are a pirate"
 
 Environment overrides:
    MODEL_ID, MODEL_PORT, WEB_PORT, TRAIN_ITERS, TRAIN_LR, TRAIN_SEQ_LEN,
@@ -41,6 +41,7 @@ import logging
 import os
 import platform
 import random
+import shutil
 import signal
 import socket
 import sqlite3
@@ -152,19 +153,27 @@ def ensure_dirs() -> None:
 
 
 class Database:
-    """Thread-safe SQLite manager with connection pooling."""
-
-    _local = threading.local()
+    """Thread-safe SQLite manager with one connection per thread."""
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
+        self._local = threading.local()
+        self._all_conns: list[sqlite3.Connection] = []
+        self._conns_lock = threading.Lock()
         self._init_db()
 
     def _connection(self) -> sqlite3.Connection:
-        if not hasattr(self._local, "conn") or self._local.conn is None:
-            self._local.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            self._local.conn.row_factory = sqlite3.Row
-        return self._local.conn
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+            self._local.conn = conn
+            with self._conns_lock:
+                self._all_conns.append(conn)
+        return conn
 
     def _init_db(self) -> None:
         with self._connection() as conn:
@@ -178,12 +187,22 @@ class Database:
                     corrected_response TEXT,
                     approved_for_training INTEGER DEFAULT 0,
                     session_id TEXT,
-                    model_id TEXT
+                    model_id TEXT,
+                    trained_at TIMESTAMP
                 )
             """)
+            # Migration: older databases predate trained_at.
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(feedback)")}
+            if "trained_at" not in columns:
+                log("Migrating feedback table: adding trained_at column.")
+                conn.execute("ALTER TABLE feedback ADD COLUMN trained_at TIMESTAMP")
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_feedback_approved 
                 ON feedback(approved_for_training)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_feedback_untrained
+                ON feedback(approved_for_training, trained_at)
             """)
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_feedback_created 
@@ -209,9 +228,15 @@ class Database:
         self._connection().commit()
 
     def close(self) -> None:
-        if hasattr(self._local, "conn") and self._local.conn:
-            self._local.conn.close()
-            self._local.conn = None
+        """Close every connection this Database has handed out, across all threads."""
+        with self._conns_lock:
+            conns, self._all_conns = self._all_conns, []
+        for conn in conns:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._local.conn = None
 
     def seed_demo(self) -> int:
         count = self.execute("SELECT COUNT(*) as cnt FROM feedback").fetchone()["cnt"]
@@ -259,19 +284,38 @@ class Database:
         positive = self.execute("SELECT COUNT(*) as cnt FROM feedback WHERE rating > 0").fetchone()["cnt"]
         negative = self.execute("SELECT COUNT(*) as cnt FROM feedback WHERE rating < 0").fetchone()["cnt"]
         corrected = self.execute("SELECT COUNT(*) as cnt FROM feedback WHERE corrected_response IS NOT NULL").fetchone()["cnt"]
+        untrained = self.execute(
+            "SELECT COUNT(*) as cnt FROM feedback "
+            "WHERE approved_for_training = 1 AND trained_at IS NULL"
+        ).fetchone()["cnt"]
         return {
             "total": total,
             "approved": approved,
+            "untrained": untrained,
             "positive": positive,
             "negative": negative,
             "corrected": corrected,
         }
 
     def get_untrained_count(self) -> int:
-        """Count feedback approved for training but not yet exported."""
+        """Count feedback approved for training that has not been trained on yet."""
         return self.execute(
-            "SELECT COUNT(*) as cnt FROM feedback WHERE approved_for_training = 1"
+            "SELECT COUNT(*) as cnt FROM feedback "
+            "WHERE approved_for_training = 1 AND trained_at IS NULL"
         ).fetchone()["cnt"]
+
+    def mark_trained(self, feedback_ids: list[int]) -> int:
+        """Stamp rows as trained so auto-retrain does not fire on them again."""
+        if not feedback_ids:
+            return 0
+        stamp = datetime.now(timezone.utc).isoformat()
+        placeholders = ",".join("?" for _ in feedback_ids)
+        cursor = self.execute(
+            f"UPDATE feedback SET trained_at = ? WHERE id IN ({placeholders})",
+            (stamp, *feedback_ids),
+        )
+        self.commit()
+        return cursor.rowcount
 
     def delete_feedback(self, feedback_id: int) -> bool:
         cursor = self.execute("DELETE FROM feedback WHERE id = ?", (feedback_id,))
@@ -297,8 +341,11 @@ def port_open(port: int) -> bool:
         return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
-def get_free_port(preferred: int) -> int:
+def get_free_port(preferred: int, exclude: set[int] | None = None) -> int:
+    exclude = exclude or set()
     for port in range(preferred, preferred + 100):
+        if port in exclude:
+            continue
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.bind(("127.0.0.1", port))
@@ -382,7 +429,7 @@ class ModelServerManager:
         self._server_help = help_cmd("mlx_lm.server")
         self._log_file: Any = None
         self._watchdog_thread: threading.Thread | None = None
-        self._stop_watchdog = threading.Event()
+        self._watchdog_stop = threading.Event()
 
     def _build_cmd(self, use_adapter: bool) -> list[str]:
         cmd = [sys.executable, "-m", "mlx_lm.server"]
@@ -395,13 +442,17 @@ class ModelServerManager:
         return cmd
 
     def _start_watchdog(self) -> None:
-        self._stop_watchdog.clear()
+        # A restart triggered from inside the watchdog thread must not spawn a second one.
+        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+            self._watchdog_stop.clear()
+            return
+        self._watchdog_stop.clear()
         self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
         self._watchdog_thread.start()
 
     def _watchdog_loop(self) -> None:
         """Auto-restart model server if it crashes unexpectedly."""
-        while not self._stop_watchdog.wait(5):
+        while not self._watchdog_stop.wait(5):
             with self.lock:
                 if self.status == "ready" and self.proc is not None and self.proc.poll() is not None:
                     log("Watchdog: Model server crashed, restarting...", logging.WARNING)
@@ -413,9 +464,12 @@ class ModelServerManager:
                         self.status = f"error: {exc}"
 
     def _stop_watchdog(self) -> None:
-        self._stop_watchdog.set()
-        if self._watchdog_thread:
-            self._watchdog_thread.join(timeout=2)
+        self._watchdog_stop.set()
+        thread = self._watchdog_thread
+        # stop() can be reached from inside the watchdog loop; joining self raises.
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2)
+            self._watchdog_thread = None
 
     def stop(self) -> None:
         self._stop_watchdog()
@@ -425,18 +479,25 @@ class ModelServerManager:
                 self.proc.terminate()
                 try:
                     self.proc.wait(timeout=10)
-                except Exception:
+                except subprocess.TimeoutExpired:
                     self.proc.kill()
                     try:
                         self.proc.wait(timeout=5)
-                    except Exception:
-                        pass
+                    except subprocess.TimeoutExpired:
+                        log("Model server did not exit after SIGKILL.", logging.WARNING)
             self.proc = None
             self.status = "stopped"
-            if self._log_file:
+            self._close_log_file()
+        # Give the OS a moment to release the port. Done outside the lock.
+        time.sleep(0.5)
+
+    def _close_log_file(self) -> None:
+        if self._log_file is not None:
+            try:
                 self._log_file.close()
-                self._log_file = None
-            time.sleep(0.5)
+            except Exception:
+                pass
+            self._log_file = None
 
     def _start_internal(self) -> None:
         """Internal start without lock acquisition (caller must hold lock)."""
@@ -448,6 +509,7 @@ class ModelServerManager:
         last_error: Exception | None = None
         for cmd in candidates:
             log("Starting model server: " + " ".join(cmd))
+            self._close_log_file()
             self._log_file = open(LOG_DIR / "model_server.log", "ab")
             proc = subprocess.Popen(cmd, stdout=self._log_file, stderr=subprocess.STDOUT)
             time.sleep(2)
@@ -464,13 +526,14 @@ class ModelServerManager:
                     last_error = exc
                     self.stop()
             else:
+                self._close_log_file()
                 last_error = RuntimeError(
                     f"Model server exited immediately with code {proc.returncode}. "
                     "Check logs/model_server.log."
                 )
 
         self.status = f"error: {last_error}"
-        raise last_error if last_error else RuntimeError("Failed to start model server.")
+        raise last_error or RuntimeError("Failed to start model server.")
 
     def start(self) -> None:
         with self.lock:
@@ -521,11 +584,29 @@ class RetrainManager:
         """Backup current adapter before retraining."""
         if not adapter_ready():
             return None
+        ADAPTER_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
         backup_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         backup_path = ADAPTER_BACKUP_DIR / backup_id
+        # Two retrains inside the same second would collide on the timestamp.
+        suffix = 1
+        while backup_path.exists():
+            backup_path = ADAPTER_BACKUP_DIR / f"{backup_id}_{suffix}"
+            suffix += 1
         shutil.copytree(ADAPTER_DIR, backup_path)
         log(f"Adapter backed up to {backup_path}")
         return backup_path
+
+    def _rollback_adapter(self, backup_path: Path | None) -> None:
+        """Restore the pre-training adapter after a failed run."""
+        if backup_path is None or not backup_path.exists():
+            return
+        try:
+            if ADAPTER_DIR.exists():
+                shutil.rmtree(ADAPTER_DIR)
+            shutil.copytree(backup_path, ADAPTER_DIR)
+            log(f"Rolled back adapter from {backup_path}", logging.WARNING)
+        except Exception as exc:
+            log(f"Adapter rollback failed: {exc}", logging.ERROR)
 
     def _build_cmd(self) -> list[str]:
         cmd = [sys.executable, "-m", "mlx_lm.lora"]
@@ -545,13 +626,16 @@ class RetrainManager:
         add_if_supported(cmd, self._lora_help, ["--max-seq-length", "--seq-length", "--max-seq-len"], self.config.train_seq_len)
         return cmd
 
-    def export_feedback(self) -> int:
+    def export_feedback(self) -> tuple[int, list[int]]:
+        """Write train/valid JSONL. Returns (example count, contributing feedback ids)."""
         rows = self.db.execute("""
-            SELECT user_prompt, assistant_response, corrected_response, rating
+            SELECT id, user_prompt, assistant_response, corrected_response, rating
             FROM feedback WHERE approved_for_training = 1
+            ORDER BY id
         """).fetchall()
 
         examples = []
+        exported_ids: list[int] = []
         seen = set()
         for row in rows:
             user_prompt = (row["user_prompt"] or "").strip()
@@ -560,8 +644,11 @@ class RetrainManager:
                 continue
             key = (user_prompt, assistant_response)
             if key in seen:
+                # Duplicate content still counts as consumed, or it retriggers forever.
+                exported_ids.append(row["id"])
                 continue
             seen.add(key)
+            exported_ids.append(row["id"])
             examples.append({
                 "messages": [
                     {"role": "system", "content": self.config.system_prompt},
@@ -571,7 +658,7 @@ class RetrainManager:
             })
 
         if not examples:
-            return 0
+            return 0, []
 
         random.seed(42)
         random.shuffle(examples)
@@ -589,21 +676,22 @@ class RetrainManager:
         train_path.write_text(train_text, encoding="utf-8")
         valid_path.write_text(valid_text, encoding="utf-8")
 
-        return len(examples)
+        return len(examples), exported_ids
 
     def run(self, trigger: str = "manual") -> None:
         if not self.lock.acquire(blocking=False):
             return
 
+        backup_path: Path | None = None
         try:
             self.status = {"running": True, "message": f"Retraining started from {trigger}"}
 
-            count = self.export_feedback()
+            count, exported_ids = self.export_feedback()
             if count == 0:
                 self.status = {"running": False, "message": "No approved feedback available for training."}
                 return
 
-            self._backup_adapter()
+            backup_path = self._backup_adapter()
 
             self.status["message"] = f"Exported {count} examples. Stopping model server."
             self.model_manager.stop()
@@ -613,7 +701,7 @@ class RetrainManager:
 
             self.status["message"] = "Training LoRA adapter..."
 
-            with open(train_log, "ab", encoding="utf-8") as lf:
+            with open(train_log, "a", encoding="utf-8") as lf:
                 lf.write(f"\n\n{datetime.now(timezone.utc).isoformat()} Training command:\n{' '.join(cmd)}\n")
                 lf.flush()
 
@@ -621,12 +709,16 @@ class RetrainManager:
                 if proc.returncode != 0:
                     raise RuntimeError(f"Training failed with exit code {proc.returncode}. See logs/train.log.")
 
+            self.db.mark_trained(exported_ids)
+
             self.status["message"] = "Training complete. Restarting model server."
             self.model_manager.restart()
 
-            self.status = {"running": False, "message": "Retraining complete."}
+            self.status = {"running": False, "message": f"Retraining complete on {count} examples."}
 
         except Exception as exc:
+            log(f"Retrain failed: {exc}", logging.ERROR)
+            self._rollback_adapter(backup_path)
             self.status = {"running": False, "message": f"Retrain error: {exc}"}
             try:
                 self.model_manager.start()
@@ -946,7 +1038,8 @@ HTML_PAGE = """
        let msg = "Model: " + (data.model_status || "unknown");
        msg += "\\nRetrain: " + (data.retrain?.message || "idle");
        if (data.stats) {
-         msg += "\\nFeedback: " + data.stats.total + " total, " + data.stats.approved + " approved";
+         msg += "\\nFeedback: " + data.stats.total + " total, " + data.stats.approved
+              + " approved, " + data.stats.untrained + " untrained";
        }
        statusEl.textContent = msg;
        statusEl.className = "";
@@ -966,36 +1059,65 @@ HTML_PAGE = """
 """
 
 
+# Request/response models are bound at module scope by _define_api_models().
+# They cannot be plain module-level class statements because pydantic is not
+# installed until bootstrap() has run.
+ChatRequest: Any = None
+FeedbackRequest: Any = None
+ChatResponse: Any = None
+
+
+def _define_api_models() -> None:
+    """Define the Pydantic models in the module namespace.
+
+    This module uses `from __future__ import annotations`, so every parameter
+    annotation is a string at runtime. FastAPI resolves those strings against the
+    endpoint function's __globals__, which is the module namespace. Models defined
+    inside create_app() are invisible there, so FastAPI silently falls back to
+    treating the body parameter as a query parameter and every POST returns 422.
+    """
+    global ChatRequest, FeedbackRequest, ChatResponse
+    if ChatRequest is not None:
+        return
+    from pydantic import BaseModel, Field
+
+    class ChatRequest(BaseModel):  # noqa: F811
+        message: str = Field(..., min_length=1, max_length=4000)
+
+    class FeedbackRequest(BaseModel):  # noqa: F811
+        user_prompt: str = Field(..., min_length=1)
+        assistant_response: str = Field(..., min_length=1)
+        rating: int = Field(0, ge=-1, le=1)
+        corrected_response: str | None = None
+
+    class ChatResponse(BaseModel):  # noqa: F811
+        answer: str
+
+
 def create_app(config: Config, db: Database, model_manager: ModelServerManager, retrain_manager: RetrainManager):
     """Create and configure the FastAPI application with Pydantic validation."""
     import httpx
     from fastapi import FastAPI, Query
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-    from pydantic import BaseModel, Field, validator
+
+    _define_api_models()
 
     app = FastAPI(title="Local LLM")
 
+    # The UI is same-origin, so only the loopback origins this process serves are allowed.
+    # A wildcard here would let any site the user visits drive /api/retrain and
+    # DELETE /api/feedback on their machine.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=[
+            f"http://127.0.0.1:{config.web_port}",
+            f"http://localhost:{config.web_port}",
+        ],
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "DELETE"],
+        allow_headers=["Content-Type"],
     )
-
-    # Pydantic models
-    class ChatRequest(BaseModel):
-        message: str = Field(..., min_length=1, max_length=4000)
-
-    class FeedbackRequest(BaseModel):
-        user_prompt: str = Field(..., min_length=1)
-        assistant_response: str = Field(..., min_length=1)
-        rating: int = Field(0, ge=-1, le=1)
-        corrected_response: str | None = None
-
-    class ChatResponse(BaseModel):
-        answer: str
 
     @app.get("/", response_class=HTMLResponse)
     def index():
@@ -1100,7 +1222,8 @@ def create_app(config: Config, db: Database, model_manager: ModelServerManager, 
                 async with httpx.AsyncClient(timeout=600) as client:
                     async with client.stream("POST", url, json=payload) as response:
                         if response.status_code != 200:
-                            yield f"data: {json.dumps({'error': await response.aread()})}\n\n"
+                            body = (await response.aread()).decode("utf-8", "replace")
+                            yield f"data: {json.dumps({'error': body})}\n\n"
                             return
 
                         async for line in response.aiter_lines():
@@ -1195,6 +1318,8 @@ def main() -> None:
     parser.add_argument("--model-port", type=int, default=int(os.environ.get("MODEL_PORT", "8080")))
     parser.add_argument("--web-port", type=int, default=int(os.environ.get("WEB_PORT", "8000")))
     parser.add_argument("--train-iters", type=int, default=int(os.environ.get("TRAIN_ITERS", "30")))
+    parser.add_argument("--train-lr", default=os.environ.get("TRAIN_LR", "1e-4"))
+    parser.add_argument("--train-seq-len", default=os.environ.get("TRAIN_SEQ_LEN", "256"))
     parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("MAX_TOKENS", "128")))
     parser.add_argument("--auto-retrain-threshold", type=int, default=int(os.environ.get("AUTO_RETRAIN_THRESHOLD", "0")))
     parser.add_argument("--seed-demo", action="store_true")
@@ -1215,6 +1340,8 @@ def main() -> None:
         model_port=args.model_port,
         web_port=args.web_port,
         train_iters=args.train_iters,
+        train_lr=args.train_lr,
+        train_seq_len=args.train_seq_len,
         max_tokens=args.max_tokens,
         auto_retrain_threshold=args.auto_retrain_threshold,
         seed_demo=args.seed_demo,
@@ -1225,7 +1352,7 @@ def main() -> None:
     )
 
     config.model_port = get_free_port(config.model_port)
-    config.web_port = get_free_port(config.web_port)
+    config.web_port = get_free_port(config.web_port, exclude={config.model_port})
 
     db = Database(DB_PATH)
 
@@ -1247,7 +1374,7 @@ def main() -> None:
     retrain_manager = RetrainManager(db, model_manager, config)
 
     if config.export_only:
-        count = retrain_manager.export_feedback()
+        count, _ = retrain_manager.export_feedback()
         log(f"Exported {count} training examples to {SFT_DIR}")
         if config.export_format == "csv":
             csv_count = export_to_csv(db, DATA_DIR / "feedback_export.csv")
