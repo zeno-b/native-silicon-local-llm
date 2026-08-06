@@ -72,6 +72,10 @@ DEFAULT_SYSTEM_PROMPT = os.environ.get(
     "You are a helpful local assistant.",
 )
 
+# Bump when HTML_PAGE changes. Shown in the header and returned by /api/health so
+# a stale browser cache is immediately visible rather than silently misleading.
+UI_BUILD = "2026-08-06.3"
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -872,7 +876,7 @@ HTML_PAGE = """
 </head>
 <body>
  <header>
-   <div><strong>Local LLM</strong></div>
+   <div><strong>Local LLM</strong> <span style="color:#666;font-size:11px">build {{UI_BUILD}}</span></div>
    <div id="status">Starting...</div>
    <button onclick="retrain()">Retrain</button>
  </header>
@@ -1048,6 +1052,10 @@ HTML_PAGE = """
      try {
        const {data} = await fetchJSON("/api/health");
        let msg = "Model: " + (data.model_status || "unknown");
+       if (data.ui_build && data.ui_build !== "{{UI_BUILD}}") {
+         msg = "STALE PAGE: server is build " + data.ui_build +
+               ", this tab is {{UI_BUILD}}. Hard-reload.\n" + msg;
+       }
        msg += "\\nRetrain: " + (data.retrain?.message || "idle");
        if (data.stats) {
          msg += "\\nFeedback: " + data.stats.total + " total, " + data.stats.approved
@@ -1131,14 +1139,26 @@ def create_app(config: Config, db: Database, model_manager: ModelServerManager, 
         allow_headers=["Content-Type"],
     )
 
+    # The UI is embedded in this file, so a cached copy silently defeats every
+    # edit to HTML_PAGE. Nothing here is worth caching on a local dev server.
+    @app.middleware("http")
+    async def no_cache(request, call_next):
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        return response
+
     @app.get("/", response_class=HTMLResponse)
     def index():
-        return HTML_PAGE
+        return HTMLResponse(content=HTML_PAGE.replace("{{UI_BUILD}}", UI_BUILD))
 
     @app.get("/api/health")
     async def health():
         model_healthy = await model_manager.health_probe() if model_manager.is_alive() else False
         return {
+            "ui_build": UI_BUILD,
+            "web_port": config.web_port,
+            "model_port": config.model_port,
             "model_status": model_manager.status,
             "model_process_alive": model_manager.is_alive(),
             "model_healthy": model_healthy,
@@ -1321,6 +1341,43 @@ def export_to_csv(db: Database, path: Path) -> int:
     return len(rows)
 
 
+def doctor(web_port: int, model_port: int) -> None:
+    """Probe the loopback ports and report what is actually answering on each."""
+    import urllib.error
+    import urllib.request
+
+    def probe(port: int, path: str) -> str:
+        url = f"http://127.0.0.1:{port}{path}"
+        req = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return f"{resp.status} {resp.headers.get('Content-Type')} {resp.read(90)!r}"
+        except urllib.error.HTTPError as exc:
+            return f"{exc.code} {exc.headers.get('Content-Type')} {exc.read(90)!r}"
+        except Exception as exc:
+            return f"no response ({exc})"
+
+    print(f"python      : {sys.version.split()[0]} ({platform.machine()}, {platform.system()})")
+    print(f"script      : {Path(__file__).resolve()}")
+    print(f"ui build    : {UI_BUILD}")
+    print(f"in venv     : {in_venv()}  ({sys.prefix})")
+
+    print(f"\nweb UI port {web_port}: {'LISTENING' if port_open(web_port) else 'CLOSED'}")
+    if port_open(web_port):
+        for path in ["/", "/api/health"]:
+            print(f"  GET {path:14} -> {probe(web_port, path)}")
+
+    print(f"\nmodel port {model_port}: {'LISTENING' if port_open(model_port) else 'CLOSED'}")
+    if port_open(model_port):
+        print(f"  GET {'/v1/models':14} -> {probe(model_port, '/v1/models')}")
+        print(f"  GET {'/':14} -> {probe(model_port, '/')}")
+
+    others = [p for p in range(8000, 8101) if p not in (web_port, model_port) and port_open(p)]
+    print(f"\nother loopback listeners in 8000-8100: {others or 'none'}")
+    print("\nA healthy web UI answers GET / with 200 text/html and")
+    print("GET /api/health with 200 application/json. Anything else is the wrong port.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="All-in-one local LLM server, chat UI, feedback, and retraining loop."
@@ -1338,8 +1395,16 @@ def main() -> None:
     parser.add_argument("--retrain-now", action="store_true")
     parser.add_argument("--export-only", action="store_true")
     parser.add_argument("--list-feedback", action="store_true")
+    parser.add_argument("--doctor", action="store_true",
+                        help="Probe the ports and report what is actually listening, then exit.")
     parser.add_argument("--export-format", choices=["jsonl", "csv"], default="jsonl")
     args = parser.parse_args()
+
+    # Must run before get_free_port(), which deliberately returns *unused* ports
+    # and would therefore report on the wrong ones.
+    if args.doctor:
+        doctor(args.web_port, args.model_port)
+        return
 
     bootstrap()
     import uvicorn
