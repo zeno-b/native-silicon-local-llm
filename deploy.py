@@ -939,6 +939,23 @@ HTML_PAGE = """
      chat.scrollTop = chat.scrollHeight;
    }
 
+   // Any non-JSON body must surface as a readable message. A bare "Not Found"
+   // means the request reached the mlx model server, not this web UI.
+   async function fetchJSON(url, options) {
+     const res = await fetch(url, options);
+     const raw = await res.text();
+     if (!raw) return {res: res, data: {}};
+     try {
+       return {res: res, data: JSON.parse(raw)};
+     } catch (err) {
+       throw new Error(
+         "HTTP " + res.status + " from " + (res.url || url) +
+         " returned non-JSON, so this page is probably talking to the model " +
+         "server instead of the web UI. Body: " + raw.slice(0, 200)
+       );
+     }
+   }
+
    async function send() {
      const message = input.value.trim();
      if (!message) return;
@@ -958,14 +975,13 @@ HTML_PAGE = """
      chat.scrollTop = chat.scrollHeight;
 
      try {
-       const res = await fetch("/api/chat", {
+       const {res, data} = await fetchJSON("/api/chat", {
          method: "POST",
          headers: {"Content-Type": "application/json"},
          body: JSON.stringify({message: message})
        });
        typing.remove();
 
-       const data = await res.json();
        if (!res.ok || data.error) {
          addMessage("assistant", "Error: " + (data.error || res.statusText));
        } else {
@@ -973,7 +989,7 @@ HTML_PAGE = """
        }
      } catch (err) {
        typing.remove();
-       addMessage("assistant", "Error: " + err);
+       addMessage("assistant", "Error: " + err.message);
      } finally {
        sendBtn.disabled = false;
        input.focus();
@@ -982,7 +998,7 @@ HTML_PAGE = """
 
    async function vote(userPrompt, assistantResponse, rating) {
      try {
-       const res = await fetch("/api/feedback", {
+       const {data} = await fetchJSON("/api/feedback", {
          method: "POST",
          headers: {"Content-Type": "application/json"},
          body: JSON.stringify({
@@ -992,10 +1008,9 @@ HTML_PAGE = """
            corrected_response: null
          })
        });
-       const data = await res.json();
        addSystem(data.status || "Feedback saved.");
      } catch (err) {
-       addSystem("Feedback error: " + err);
+       addSystem("Feedback error: " + err.message);
      }
    }
 
@@ -1003,7 +1018,7 @@ HTML_PAGE = """
      const corrected = window.prompt("Corrected answer:", assistantResponse);
      if (corrected === null) return;
      try {
-       const res = await fetch("/api/feedback", {
+       const {data} = await fetchJSON("/api/feedback", {
          method: "POST",
          headers: {"Content-Type": "application/json"},
          body: JSON.stringify({
@@ -1013,28 +1028,25 @@ HTML_PAGE = """
            corrected_response: corrected
          })
        });
-       const data = await res.json();
        addSystem(data.status || "Correction saved.");
      } catch (err) {
-       addSystem("Correction error: " + err);
+       addSystem("Correction error: " + err.message);
      }
    }
 
    async function retrain() {
      if (!window.confirm("Start retraining? The model server will be stopped temporarily.")) return;
      try {
-       const res = await fetch("/api/retrain", {method: "POST"});
-       const data = await res.json();
+       const {data} = await fetchJSON("/api/retrain", {method: "POST"});
        addSystem(data.status || JSON.stringify(data));
      } catch (err) {
-       addSystem("Retrain error: " + err);
+       addSystem("Retrain error: " + err.message);
      }
    }
 
    async function refreshHealth() {
      try {
-       const res = await fetch("/api/health");
-       const data = await res.json();
+       const {data} = await fetchJSON("/api/health");
        let msg = "Model: " + (data.model_status || "unknown");
        msg += "\\nRetrain: " + (data.retrain?.message || "idle");
        if (data.stats) {
@@ -1046,7 +1058,7 @@ HTML_PAGE = """
        if (data.model_status?.startsWith("error")) statusEl.className = "error";
        else if (data.model_status === "starting") statusEl.className = "warn";
      } catch (err) {
-       statusEl.textContent = "Status unavailable";
+       statusEl.textContent = "Status unavailable: " + err.message;
        statusEl.className = "error";
      }
    }
@@ -1394,8 +1406,11 @@ def main() -> None:
 
     log(f"Model: {config.model}")
     log(f"System prompt: {config.system_prompt[:60]}...")
-    log(f"Model port: {config.model_port}")
-    log(f"Web UI: http://127.0.0.1:{config.web_port}")
+    log("=" * 62)
+    log(f"  OPEN THIS IN YOUR BROWSER:  http://127.0.0.1:{config.web_port}")
+    log(f"  Model backend (not a UI):   http://127.0.0.1:{config.model_port}")
+    log("=" * 62)
+    log("Ports shift automatically when the preferred one is busy, so use the URL above.")
     log("Starting model server. First run may download the model.")
 
     try:
