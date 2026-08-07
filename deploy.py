@@ -24,8 +24,28 @@ Usage:
    python3 deploy.py --agent --context-size 8192 --max-tokens 512
    python3 deploy.py --tool-test web_search --tool-args '{"query": "mlx lora"}'
    python3 deploy.py --list-models
+   python3 deploy.py --bench
    python3 deploy.py --model mlx-community/Qwen2.5-1.5B-Instruct-4bit --adapter none
    python3 deploy.py --add-task '{"name": "news", "goal": "Search for MLX news", "interval_seconds": 3600}'
+
+Performance notes for an 8GB machine:
+- The dominant cost in a multi-step agent run is re-prefill, not decode. The
+  whole prompt is re-sent every step, so total prefill is quadratic in the step
+  count. Run --bench to see the curve on your hardware, and watch
+  /api/metrics/run/<conversation_id> for prompt tokens climbing step over step.
+- What attacks that: a small tool catalogue (AGENT_TOOLS, or per-task tools),
+  small tool results in context (TOOL_RESULT_CHARS), summarising long results
+  instead of truncating them, and a stable prompt prefix (STABLE_PREFIX) so a
+  server-side prompt cache can reuse the previous step.
+- Reasoning models (Qwen3.5 and later) think by default. In a tool loop that is
+  pure cost, so DISABLE_THINKING is on and any <think> block that arrives is
+  stripped before the reply is parsed.
+- Quantization damages format adherence before it damages knowledge, and the
+  tool loop depends on format adherence. An 8-bit small model can beat a 4-bit
+  larger one at agent work. Both are in the catalogue so you can measure it.
+- Tasks may name their own model. Interactive chat wants a small fast model; a
+  scheduled 3am task has nobody waiting and can afford a bigger one. The task
+  swaps up, runs, and swaps back.
 
 Environment overrides:
    MODEL_ID, MODEL_PORT, WEB_PORT, TRAIN_ITERS, TRAIN_LR, TRAIN_SEQ_LEN,
@@ -36,7 +56,11 @@ Environment overrides:
    ADAPTER (latest|none|<backup id>), MODEL_CATALOG,
    MAX_CONCURRENT_TASKS, TASK_POLL_SECONDS,
    SEARCH_BACKEND (ddg|brave|tavily|searxng), SEARCH_RESULTS,
-   TOOL_TIMEOUT, TOOL_RESULT_CHARS,
+   TOOL_TIMEOUT, TOOL_RESULT_CHARS, TOOL_RAW_CHARS,
+   DISABLE_THINKING, TOOL_TEMPERATURE, FAST_PATH, STABLE_PREFIX,
+   SUMMARISE_TOOL_RESULTS, SUMMARISE_OVER_CHARS, CHAT_IDLE_SECONDS,
+   KV_BITS, KV_GROUP_SIZE, QUANTIZED_KV_START, PROMPT_CACHE_DIR,
+   TRAIN_NUM_LAYERS, TRAIN_ON_TOOL_CALLS, TRAIN_TOOL_EXAMPLES,
    BRAVE_API_KEY, TAVILY_API_KEY, SEARXNG_URL
 
 Notes:
@@ -47,6 +71,9 @@ Notes:
 - run_python and run_shell are off unless you pass --allow-python/--allow-shell.
   They are not sandboxed: the model gets the same rights as the user running it.
 - Retraining stops the model server temporarily, trains, then restarts it.
+- Training now also learns from logged tool calls, not just thumbs-up feedback.
+  Format adherence is what small models fail at, and those rows are this app's
+  own schema in its own wording.
 - Tasks are agent runs that happen on their own: give one a goal and an
   interval, and the scheduler runs it and keeps every step of every run. The
   Tasks tab in the web UI streams a live run and replays finished ones.
@@ -64,6 +91,7 @@ import ast
 import asyncio
 import csv
 import html
+import hashlib
 import json
 import logging
 import math
@@ -116,7 +144,7 @@ CONTEXT_SAFETY_MARGIN = 256
 
 # Bump when HTML_PAGE changes. Shown in the header and returned by /api/health so
 # a stale browser cache is immediately visible rather than silently misleading.
-UI_BUILD = "2026-08-07.6-tasks"
+UI_BUILD = "2026-08-07.8-curve"
 
 # Setup logging
 logging.basicConfig(
@@ -347,8 +375,28 @@ class Database:
                     endpoint TEXT,
                     duration_ms REAL,
                     status_code INTEGER,
-                    error TEXT
+                    error TEXT,
+                    prompt_tokens INTEGER,
+                    completion_tokens INTEGER,
+                    ttft_ms REAL,
+                    decode_tps REAL,
+                    model TEXT,
+                    step INTEGER,
+                    conversation_id TEXT
                 )
+            """)
+            # Migration: older databases have the four-column metrics table.
+            metric_columns = {row["name"] for row in conn.execute("PRAGMA table_info(metrics)")}
+            for column, ddl in (
+                ("prompt_tokens", "INTEGER"), ("completion_tokens", "INTEGER"),
+                ("ttft_ms", "REAL"), ("decode_tps", "REAL"), ("model", "TEXT"),
+                ("step", "INTEGER"), ("conversation_id", "TEXT"),
+            ):
+                if column not in metric_columns:
+                    conn.execute(f"ALTER TABLE metrics ADD COLUMN {column} {ddl}")
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_metrics_endpoint
+                ON metrics(endpoint, timestamp)
             """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
@@ -392,6 +440,8 @@ class Database:
                     tools TEXT DEFAULT '',
                     system_prompt TEXT,
                     use_history INTEGER DEFAULT 0,
+                    model TEXT,
+                    next_task_id TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_run_at TIMESTAMP,
@@ -401,6 +451,11 @@ class Database:
                     last_answer TEXT
                 )
             """)
+            # Migration: model override and chaining came later.
+            task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+            for column in ("model", "next_task_id"):
+                if column not in task_columns:
+                    conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} TEXT")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS task_runs (
                     id TEXT PRIMARY KEY,
@@ -663,7 +718,7 @@ class Database:
 
     TASK_FIELDS = (
         "name", "goal", "enabled", "interval_seconds", "max_steps",
-        "tools", "system_prompt", "use_history",
+        "tools", "system_prompt", "use_history", "model", "next_task_id",
     )
 
     def create_task(self, **fields: Any) -> dict:
@@ -675,8 +730,8 @@ class Database:
         next_run = iso(utc_now()) if (enabled and interval > 0) else None
         self.execute(
             "INSERT INTO tasks (id, name, goal, enabled, interval_seconds, max_steps, "
-            "tools, system_prompt, use_history, next_run_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "tools, system_prompt, use_history, model, next_task_id, next_run_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 str(fields.get("name") or "task").strip()[:120],
@@ -687,6 +742,8 @@ class Database:
                 str(fields.get("tools") or ""),
                 fields.get("system_prompt"),
                 1 if fields.get("use_history") else 0,
+                fields.get("model") or None,
+                fields.get("next_task_id") or None,
                 next_run,
             ),
         )
@@ -714,6 +771,8 @@ class Database:
                 value = 1 if value else 0
             elif key in ("interval_seconds", "max_steps"):
                 value = int(value)
+            elif key in ("model", "next_task_id"):
+                value = str(value).strip() or None
             sets.append(f"{key} = ?")
             params.append(value)
         if not sets:
@@ -873,12 +932,68 @@ class Database:
         self.commit()
         return cursor.rowcount > 0
 
-    def log_metric(self, endpoint: str, duration_ms: float, status_code: int, error: str | None = None) -> None:
+    def log_metric(
+        self,
+        endpoint: str,
+        duration_ms: float,
+        status_code: int,
+        error: str | None = None,
+        stats: "GenerationStats | None" = None,
+        model: str | None = None,
+        step: int | None = None,
+        conversation_id: str | None = None,
+    ) -> None:
         self.execute(
-            "INSERT INTO metrics (endpoint, duration_ms, status_code, error) VALUES (?, ?, ?, ?)",
-            (endpoint, duration_ms, status_code, error),
+            "INSERT INTO metrics (endpoint, duration_ms, status_code, error, prompt_tokens, "
+            "completion_tokens, ttft_ms, decode_tps, model, step, conversation_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                endpoint, duration_ms, status_code, error,
+                stats.prompt_tokens if stats else None,
+                stats.completion_tokens if stats else None,
+                round(stats.ttft_ms, 1) if stats and stats.ttft_ms else None,
+                round(stats.decode_tps, 2) if stats and stats.decode_tps else None,
+                model, step, conversation_id,
+            ),
         )
         self.commit()
+
+    def metric_summary(self, endpoint: str | None = None, limit: int = 500) -> dict:
+        """Aggregate the recent metrics. This is what tells you if a change helped."""
+        clause = "WHERE endpoint = ?" if endpoint else ""
+        params: tuple = (endpoint, limit) if endpoint else (limit,)
+        rows = self.execute(
+            f"SELECT * FROM (SELECT * FROM metrics {clause} ORDER BY id DESC LIMIT ?)",
+            params,
+        ).fetchall()
+        if not rows:
+            return {"samples": 0}
+
+        def mean(key: str) -> float | None:
+            values = [row[key] for row in rows if row[key] is not None]
+            return round(sum(values) / len(values), 2) if values else None
+
+        prompts = [row["prompt_tokens"] for row in rows if row["prompt_tokens"] is not None]
+        return {
+            "samples": len(rows),
+            "avg_duration_ms": mean("duration_ms"),
+            "avg_prompt_tokens": mean("prompt_tokens"),
+            "avg_completion_tokens": mean("completion_tokens"),
+            "avg_ttft_ms": mean("ttft_ms"),
+            "avg_decode_tps": mean("decode_tps"),
+            "total_prompt_tokens": sum(prompts) if prompts else 0,
+            "errors": sum(1 for row in rows if row["error"]),
+        }
+
+    def run_step_metrics(self, conversation_id: str, limit: int = 50) -> list[dict]:
+        """Per-step prompt token counts, so re-prefill growth is visible as a curve."""
+        rows = self.execute(
+            "SELECT step, prompt_tokens, completion_tokens, ttft_ms, decode_tps, duration_ms "
+            "FROM metrics WHERE conversation_id = ? AND step IS NOT NULL "
+            "ORDER BY id DESC LIMIT ?",
+            (conversation_id, limit),
+        ).fetchall()
+        return [dict(row) for row in reversed(rows)]
 
 
 LOG_FILES = {"model": "model_server.log", "train": "train.log", "tasks": "tasks.log"}
@@ -1199,16 +1314,28 @@ def resolve_adapter(choice: str | None) -> Path | None:
     return candidate
 
 
-# Small enough to run on 8GB alongside the web process. Anything on Hugging Face
-# works too; the UI accepts a free-text repo id.
+# Small enough to run on 8GB alongside the web process. Anything on Hugging
+# Face works too; the UI accepts a free-text repo id, so this list is a
+# convenience rather than a limit. Sizes are the 4-bit download, roughly.
+#
+# Two notes that matter more than the ordering:
+#   - Quantization damages instruction-following and strict format adherence
+#     earlier than it damages world knowledge, and format adherence is exactly
+#     what the tool loop depends on. An 8-bit 1.5B can beat a 4-bit 4B at
+#     agent work even when every general benchmark says otherwise. The 8-bit
+#     entries below are here to make that easy to test.
+#   - Qwen3.5 and later are reasoning models with thinking on by default.
+#     disable_thinking (on by default) turns it off, and the agent strips any
+#     <think> block that arrives anyway.
 DEFAULT_MODEL_CATALOG = [
-    "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
-    "mlx-community/Qwen2.5-1.5B-Instruct-4bit",
-    "mlx-community/Qwen2.5-3B-Instruct-4bit",
-    "mlx-community/Llama-3.2-1B-Instruct-4bit",
-    "mlx-community/Llama-3.2-3B-Instruct-4bit",
-    "mlx-community/Phi-3.5-mini-instruct-4bit",
-    "mlx-community/gemma-2-2b-it-4bit",
+    "mlx-community/Qwen3.5-4B-OptiQ-4bit",       # ~2.5GB, mixed precision, agent-calibrated
+    "mlx-community/Qwen3.5-4B-MLX-4bit",         # ~2.5GB, stock uniform 4-bit
+    "mlx-community/Qwen2.5-3B-Instruct-4bit",    # ~1.7GB, no thinking mode
+    "mlx-community/Qwen2.5-1.5B-Instruct-8bit",  # ~1.6GB, 8-bit: better format adherence
+    "mlx-community/Qwen2.5-1.5B-Instruct-4bit",  # ~0.9GB
+    "mlx-community/Llama-3.2-3B-Instruct-4bit",  # ~1.8GB
+    "mlx-community/Llama-3.2-1B-Instruct-4bit",  # ~0.8GB
+    "mlx-community/Qwen2.5-0.5B-Instruct-4bit",  # ~0.4GB, fastest, weakest at tools
 ]
 
 
@@ -1256,9 +1383,16 @@ class Config:
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     model_port: int = field(default_factory=lambda: int(os.environ.get("MODEL_PORT", "8080")))
     web_port: int = field(default_factory=lambda: int(os.environ.get("WEB_PORT", "8000")))
-    train_iters: int = field(default_factory=lambda: int(os.environ.get("TRAIN_ITERS", "30")))
-    train_lr: str = field(default_factory=lambda: os.environ.get("TRAIN_LR", "1e-4"))
-    train_seq_len: str = field(default_factory=lambda: os.environ.get("TRAIN_SEQ_LEN", "256"))
+    # 30 iterations is a warmup, not a fine-tune. A format tune needs a few
+    # hundred passes over a hundred-odd examples to change anything.
+    train_iters: int = field(default_factory=lambda: int(os.environ.get("TRAIN_ITERS", "300")))
+    train_lr: str = field(default_factory=lambda: os.environ.get("TRAIN_LR", "3e-5"))
+    train_seq_len: str = field(default_factory=lambda: os.environ.get("TRAIN_SEQ_LEN", "512"))
+    # Tuning only the top layers is what keeps a 3B trainable on 8GB while the
+    # web process and the page cache are also resident.
+    train_num_layers: int = field(default_factory=lambda: int(os.environ.get("TRAIN_NUM_LAYERS", "8")))
+    train_on_tool_calls: bool = field(default_factory=lambda: os.environ.get("TRAIN_ON_TOOL_CALLS", "1") == "1")
+    train_tool_examples: int = field(default_factory=lambda: int(os.environ.get("TRAIN_TOOL_EXAMPLES", "400")))
     max_tokens: int = field(default_factory=lambda: int(os.environ.get("MAX_TOKENS", "512")))
     auto_retrain_threshold: int = field(default_factory=lambda: int(os.environ.get("AUTO_RETRAIN_THRESHOLD", "0")))
 
@@ -1286,16 +1420,56 @@ class Config:
     # serves one request at a time, so more than one mostly adds queueing.
     max_concurrent_tasks: int = field(default_factory=lambda: int(os.environ.get("MAX_CONCURRENT_TASKS", "1")))
     task_poll_seconds: int = field(default_factory=lambda: int(os.environ.get("TASK_POLL_SECONDS", "2")))
+    # Seconds of interactive quiet before a scheduled run is allowed to start.
+    chat_idle_seconds: int = field(default_factory=lambda: int(os.environ.get("CHAT_IDLE_SECONDS", "45")))
     # fetch_url refuses loopback and RFC1918 targets unless this is on, so a
     # prompt-injected page cannot make the agent read the machine's own
     # services (including this app's API) and hand the result back.
     allow_local_fetch: bool = field(default_factory=lambda: os.environ.get("ALLOW_LOCAL_FETCH", "0") == "1")
 
+    # Reasoning-mode models (Qwen3.5 and later) emit a <think> block by default.
+    # In a tool loop that is pure cost: the reasoning is discarded by the
+    # protocol, it inflates the KV cache, and JSON inside it confuses parsing.
+    disable_thinking: bool = field(default_factory=lambda: os.environ.get("DISABLE_THINKING", "1") == "1")
+    # Tool-selection steps want deterministic JSON; only the final answer wants
+    # the configured temperature. One value for both costs malformed calls.
+    tool_temperature: float = field(default_factory=lambda: float(os.environ.get("TOOL_TEMPERATURE", "0.0")))
+    # Answer arithmetic and bare URLs without a model round trip at all.
+    fast_path: bool = field(default_factory=lambda: os.environ.get("FAST_PATH", "1") == "1")
+    # When the trace outgrows the context, collapse the oldest steps into one
+    # summary message instead of dropping them off the front. Dropping shifts
+    # every following token and invalidates any server-side prefix cache at the
+    # exact point a run is longest.
+    stable_prefix: bool = field(default_factory=lambda: os.environ.get("STABLE_PREFIX", "1") == "1")
+
+    # KV cache quantization, passed through to mlx_lm.server when the installed
+    # build accepts the flags. 0 leaves the cache in fp16.
+    kv_bits: int = field(default_factory=lambda: int(os.environ.get("KV_BITS", "0")))
+    kv_group_size: int = field(default_factory=lambda: int(os.environ.get("KV_GROUP_SIZE", "64")))
+    quantized_kv_start: int = field(default_factory=lambda: int(os.environ.get("QUANTIZED_KV_START", "1024")))
+    prompt_cache_dir: str = field(default_factory=lambda: os.environ.get("PROMPT_CACHE_DIR", ""))
+
     # Tools
     search_backend: str = field(default_factory=lambda: os.environ.get("SEARCH_BACKEND", "ddg"))
     search_results: int = field(default_factory=lambda: int(os.environ.get("SEARCH_RESULTS", "5")))
     tool_timeout: int = field(default_factory=lambda: int(os.environ.get("TOOL_TIMEOUT", "30")))
-    tool_result_chars: int = field(default_factory=lambda: int(os.environ.get("TOOL_RESULT_CHARS", "4000")))
+    # Two different caps, and the difference matters.
+    #
+    # tool_raw_chars is how much a tool may return at all. It is what gets
+    # logged and shown in the UI, and what the summariser reads.
+    #
+    # tool_result_chars is how much may enter the model's context. A result is
+    # re-sent on every later step, so a 4000-character page is not a 4000-token
+    # cost, it is that times the number of steps that follow.
+    #
+    # Collapsing these two into one number means the raw result is destroyed
+    # before anything can summarise it, and the summariser becomes dead code.
+    tool_raw_chars: int = field(default_factory=lambda: int(os.environ.get("TOOL_RAW_CHARS", "20000")))
+    tool_result_chars: int = field(default_factory=lambda: int(os.environ.get("TOOL_RESULT_CHARS", "1500")))
+    # Results longer than this get one cheap summarisation pass before they
+    # enter the context. Worth it even at 15 tok/s because of the multiplier.
+    summarise_tool_results: bool = field(default_factory=lambda: os.environ.get("SUMMARISE_TOOL_RESULTS", "1") == "1")
+    summarise_over_chars: int = field(default_factory=lambda: int(os.environ.get("SUMMARISE_OVER_CHARS", "2500")))
 
     seed_demo: bool = False
     retrain_now: bool = False
@@ -1308,7 +1482,9 @@ class Config:
     MUTABLE = (
         "system_prompt", "max_tokens", "temperature", "context_size",
         "history_turns", "agent_enabled", "agent_max_steps",
-        "search_backend", "search_results", "tool_result_chars",
+        "search_backend", "search_results", "tool_result_chars", "tool_raw_chars",
+        "disable_thinking", "tool_temperature", "fast_path", "stable_prefix",
+        "summarise_tool_results", "summarise_over_chars",
     )
 
     SEARCH_BACKENDS = ("ddg", "brave", "tavily", "searxng")
@@ -1349,16 +1525,20 @@ class Config:
 
         before = {name: getattr(self, name) for name in
                   ("context_size", "max_tokens", "temperature", "agent_max_steps",
-                   "history_turns", "search_results", "tool_result_chars")}
+                   "history_turns", "search_results", "tool_result_chars",
+                   "tool_temperature", "summarise_over_chars")}
         self.context_size = max(512, self.context_size)
         self.max_tokens = max(16, self.max_tokens)
         if self.max_tokens >= self.context_size:
             self.max_tokens = max(16, self.context_size // 2)
         self.temperature = min(2.0, max(0.0, self.temperature))
+        self.tool_temperature = min(2.0, max(0.0, self.tool_temperature))
+        self.summarise_over_chars = max(500, self.summarise_over_chars)
         self.agent_max_steps = min(20, max(1, self.agent_max_steps))
         self.history_turns = min(200, max(0, self.history_turns))
         self.search_results = min(10, max(1, self.search_results))
         self.tool_result_chars = min(40000, max(200, self.tool_result_chars))
+        self.tool_raw_chars = min(200000, max(self.tool_result_chars, self.tool_raw_chars))
         for name, old in before.items():
             if getattr(self, name) != old and name not in changed:
                 changed.append(name)
@@ -1375,7 +1555,15 @@ class ModelServerManager:
         adapter_dir: Path,
         max_kv_size: int = 0,
         adapter_choice: str = "latest",
+        kv_bits: int = 0,
+        kv_group_size: int = 64,
+        quantized_kv_start: int = 1024,
+        prompt_cache_dir: str = "",
     ):
+        self.kv_bits = kv_bits
+        self.kv_group_size = kv_group_size
+        self.quantized_kv_start = quantized_kv_start
+        self.prompt_cache_dir = prompt_cache_dir
         self.model_id = model_id
         self.model_port = model_port
         self.adapter_dir = adapter_dir
@@ -1410,6 +1598,32 @@ class ModelServerManager:
                     logging.WARNING,
                 )
         adapter_path = self.adapter_path()
+        if self.kv_bits > 0:
+            # Quantized KV cache roughly halves cache memory at 8 bits, which is
+            # the difference between a usable context and swapping on 8GB.
+            # Server support is genuinely unsettled across builds, so this is
+            # best effort and the run continues without it.
+            if add_if_supported(cmd, self._server_help, ["--kv-bits"], str(self.kv_bits)):
+                add_if_supported(cmd, self._server_help, ["--kv-group-size"], str(self.kv_group_size))
+                add_if_supported(
+                    cmd, self._server_help,
+                    ["--quantized-kv-start"], str(self.quantized_kv_start),
+                )
+            else:
+                log(
+                    "Installed mlx_lm.server has no --kv-bits; the KV cache stays in fp16. "
+                    "Support for this flag varies by build.",
+                    logging.WARNING,
+                )
+        if self.prompt_cache_dir:
+            # The agent re-sends an extending prefix every step, which is the
+            # best case for prompt caching. Worth far more here than in chat.
+            if not add_if_supported(
+                cmd, self._server_help,
+                ["--prompt-cache-dir", "--prompt-cache"], self.prompt_cache_dir,
+            ):
+                log("Installed mlx_lm.server has no prompt cache flag; ignoring PROMPT_CACHE_DIR.",
+                    logging.WARNING)
         if use_adapter and adapter_path is not None:
             add_if_supported(cmd, self._server_help, ["--adapter-path", "--adapter"], str(adapter_path))
         return cmd
@@ -1445,6 +1659,8 @@ class ModelServerManager:
                 selected is not None and not adapter_fits(selected, self.model_id)
             ),
             "max_kv_size": self.max_kv_size,
+            "kv_bits": self.kv_bits,
+            "prompt_cache_dir": self.prompt_cache_dir,
             "status": self.status,
             "cached": model_is_cached(self.model_id),
         }
@@ -1680,10 +1896,59 @@ class RetrainManager:
 
         add_if_supported(cmd, self._lora_help, ["--iters", "--iterations"], str(self.config.train_iters))
         add_if_supported(cmd, self._lora_help, ["--batch-size"], "1")
+        add_if_supported(cmd, self._lora_help, ["--num-layers"], str(self.config.train_num_layers))
         add_if_supported(cmd, self._lora_help, ["--learning-rate", "-lr"], self.config.train_lr)
         add_if_supported(cmd, self._lora_help, ["--grad-checkpoint", "--gradient-checkpoint"])
         add_if_supported(cmd, self._lora_help, ["--max-seq-length", "--seq-length", "--max-seq-len"], self.config.train_seq_len)
         return cmd
+
+    def export_tool_traces(self) -> list[dict]:
+        """Turn logged tool calls into supervised examples of the call format.
+
+        Small models fail at format adherence far more than at reasoning, and
+        format adherence is what the loop depends on: a run dies when the model
+        emits {"tool": "search"} instead of this app's schema, not when it
+        misremembers a date. These rows are the app's own schema, in the app's
+        own wording, which is exactly the supervision that is missing.
+        """
+        if not self.config.train_on_tool_calls:
+            return []
+        rows = self.db.execute(
+            "SELECT t.name, t.args, t.error, m.content AS question "
+            "FROM tool_calls t LEFT JOIN messages m "
+            "  ON m.conversation_id = t.conversation_id AND m.role = 'user' "
+            "  AND m.id = (SELECT MAX(id) FROM messages m2 "
+            "              WHERE m2.conversation_id = t.conversation_id "
+            "                AND m2.role = 'user' AND m2.created_at <= t.created_at) "
+            "WHERE t.error IS NULL AND t.conversation_id IS NOT NULL "
+            "ORDER BY t.id DESC LIMIT ?",
+            (self.config.train_tool_examples,),
+        ).fetchall()
+
+        examples: list[dict] = []
+        seen: set[tuple] = set()
+        for row in rows:
+            question = (row["question"] or "").strip()
+            if not question:
+                continue
+            try:
+                args = json.loads(row["args"] or "{}")
+            except Exception:
+                continue
+            call = json.dumps({"tool": row["name"], "args": args},
+                              ensure_ascii=False, sort_keys=True)
+            key = (question, call)
+            if key in seen:
+                continue
+            seen.add(key)
+            examples.append({
+                "messages": [
+                    {"role": "system", "content": TOOL_TRAINING_PREAMBLE},
+                    {"role": "user", "content": question},
+                    {"role": "assistant", "content": call},
+                ]
+            })
+        return examples
 
     def export_feedback(self) -> tuple[int, list[int]]:
         """Write train/valid JSONL. Returns (example count, contributing feedback ids)."""
@@ -1715,6 +1980,11 @@ class RetrainManager:
                     {"role": "assistant", "content": assistant_response},
                 ]
             })
+
+        tool_examples = self.export_tool_traces()
+        if tool_examples:
+            log(f"Adding {len(tool_examples)} tool-call examples to the training set.")
+            examples.extend(tool_examples)
 
         if not examples:
             return 0, []
@@ -1789,6 +2059,11 @@ class RetrainManager:
         finally:
             self.lock.release()
 
+
+TOOL_TRAINING_PREAMBLE = (
+    "You call tools by replying with a single JSON object and nothing else, in "
+    'the form {"tool": "tool_name", "args": {"arg": "value"}}.'
+)
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " \
              "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
@@ -2307,10 +2582,10 @@ class ToolRegistry:
             raise ValueError("url must start with http:// or https://")
         if not self.config.allow_local_fetch:
             guard_public_url(url)
-        limit = self.config.tool_result_chars
+        limit = self.config.tool_raw_chars
         try:
             if max_chars:
-                limit = min(20000, max(200, int(max_chars)))
+                limit = min(self.config.tool_raw_chars, max(200, int(max_chars)))
         except (TypeError, ValueError):
             pass
         # Read a bounded number of bytes rather than resp.text. An unbounded
@@ -2393,7 +2668,7 @@ class ToolRegistry:
         target = resolve_in_workspace(path)
         if not target.is_file():
             raise ValueError(f"no such file: {path}")
-        return target.read_text(encoding="utf-8", errors="replace")[:self.config.tool_result_chars]
+        return target.read_text(encoding="utf-8", errors="replace")[:self.config.tool_raw_chars]
 
     def _write_file(self, path: str, content: str) -> str:
         target = resolve_in_workspace(path)
@@ -2504,7 +2779,7 @@ class ToolRegistry:
             timeout=self.config.tool_timeout,
         )
         out = (proc.stdout or "") + (("\n[stderr]\n" + proc.stderr) if proc.stderr else "")
-        return (out.strip() or f"(no output, exit code {proc.returncode})")[:self.config.tool_result_chars]
+        return (out.strip() or f"(no output, exit code {proc.returncode})")[:self.config.tool_raw_chars]
 
     def _run_shell(self, command: str) -> str:
         WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
@@ -2517,7 +2792,7 @@ class ToolRegistry:
             timeout=self.config.tool_timeout,
         )
         out = (proc.stdout or "") + (("\n[stderr]\n" + proc.stderr) if proc.stderr else "")
-        return (out.strip() or f"(no output, exit code {proc.returncode})")[:self.config.tool_result_chars]
+        return (out.strip() or f"(no output, exit code {proc.returncode})")[:self.config.tool_raw_chars]
 
     def call(self, name: str, args: dict, conversation_id: str | None = None) -> tuple[str, str | None]:
         """Run a tool. Returns (result text, error message or None)."""
@@ -2551,7 +2826,9 @@ class ToolRegistry:
             result = f"{type(exc).__name__}: {exc}"
             error = result
         duration = (time.time() - start) * 1000
-        result = result[:self.config.tool_result_chars]
+        # Keep the full-ish result here. The agent decides separately how much
+        # of it is worth spending context on, after a summarisation pass.
+        result = result[:self.config.tool_raw_chars]
         if self.db:
             self.db.log_tool_call(conversation_id, name, clean, result, duration, error)
         return result, error
@@ -2583,6 +2860,29 @@ TOOL_PROTOCOL = textwrap.dedent("""\
     """)
 
 
+# Every agent request begins with this exact text, so it is the prefix any
+# server-side prompt cache keys on. When it changes, every cached prefix on the
+# machine becomes worthless. That is invisible otherwise: you edit the system
+# prompt in the UI, latency doubles, and nothing says why.
+PREFIX_STATE: dict[str, Any] = {"hash": None, "changed_at": None, "generation": 0}
+
+
+def note_prefix(prompt: str) -> None:
+    digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+    if PREFIX_STATE["hash"] == digest:
+        return
+    first = PREFIX_STATE["hash"] is None
+    PREFIX_STATE["hash"] = digest
+    PREFIX_STATE["changed_at"] = iso(utc_now())
+    PREFIX_STATE["generation"] += 1
+    if not first:
+        log(
+            "Agent prompt prefix changed (system prompt or tool set). Any cached "
+            "prefix is now invalid and the next few steps will re-prefill in full.",
+            logging.WARNING,
+        )
+
+
 def build_agent_system_prompt(base_prompt: str, registry: ToolRegistry) -> str:
     lines = []
     for tool in registry.specs():
@@ -2591,7 +2891,9 @@ def build_agent_system_prompt(base_prompt: str, registry: ToolRegistry) -> str:
         ) or "no arguments"
         required = ", ".join(tool["required"]) or "none"
         lines.append(f"- {tool['name']}: {tool['description']}\n  args: {params}\n  required: {required}")
-    return f"{base_prompt}\n\n{TOOL_PROTOCOL}" + "\n".join(lines)
+    prompt = f"{base_prompt}\n\n{TOOL_PROTOCOL}" + "\n".join(lines)
+    note_prefix(prompt)
+    return prompt
 
 
 def extract_json_object(text: str) -> dict | None:
@@ -2638,6 +2940,26 @@ def extract_json_object(text: str) -> dict | None:
     return None
 
 
+THINK_BLOCK = re.compile(r"(?is)<(think|thinking|reasoning)>.*?</\1>")
+OPEN_THINK = re.compile(r"(?is)<(think|thinking|reasoning)>.*\Z")
+
+
+def strip_reasoning(text: str) -> str:
+    """Remove a reasoning model's chain-of-thought block.
+
+    Qwen3.5 and later emit <think>...</think> before the answer. extract_json_object
+    scans for the first balanced JSON object anywhere in the reply, so reasoning
+    that talks through candidate arguments gets parsed as the tool call itself.
+    An unterminated block is stripped too, because mid-stream the closing tag
+    has not arrived yet and the agent tests the buffer on every token.
+    """
+    if not text or "<" not in text:
+        return text
+    text = THINK_BLOCK.sub("", text)
+    text = OPEN_THINK.sub("", text)
+    return text.strip()
+
+
 def parse_tool_call(text: str, known: set[str] | None = None) -> tuple[str, dict] | None:
     """Return (tool name, args) if the reply is a tool call, else None.
 
@@ -2646,7 +2968,7 @@ def parse_tool_call(text: str, known: set[str] | None = None) -> tuple[str, dict
     the explicit "tool" key. That stops a final answer that happens to contain
     JSON (a config snippet, a parsed record) from being executed as a tool call.
     """
-    parsed = extract_json_object(text)
+    parsed = extract_json_object(strip_reasoning(text))
     if not parsed:
         return None
     explicit = "tool" in parsed or "tool_name" in parsed
@@ -2667,6 +2989,38 @@ def parse_tool_call(text: str, known: set[str] | None = None) -> tuple[str, dict
     return name, args
 
 
+@dataclass
+class GenerationStats:
+    """What one model call actually cost.
+
+    prompt_tokens is the number that matters most on this hardware: an agent
+    re-sends its whole prompt every step, so prefill, not decode, is where a
+    multi-step run spends its time. Watching this climb step over step within a
+    single run is how you see the quadratic.
+    """
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    ttft_ms: float = 0.0
+    total_ms: float = 0.0
+    from_server: bool = False
+
+    @property
+    def decode_tps(self) -> float:
+        decode_ms = max(1.0, self.total_ms - self.ttft_ms)
+        return self.completion_tokens / (decode_ms / 1000.0)
+
+    def as_event(self) -> dict:
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "ttft_ms": round(self.ttft_ms, 1),
+            "total_ms": round(self.total_ms, 1),
+            "decode_tps": round(self.decode_tps, 2),
+            "estimated": not self.from_server,
+        }
+
+
 class ModelClient:
     """Thin async client for the local OpenAI-compatible model server."""
 
@@ -2684,13 +3038,41 @@ class ModelClient:
         max_tokens: int | None = None,
         temperature: float | None = None,
     ) -> dict:
-        return {
+        body = {
             "model": self.config.model,
             "messages": messages,
             "stream": stream,
             "temperature": self.config.temperature if temperature is None else temperature,
             "max_tokens": max_tokens or self.config.max_tokens,
         }
+        if stream:
+            # Ask for usage on the final chunk. Servers that do not know the
+            # option ignore it, and the estimate below covers them.
+            body["stream_options"] = {"include_usage": True}
+        if self.config.disable_thinking:
+            # Qwen3.5 and friends default to thinking-on. Chain of thought is a
+            # bad trade in a tool loop: it burns the KV cache on tokens the
+            # protocol discards, and the reasoning text confuses JSON parsing.
+            # Both spellings are in circulation; unknown keys are ignored.
+            body["chat_template_kwargs"] = {"enable_thinking": False}
+            body["enable_thinking"] = False
+        return body
+
+    def _stats_from_usage(self, usage: dict | None, messages: list[dict], text: str,
+                          started: float, first_token_at: float | None) -> GenerationStats:
+        total_ms = (time.time() - started) * 1000
+        ttft_ms = ((first_token_at - started) * 1000) if first_token_at else total_ms
+        if usage:
+            return GenerationStats(
+                prompt_tokens=int(usage.get("prompt_tokens") or 0),
+                completion_tokens=int(usage.get("completion_tokens") or 0),
+                ttft_ms=ttft_ms, total_ms=total_ms, from_server=True,
+            )
+        return GenerationStats(
+            prompt_tokens=messages_tokens(messages),
+            completion_tokens=estimate_tokens(text),
+            ttft_ms=ttft_ms, total_ms=total_ms, from_server=False,
+        )
 
     async def complete(
         self,
@@ -2698,7 +3080,17 @@ class ModelClient:
         max_tokens: int | None = None,
         temperature: float | None = None,
     ) -> str:
+        text, _ = await self.complete_with_stats(messages, max_tokens, temperature)
+        return text
+
+    async def complete_with_stats(
+        self,
+        messages: list[dict],
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> tuple[str, GenerationStats]:
         import httpx
+        started = time.time()
         async with httpx.AsyncClient(timeout=600) as client:
             resp = await client.post(self.url, json=self.payload(messages, False, max_tokens, temperature))
             if resp.status_code != 200:
@@ -2708,35 +3100,92 @@ class ModelClient:
             if resp.status_code != 200:
                 raise RuntimeError(f"model server returned {resp.status_code}: {resp.text[:300]}")
             data = resp.json()
-            return data["choices"][0]["message"]["content"]
+            text = data["choices"][0]["message"]["content"]
+            return text, self._stats_from_usage(data.get("usage"), messages, text, started, None)
 
     async def stream(
         self,
         messages: list[dict],
         max_tokens: int | None = None,
         temperature: float | None = None,
+        stats: GenerationStats | None = None,
     ) -> AsyncGenerator[str, None]:
+        """Yield content deltas. When `stats` is passed it is filled in place.
+
+        In place rather than returned because this is an async generator and the
+        caller needs the numbers even when it breaks out of the loop early,
+        which the agent does on every completed tool call.
+        """
         import httpx
-        async with httpx.AsyncClient(timeout=600) as client:
-            async with client.stream(
-                "POST", self.url, json=self.payload(messages, True, max_tokens, temperature)
-            ) as resp:
-                if resp.status_code != 200:
-                    body = (await resp.aread()).decode("utf-8", "replace")
-                    raise RuntimeError(f"model server returned {resp.status_code}: {body[:300]}")
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    chunk = line[6:]
-                    if chunk.strip() == "[DONE]":
-                        return
-                    try:
-                        data = json.loads(chunk)
-                        delta = data["choices"][0]["delta"].get("content", "")
-                    except Exception:
-                        continue
-                    if delta:
-                        yield delta
+        started = time.time()
+        first_token_at: float | None = None
+        usage: dict | None = None
+        text_len = 0
+        try:
+            async with httpx.AsyncClient(timeout=600) as client:
+                async with client.stream(
+                    "POST", self.url, json=self.payload(messages, True, max_tokens, temperature)
+                ) as resp:
+                    if resp.status_code != 200:
+                        body = (await resp.aread()).decode("utf-8", "replace")
+                        raise RuntimeError(f"model server returned {resp.status_code}: {body[:300]}")
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        chunk = line[6:]
+                        if chunk.strip() == "[DONE]":
+                            return
+                        try:
+                            data = json.loads(chunk)
+                        except Exception:
+                            continue
+                        if data.get("usage"):
+                            usage = data["usage"]
+                        choices = data.get("choices") or []
+                        if not choices:
+                            continue
+                        delta = (choices[0].get("delta") or {}).get("content", "")
+                        if delta:
+                            if first_token_at is None:
+                                first_token_at = time.time()
+                            text_len += len(delta)
+                            yield delta
+        finally:
+            if stats is not None:
+                measured = self._stats_from_usage(
+                    usage, messages, "x" * text_len, started, first_token_at
+                )
+                stats.prompt_tokens = measured.prompt_tokens
+                stats.completion_tokens = measured.completion_tokens
+                stats.ttft_ms = measured.ttft_ms
+                stats.total_ms = measured.total_ms
+                stats.from_server = measured.from_server
+
+
+ARITHMETIC_ONLY = re.compile(r"^[\d\s+\-*/().,^%]+$")
+BARE_URL = re.compile(r"^\s*(https?://\S+)\s*$", re.I)
+
+
+def fast_path_call(message: str) -> tuple[str, dict] | None:
+    """Route obvious requests straight to a tool, skipping a model round trip.
+
+    A full prefill just to have a 4B model decide to use the calculator is the
+    most expensive way to evaluate 17*23 ever devised.
+    """
+    text = (message or "").strip()
+    if not text or len(text) > 400:
+        return None
+
+    url = BARE_URL.match(text)
+    if url:
+        return "fetch_url", {"url": url.group(1)}
+
+    expression = text.rstrip("=?").strip()
+    # Require an operator so a bare number or a year is not "arithmetic".
+    if (ARITHMETIC_ONLY.match(expression) and any(op in expression for op in "+-*/^%")
+            and any(char.isdigit() for char in expression)):
+        return "calculator", {"expression": expression.replace("^", "**").replace(",", "")}
+    return None
 
 
 class Agent:
@@ -2773,13 +3222,63 @@ class Agent:
             reserve,
         )
 
-    def assemble(self, base: list[dict], scratch: list[dict], reserve: int) -> tuple[list[dict], int]:
-        """base + as much of the tool trace as fits, dropping the oldest first.
+    SUMMARY_MARKER = "EARLIER STEPS (condensed):"
 
-        The previous version re-trimmed the whole list every step, which meant a
-        long trace eventually evicted the user's question and left the model
-        summarising tool output it no longer had a reason for. base is fixed.
+    def compact(self, base: list[dict], scratch: list[dict], reserve: int) -> int:
+        """Shrink an overlong trace in place. Returns how many entries collapsed.
+
+        Mutating scratch rather than recomputing a view each step is the whole
+        point. A prefix cache matches on the token prefix, so what it needs is
+        for step k+1's prompt to *start with* step k's prompt. Appending to a
+        stable list gives exactly that. Recomputing a summary every step does
+        not: the summary text changes as more is folded into it, which moves
+        every token after it and invalidates the cache on every single step.
+
+        So the collapse happens once, when the budget is actually exceeded, and
+        the run then extends cleanly again until the next one. Long runs of
+        cache hits punctuated by rare misses, instead of a miss every step.
         """
+        budget = max(256, self.config.context_size - reserve - CONTEXT_SAFETY_MARGIN)
+        fixed = messages_tokens(base)
+        if fixed + messages_tokens(scratch) <= budget:
+            return 0
+
+        collapsed = 0
+        carried: list[str] = []
+        # Reclaim to 60% of budget so the next few steps fit without another
+        # collapse. Collapsing to exactly the limit would re-trigger next step.
+        target = int(budget * 0.6)
+        while scratch and fixed + messages_tokens(scratch) > target:
+            oldest = scratch.pop(0)
+            collapsed += 1
+            content = (oldest.get("content") or "").strip()
+            if not content:
+                continue
+            if content.startswith(self.SUMMARY_MARKER):
+                # Fold a previous summary in rather than nesting them.
+                carried = [line[2:] for line in content.splitlines()[1:]] + carried
+            elif oldest.get("role") == "user":
+                carried.append(content.split("\n")[0][:120])
+
+        if carried:
+            scratch.insert(0, {
+                "role": "user",
+                "content": self.SUMMARY_MARKER + "\n" + "\n".join(f"- {line}" for line in carried[-12:]),
+            })
+        return collapsed
+
+    def assemble(self, base: list[dict], scratch: list[dict], reserve: int) -> tuple[list[dict], int]:
+        """base + the trace. base is fixed and can never be evicted.
+
+        With stable_prefix off this drops the oldest entries from a copy every
+        step, which is correct but cache-hostile. With it on, compact() has
+        already made the list fit, so this is a concatenation and the prompt
+        strictly extends between collapses.
+        """
+        if self.config.stable_prefix:
+            collapsed = self.compact(base, scratch, reserve)
+            return [*base, *scratch], collapsed
+
         budget = max(256, self.config.context_size - reserve - CONTEXT_SAFETY_MARGIN)
         fixed = messages_tokens(base)
         kept = list(scratch)
@@ -2790,9 +3289,45 @@ class Agent:
         return [*base, *kept], dropped
 
     def _tool_budget(self, reserve: int) -> int:
-        """Characters of a single tool result allowed into the context."""
-        room = max(512, (self.config.context_size - reserve) // 3) * CHARS_PER_TOKEN
+        """Characters of a single tool result allowed into the context.
+
+        A result added at step k is re-prefilled at every step after it, so the
+        real cost is this number times the steps remaining. The share of context
+        is deliberately smaller than it looks reasonable to allow.
+        """
+        room = max(512, (self.config.context_size - reserve) // 6) * CHARS_PER_TOKEN
         return int(min(self.config.tool_result_chars, room))
+
+    async def compress_tool_result(self, name: str, result: str, budget: int) -> tuple[str, bool]:
+        """Shrink an oversized tool result, preferring a summary over a hard cut.
+
+        Truncation keeps the navigation chrome at the top of a page and throws
+        away the part that answers the question. One cheap summarisation call
+        pays for itself the moment two more steps follow.
+        """
+        if len(result) <= budget:
+            return result, False
+        if not self.config.summarise_tool_results or len(result) <= self.config.summarise_over_chars:
+            return result[:budget] + "\n[truncated]", False
+        prompt = [
+            {"role": "system", "content":
+                "You compress tool output. Reply with only the facts the caller asked for, "
+                "in at most 8 short lines. Keep numbers, names, dates and URLs exactly. "
+                "Do not add commentary, and do not invent anything."},
+            {"role": "user", "content":
+                f"Tool: {name}\nCompress this output:\n\n{result[:12000]}"},
+        ]
+        try:
+            summary, _ = await self.client.complete_with_stats(
+                prompt, max_tokens=min(400, budget // CHARS_PER_TOKEN), temperature=0.0
+            )
+        except Exception as exc:
+            log(f"Tool result summarisation failed ({exc}); truncating instead.", logging.WARNING)
+            return result[:budget] + "\n[truncated]", False
+        summary = strip_reasoning(summary).strip()
+        if not summary:
+            return result[:budget] + "\n[truncated]", False
+        return f"[condensed from {len(result)} chars]\n{summary[:budget]}", True
 
     async def run(
         self,
@@ -2816,6 +3351,8 @@ class Agent:
         seen_calls: list[str] = []
         trace: list[dict] = []
         nudges = 0
+        prompt_tokens_total = 0
+        completion_tokens_total = 0
 
         def done(answer: str, step: int, truncated: bool = False) -> dict:
             return {
@@ -2825,20 +3362,52 @@ class Agent:
                 "trace": trace,
                 "tools_used": [entry["name"] for entry in trace],
                 "elapsed_ms": round((time.time() - started) * 1000),
+                "prompt_tokens": prompt_tokens_total,
+                "completion_tokens": completion_tokens_total,
                 "truncated": truncated,
             }
+
+        # Deterministic routing before the model is involved at all.
+        if self.config.fast_path:
+            shortcut = fast_path_call(user_message)
+            if shortcut and self.registry.get(shortcut[0]) is not None:
+                name, args = shortcut
+                yield {"type": "tool_call", "name": name, "args": args, "step": 0,
+                       "fast_path": True}
+                result, error = await asyncio.to_thread(
+                    self.registry.call, name, args, conversation_id
+                )
+                yield {"type": "tool_result", "name": name, "result": result,
+                       "error": error, "step": 0, "fast_path": True}
+                if not error:
+                    trace.append({"name": name, "args": args,
+                                  "result": result[:1000], "error": None})
+                    yield done(result.strip(), 0)
+                    return
+                # A failed shortcut is not fatal; fall through to the model.
+                scratch.append({"role": "assistant", "content": f"I tried {name} and it failed."})
+                scratch.append({"role": "user", "content": f"TOOL RESULT [{name}]:\n{result}"})
 
         for step in range(1, self.config.agent_max_steps + 1):
             if cancel is not None and cancel.is_set():
                 yield {"type": "cancelled", "step": step, "trace": trace}
                 return
 
-            messages, _ = self.assemble(base, scratch, reserve)
-            yield {"type": "step", "step": step, "max_steps": self.config.agent_max_steps}
+            messages, condensed = self.assemble(base, scratch, reserve)
+            yield {"type": "step", "step": step, "max_steps": self.config.agent_max_steps,
+                   "prompt_tokens": messages_tokens(messages), "condensed": condensed}
 
             buffer = ""
             cancelled = False
-            stream = self.client.stream(messages, reserve, temperature)
+            stats = GenerationStats()
+            # Tool-selection steps want deterministic JSON. Only the answer the
+            # user reads should get the configured temperature, and we do not
+            # know which this is until it parses, so bias towards valid JSON and
+            # let the final-answer pass below use the warmer setting.
+            step_temperature = (
+                self.config.tool_temperature if temperature is None else temperature
+            )
+            stream = self.client.stream(messages, reserve, step_temperature, stats)
             try:
                 async for token in stream:
                     if cancel is not None and cancel.is_set():
@@ -2848,7 +3417,11 @@ class Agent:
                     yield {"type": "token", "token": token, "step": step}
                     # A tool call is complete as soon as the JSON object closes;
                     # letting the model ramble past it wastes seconds per step.
-                    if buffer.lstrip().startswith(("{", "```")) and parse_tool_call(buffer, known):
+                    # strip_reasoning first: with a thinking model the buffer
+                    # starts with <think>, so the raw prefix test never fires and
+                    # the step pays for the whole generation.
+                    visible = strip_reasoning(buffer).lstrip()
+                    if visible.startswith(("{", "```")) and parse_tool_call(buffer, known):
                         break
             except Exception as exc:
                 yield {"type": "error", "error": str(exc)}
@@ -2859,6 +3432,10 @@ class Agent:
                 # per abandoned step.
                 await stream.aclose()
 
+            prompt_tokens_total += stats.prompt_tokens
+            completion_tokens_total += stats.completion_tokens
+            yield {"type": "usage", "step": step, **stats.as_event()}
+
             if cancelled:
                 yield {"type": "cancelled", "step": step, "partial": buffer.strip(), "trace": trace}
                 return
@@ -2866,7 +3443,7 @@ class Agent:
             call = parse_tool_call(buffer, known)
 
             if call is None:
-                answer = buffer.strip()
+                answer = strip_reasoning(buffer).strip()
                 if answer:
                     yield done(answer, step)
                     return
@@ -2891,7 +3468,7 @@ class Agent:
                     yield {"type": "tool_call", "name": name, "args": args, "step": step}
                     yield done(answer, step)
                     return
-                scratch.append({"role": "assistant", "content": buffer.strip()})
+                scratch.append({"role": "assistant", "content": strip_reasoning(buffer).strip()})
                 scratch.append({
                     "role": "user",
                     "content": "final_answer needs a non-empty answer argument. "
@@ -2916,15 +3493,14 @@ class Agent:
                 )
 
             budget = self._tool_budget(reserve)
-            if len(result) > budget:
-                result_for_model = result[:budget] + "\n[truncated]"
-            else:
-                result_for_model = result
+            result_for_model, was_summarised = await self.compress_tool_result(name, result, budget)
 
             trace.append({"name": name, "args": args, "result": result[:1000], "error": error})
-            yield {"type": "tool_result", "name": name, "result": result, "error": error, "step": step}
+            yield {"type": "tool_result", "name": name, "result": result, "error": error,
+                   "step": step, "context_chars": len(result_for_model),
+                   "summarised": was_summarised}
 
-            scratch.append({"role": "assistant", "content": buffer.strip()})
+            scratch.append({"role": "assistant", "content": strip_reasoning(buffer).strip()})
             scratch.append({
                 "role": "user",
                 "content": f"TOOL RESULT [{name}]:\n{result_for_model}\n\n"
@@ -2941,11 +3517,16 @@ class Agent:
                                         "Do not call any tool and do not output JSON."},
         ]
         try:
-            answer = await self.client.complete(final_messages, reserve, temperature)
+            answer, final_stats = await self.client.complete_with_stats(
+                final_messages, reserve, temperature
+            )
         except Exception as exc:
             yield {"type": "error", "error": str(exc)}
             return
-        yield done(answer.strip(), self.config.agent_max_steps, truncated=True)
+        prompt_tokens_total += final_stats.prompt_tokens
+        completion_tokens_total += final_stats.completion_tokens
+        yield {"type": "usage", "step": self.config.agent_max_steps, **final_stats.as_event()}
+        yield done(strip_reasoning(answer).strip(), self.config.agent_max_steps, truncated=True)
 
 
 class TaskRun:
@@ -3032,6 +3613,21 @@ class TaskManager:
         self._scheduler: asyncio.Task | None = None
         self._semaphore: asyncio.Semaphore | None = None
         self._stopping = False
+        # Wall clock of the most recent interactive request. A scheduled run
+        # landing mid-conversation puts two inference requests into a server
+        # that holds one KV cache comfortably and two only by swapping, and on
+        # 8GB the failure mode is not an error, it is macOS compressing memory
+        # while tok/s quietly collapses.
+        self.last_chat_at = 0.0
+        self.chat_in_flight = 0
+
+    def note_chat_activity(self) -> None:
+        self.last_chat_at = time.time()
+
+    def chat_is_busy(self) -> bool:
+        if self.chat_in_flight > 0:
+            return True
+        return (time.time() - self.last_chat_at) < self.config.chat_idle_seconds
 
     # ------------------------------------------------------------ lifecycle --
 
@@ -3066,6 +3662,10 @@ class TaskManager:
                     continue
                 if self.retrain_manager.status.get("running"):
                     continue
+                # Interactive use wins. A task deferred by a few seconds costs
+                # nobody anything; a task that halves your chat throughput does.
+                if self.chat_is_busy():
+                    continue
                 for task in self.db.due_tasks():
                     if task["id"] in self.by_task:
                         continue
@@ -3095,10 +3695,42 @@ class TaskManager:
         """A config copy scoped to one task, so its tools and step budget are its own."""
         return dataclass_replace(
             self.config,
+            model=task.get("model") or self.config.model,
             system_prompt=task.get("system_prompt") or self.config.system_prompt,
             agent_tools=task.get("tools") or self.config.agent_tools,
             agent_max_steps=int(task.get("max_steps") or self.config.agent_max_steps),
         )
+
+    async def _swap_for_task(self, task: dict) -> str | None:
+        """Load a task's own model, returning the one to restore afterwards.
+
+        Latency tolerance differs by workload. Interactive chat wants a small
+        model that answers now; a 3am research task has nobody waiting and can
+        afford a bigger one, or a reasoning model whose chain of thought would
+        be intolerable in a chat box. On 8GB you cannot hold both, so swap.
+        """
+        wanted = (task.get("model") or "").strip()
+        if not wanted or wanted == self.model_manager.model_id:
+            return None
+        previous = self.model_manager.model_id
+        log(f"Task {task['name']}: swapping {previous} -> {wanted}")
+        self.model_manager.swap(wanted)
+        await asyncio.to_thread(self.model_manager.restart)
+        if self.model_manager.status != "ready":
+            self.model_manager.swap(previous)
+            await asyncio.to_thread(self.model_manager.restart)
+            raise RuntimeError(f"could not load {wanted} for this task")
+        return previous
+
+    async def _restore_model(self, previous: str | None) -> None:
+        if not previous or previous == self.model_manager.model_id:
+            return
+        log(f"Restoring model {previous} after task run")
+        self.model_manager.swap(previous)
+        try:
+            await asyncio.to_thread(self.model_manager.restart)
+        except Exception as exc:
+            log(f"Could not restore {previous}: {exc}", logging.ERROR)
 
     async def _execute(self, task: dict, run: TaskRun, trigger: str) -> None:
         if self._semaphore is None:
@@ -3109,13 +3741,16 @@ class TaskManager:
         steps = 0
         tools_used: list[str] = []
         status = "ok"
+        previous_model: str | None = None
 
         try:
             async with self._semaphore:
                 if run.cancel.is_set():
                     raise asyncio.CancelledError
+                previous_model = await self._swap_for_task(task)
                 self._emit(run, {"type": "start", "task": task["name"], "trigger": trigger,
-                                 "model": self.config.model})
+                                 "model": task.get("model") or self.config.model,
+                                 "swapped": previous_model is not None})
                 append_task_log(f"run {run.run_id} start: {task['name']} ({trigger})")
 
                 task_config = self._task_config(task)
@@ -3154,6 +3789,10 @@ class TaskManager:
             log(f"Task {task['name']} failed: {error}", logging.ERROR)
             self._emit(run, {"type": "error", "error": error})
         finally:
+            try:
+                await self._restore_model(previous_model)
+            except Exception as exc:
+                log(f"Model restore failed: {exc}", logging.ERROR)
             elapsed = (time.time() - run.started) * 1000
             run.status = status
             run.answer = answer
@@ -3172,6 +3811,43 @@ class TaskManager:
             self.recent[run.run_id] = run
             while len(self.recent) > 20:
                 self.recent.pop(next(iter(self.recent)))
+
+            # Chaining. Three narrow tasks passing state through the workspace
+            # beat one task with a compound goal at this model size, so the
+            # dependency is first class rather than something you fake with two
+            # schedules and a file.
+            if status == "ok" and task.get("next_task_id") and not self._stopping:
+                await self._chain(task, answer)
+
+    async def _chain(self, task: dict, answer: str) -> None:
+        follow_on = self.db.get_task(task["next_task_id"])
+        if follow_on is None:
+            log(f"Task {task['name']} points at a missing next task.", logging.WARNING)
+            return
+        if follow_on["id"] in self.by_task:
+            log(f"Chained task {follow_on['name']} is already running; skipping.", logging.WARNING)
+            return
+        if follow_on["id"] == task["id"]:
+            log("Refusing to chain a task to itself.", logging.WARNING)
+            return
+        # Hand the upstream answer over on disk rather than in the goal text, so
+        # a long result does not become a giant prompt for the next task.
+        try:
+            handoff = resolve_in_workspace(f"chain/{task['id']}.txt")
+            handoff.parent.mkdir(parents=True, exist_ok=True)
+            handoff.write_text(answer, encoding="utf-8")
+            relative = handoff.relative_to(WORKSPACE_DIR.resolve())
+        except Exception as exc:
+            log(f"Could not write the chain handoff: {exc}", logging.WARNING)
+            return
+        chained = dict(follow_on)
+        chained["goal"] = (
+            f"{follow_on['goal']}\n\n"
+            f"The previous task ({task['name']}) wrote its result to {relative}. "
+            "Read that file first with read_file."
+        )
+        log(f"Chaining {task['name']} -> {follow_on['name']}")
+        await self.launch(chained, trigger=f"chain:{task['id']}")
 
     def _emit(self, run: TaskRun, event: dict) -> None:
         stamped = run.publish(event)
@@ -3690,6 +4366,41 @@ HTML_PAGE = r"""
        the model server only changes on restart.
      </div>
 
+     <h3 style="margin-top:18px">Performance</h3>
+     <div class="row">
+       <div>
+         <label>Tool result into context (chars)</label>
+         <input id="cfgToolChars2" type="number" min="200" max="40000" step="100">
+       </div>
+       <div>
+         <label>Tool step temperature</label>
+         <input id="cfgToolTemp" type="number" min="0" max="2" step="0.05">
+       </div>
+     </div>
+     <label class="agent-toggle" style="margin-top:8px">
+       <input id="cfgThinking" type="checkbox"> disable thinking mode
+     </label>
+     <label class="agent-toggle">
+       <input id="cfgFastPath" type="checkbox"> deterministic fast path
+     </label>
+     <label class="agent-toggle">
+       <input id="cfgStablePrefix" type="checkbox"> stable prefix (cache friendly)
+     </label>
+     <label class="agent-toggle">
+       <input id="cfgSummarise" type="checkbox"> summarise long tool results
+     </label>
+     <div class="row" style="margin-top:10px">
+       <button onclick="saveConfig()">Apply</button>
+       <button onclick="loadPerf()">Refresh stats</button>
+     </div>
+     <div class="tools-list" id="perfStats" style="margin-top:8px">no samples yet</div>
+     <div id="prefillCurve" style="margin-top:10px"></div>
+     <div class="hint">
+       Prompt tokens climbing step over step within one run is re-prefill cost.
+       Flat means the prefix is being reused.
+     </div>
+     <div class="hint" id="prefixWarn" style="display:none"></div>
+
      <h3 style="margin-top:18px">Memory</h3>
      <div class="row">
        <div><input id="memKey" type="text" placeholder="key"></div>
@@ -3938,6 +4649,8 @@ HTML_PAGE = r"""
            answered = true;
            updateContextMeter(estimateTokens(event.answer));
            addFeedbackBar(message, event.answer);
+           loadRunCurve(conversationId);
+           loadPerf();
            if (event.tools_used && event.tools_used.length) {
              addSystem("Used " + event.tools_used.join(", ") + " over " +
                        event.steps + " step(s) in " +
@@ -4115,6 +4828,12 @@ HTML_PAGE = r"""
        document.getElementById("cfgSearchBackend").value = cfg.search_backend;
        document.getElementById("cfgSearchResults").value = cfg.search_results;
        document.getElementById("cfgToolChars").value = cfg.tool_result_chars;
+       document.getElementById("cfgToolChars2").value = cfg.tool_result_chars;
+       document.getElementById("cfgToolTemp").value = cfg.tool_temperature;
+       document.getElementById("cfgThinking").checked = !!cfg.disable_thinking;
+       document.getElementById("cfgFastPath").checked = !!cfg.fast_path;
+       document.getElementById("cfgStablePrefix").checked = !!cfg.stable_prefix;
+       document.getElementById("cfgSummarise").checked = !!cfg.summarise_tool_results;
        agentToggle.checked = cfg.agent_enabled;
        var names = out.data.tools.map(function(t) { return t.name; });
        document.getElementById("toolsList").textContent = names.join("\n");
@@ -4135,7 +4854,13 @@ HTML_PAGE = r"""
        agent_max_steps: Number(document.getElementById("cfgAgentSteps").value),
        search_backend: document.getElementById("cfgSearchBackend").value,
        search_results: Number(document.getElementById("cfgSearchResults").value),
-       tool_result_chars: Number(document.getElementById("cfgToolChars").value)
+       tool_result_chars: Number(document.getElementById("cfgToolChars2").value ||
+                                 document.getElementById("cfgToolChars").value),
+       tool_temperature: Number(document.getElementById("cfgToolTemp").value),
+       disable_thinking: document.getElementById("cfgThinking").checked,
+       fast_path: document.getElementById("cfgFastPath").checked,
+       stable_prefix: document.getElementById("cfgStablePrefix").checked,
+       summarise_tool_results: document.getElementById("cfgSummarise").checked
      };
      try {
        var out = await fetchJSON("/api/config", {
@@ -4172,6 +4897,15 @@ HTML_PAGE = r"""
        }
        if (typeof data.memories === "number") {
          msg += ", " + data.memories + " notes";
+       }
+       var warn = document.getElementById("prefixWarn");
+       if (data.prefix && data.prefix.generation > 1) {
+         warn.style.display = "";
+         warn.textContent = "Prompt prefix changed " + (data.prefix.generation - 1) +
+           " time(s) this session (last " + (data.prefix.changed_at || "") +
+           "). Each change invalidates any cached prefix.";
+       } else if (warn) {
+         warn.style.display = "none";
        }
        if (data.tasks) {
          var running = data.tasks.running || [];
@@ -4248,6 +4982,112 @@ HTML_PAGE = r"""
      if (seconds < 3600) return Math.round(seconds / 60) + "m ago";
      if (seconds < 86400) return Math.round(seconds / 3600) + "h ago";
      return Math.round(seconds / 86400) + "d ago";
+   }
+
+   function renderPrefillCurve(steps) {
+     var box = document.getElementById("prefillCurve");
+     box.innerHTML = "";
+     if (!steps || steps.length < 2) return;
+
+     var values = steps.map(function(s) { return s.prompt_tokens || 0; });
+     var peak = Math.max.apply(null, values) || 1;
+     var total = values.reduce(function(a, b) { return a + b; }, 0);
+
+     var title = document.createElement("div");
+     title.style.fontSize = "11px";
+     title.style.opacity = "0.75";
+     title.style.marginBottom = "4px";
+     title.textContent = "prompt tokens per step (" + total + " total prefill)";
+     box.appendChild(title);
+
+     steps.forEach(function(s, i) {
+       var row = document.createElement("div");
+       row.style.display = "flex";
+       row.style.alignItems = "center";
+       row.style.gap = "6px";
+       row.style.fontSize = "11px";
+       row.style.lineHeight = "1.5";
+
+       var label = document.createElement("span");
+       label.style.opacity = "0.6";
+       label.style.minWidth = "18px";
+       label.textContent = "s" + (s.step === null ? i + 1 : s.step);
+
+       var track = document.createElement("span");
+       track.style.flex = "1";
+       track.style.height = "9px";
+       track.style.borderRadius = "3px";
+       track.style.background = "rgba(127,127,127,0.18)";
+       track.style.overflow = "hidden";
+
+       var fill = document.createElement("span");
+       fill.style.display = "block";
+       fill.style.height = "100%";
+       fill.style.width = Math.round(((s.prompt_tokens || 0) / peak) * 100) + "%";
+       // Growth across steps is the thing to notice, so colour by it.
+       var growing = i > 0 && (s.prompt_tokens || 0) > values[i - 1] * 1.15;
+       fill.style.background = growing ? "#c2703a" : "#5a8f6f";
+       track.appendChild(fill);
+
+       var value = document.createElement("span");
+       value.style.opacity = "0.7";
+       value.style.minWidth = "40px";
+       value.style.textAlign = "right";
+       value.textContent = String(s.prompt_tokens || 0);
+
+       row.appendChild(label);
+       row.appendChild(track);
+       row.appendChild(value);
+       box.appendChild(row);
+     });
+
+     var verdict = document.createElement("div");
+     verdict.style.fontSize = "11px";
+     verdict.style.marginTop = "5px";
+     var growth = values[values.length - 1] / (values[0] || 1);
+     if (growth > 1.5) {
+       verdict.style.color = "#c2703a";
+       verdict.textContent = "Prompt grew " + growth.toFixed(1) +
+         "x across the run. Shrink tool results or the tool list.";
+     } else {
+       verdict.style.opacity = "0.7";
+       verdict.textContent = "Prompt stayed flat across steps.";
+     }
+     box.appendChild(verdict);
+   }
+
+   async function loadRunCurve(convId) {
+     if (!convId) return;
+     try {
+       var out = await fetchJSON("/api/metrics/run/" + encodeURIComponent(convId));
+       renderPrefillCurve(out.data.steps || []);
+     } catch (err) {
+       /* the run had no agent steps; nothing to draw */
+     }
+   }
+
+   async function loadPerf() {
+     var box = document.getElementById("perfStats");
+     try {
+       var out = await fetchJSON("/api/metrics/summary");
+       var chat = out.data.chat || {};
+       var step = out.data.agent_step || {};
+       var lines = [];
+       if (chat.samples) {
+         lines.push("chat: " + chat.samples + " samples, " +
+                    Math.round(chat.avg_duration_ms) + "ms avg");
+       }
+       if (step.samples) {
+         lines.push("agent steps: " + step.samples);
+         lines.push("  prompt tokens avg " + Math.round(step.avg_prompt_tokens || 0));
+         lines.push("  ttft avg " + Math.round(step.avg_ttft_ms || 0) + "ms");
+         lines.push("  decode " + (step.avg_decode_tps || 0).toFixed(1) + " tok/s");
+         lines.push("  total prefill " + (step.total_prompt_tokens || 0) + " tokens");
+       }
+       box.textContent = lines.join("\n") || "no samples yet";
+     } catch (err) {
+       box.textContent = "stats unavailable: " + err.message;
+     }
    }
 
    async function loadTasks() {
@@ -4656,6 +5496,7 @@ HTML_PAGE = r"""
 
    loadConfig();
    loadMemory();
+   loadPerf();
    setInterval(refreshHealth, 3000);
    refreshHealth();
  </script>
@@ -4721,6 +5562,13 @@ def _define_api_models() -> None:
         search_backend: str | None = Field(None, max_length=20)
         search_results: int | None = Field(None, ge=1, le=10)
         tool_result_chars: int | None = Field(None, ge=200, le=40000)
+        tool_raw_chars: int | None = Field(None, ge=200, le=200000)
+        tool_temperature: float | None = Field(None, ge=0.0, le=2.0)
+        disable_thinking: bool | None = None
+        fast_path: bool | None = None
+        stable_prefix: bool | None = None
+        summarise_tool_results: bool | None = None
+        summarise_over_chars: int | None = Field(None, ge=500, le=100000)
 
     class ToolRequest(BaseModel):  # noqa: F811
         name: str = Field(..., min_length=1, max_length=64)
@@ -4740,6 +5588,12 @@ def _define_api_models() -> None:
         tools: str = Field("", max_length=500)
         system_prompt: str | None = Field(None, max_length=8000)
         use_history: bool = False
+        # Run this task on its own model, swapping back afterwards. Empty means
+        # whatever the server is already serving.
+        model: str | None = Field(None, max_length=200)
+        # Run another task when this one succeeds, handing the answer over
+        # through a workspace file.
+        next_task_id: str | None = Field(None, max_length=64)
 
     class TaskUpdateRequest(BaseModel):  # noqa: F811
         name: str | None = Field(None, min_length=1, max_length=120)
@@ -4750,6 +5604,8 @@ def _define_api_models() -> None:
         tools: str | None = Field(None, max_length=500)
         system_prompt: str | None = Field(None, max_length=8000)
         use_history: bool | None = None
+        model: str | None = Field(None, max_length=200)
+        next_task_id: str | None = Field(None, max_length=64)
 
     class ModelSelectRequest(BaseModel):  # noqa: F811
         model: str | None = Field(None, min_length=1, max_length=200)
@@ -4829,6 +5685,7 @@ def create_app(
             "model_process_alive": model_manager.is_alive(),
             "model_healthy": model_healthy,
             "retrain": retrain_manager.status,
+            "prefix": dict(PREFIX_STATE),
             "stats": db.get_stats(),
             "agent_enabled": config.agent_enabled,
             "agent_max_steps": config.agent_max_steps,
@@ -4898,8 +5755,11 @@ def create_app(
         # Recorded before generating, so a failed or empty run still leaves the
         # question in the transcript instead of silently dropping the turn.
         db.add_message(conversation_id, "user", request.message)
+        tasks.note_chat_activity()
+        tasks.chat_in_flight += 1
 
         try:
+            stats: GenerationStats | None = None
             if use_agent:
                 answer = ""
                 trace: list[dict] = []
@@ -4910,6 +5770,17 @@ def create_app(
                     if event["type"] == "final":
                         answer = event["answer"]
                         trace = event.get("trace", [])
+                    elif event["type"] == "usage":
+                        db.log_metric(
+                            "agent_step", event["total_ms"], 200,
+                            stats=GenerationStats(
+                                prompt_tokens=event["prompt_tokens"],
+                                completion_tokens=event["completion_tokens"],
+                                ttft_ms=event["ttft_ms"], total_ms=event["total_ms"],
+                            ),
+                            model=config.model, step=event.get("step"),
+                            conversation_id=conversation_id,
+                        )
                     elif event["type"] == "error":
                         error = event["error"]
                 if error:
@@ -4921,23 +5792,32 @@ def create_app(
                 messages, _ = trim_to_context(
                     system, history, user, config.context_size, max_tokens
                 )
-                answer = await model_client.complete(messages, max_tokens, temperature)
+                answer, stats = await model_client.complete_with_stats(
+                    messages, max_tokens, temperature
+                )
                 trace = []
 
             db.add_message(
                 conversation_id, "assistant", answer,
                 meta={"trace": trace} if trace else None,
             )
-            db.log_metric("chat", (time.time() - start_time) * 1000, 200)
+            db.log_metric(
+                "chat", (time.time() - start_time) * 1000, 200,
+                stats=stats, model=config.model, conversation_id=conversation_id,
+            )
             return {
                 "answer": answer,
                 "conversation_id": conversation_id,
                 "agent": use_agent,
                 "trace": trace,
+                "usage": stats.as_event() if stats else None,
             }
         except Exception as exc:
             db.log_metric("chat", (time.time() - start_time) * 1000, 503, str(exc))
             return JSONResponse(content={"error": str(exc)}, status_code=503)
+        finally:
+            tasks.chat_in_flight = max(0, tasks.chat_in_flight - 1)
+            tasks.note_chat_activity()
 
     @app.post("/api/chat/stream")
     async def chat_stream(request: ChatRequest):
@@ -4961,6 +5841,8 @@ def create_app(
             answer = ""
             trace: list[dict] = []
             start_time = time.time()
+            tasks.note_chat_activity()
+            tasks.chat_in_flight += 1
             try:
                 yield await sse({"type": "start", "conversation_id": conversation_id, "agent": use_agent})
                 db.add_message(conversation_id, "user", request.message)
@@ -4972,6 +5854,17 @@ def create_app(
                         if event["type"] == "final":
                             answer = event["answer"]
                             trace = event.get("trace", [])
+                        elif event["type"] == "usage":
+                            db.log_metric(
+                                "agent_step", event["total_ms"], 200,
+                                stats=GenerationStats(
+                                    prompt_tokens=event["prompt_tokens"],
+                                    completion_tokens=event["completion_tokens"],
+                                    ttft_ms=event["ttft_ms"], total_ms=event["total_ms"],
+                                ),
+                                model=config.model, step=event.get("step"),
+                                conversation_id=conversation_id,
+                            )
                 else:
                     system = {"role": "system", "content": config.system_prompt}
                     user = {"role": "user", "content": request.message}
@@ -4981,9 +5874,17 @@ def create_app(
                     if dropped:
                         yield await sse({"type": "context", "dropped": dropped,
                                          "tokens": messages_tokens(messages)})
-                    async for token in model_client.stream(messages, max_tokens, temperature):
+                    plain_stats = GenerationStats()
+                    async for token in model_client.stream(
+                        messages, max_tokens, temperature, plain_stats
+                    ):
                         answer += token
                         yield await sse({"type": "token", "token": token, "step": 1})
+                    yield await sse({"type": "usage", "step": 1, **plain_stats.as_event()})
+                    db.log_metric(
+                        "chat_stream_gen", plain_stats.total_ms, 200, stats=plain_stats,
+                        model=config.model, step=1, conversation_id=conversation_id,
+                    )
                     yield await sse({"type": "final", "answer": answer, "steps": 1, "trace": []})
 
                 if answer:
@@ -4995,6 +5896,9 @@ def create_app(
             except Exception as exc:
                 db.log_metric("chat_stream", (time.time() - start_time) * 1000, 503, str(exc))
                 yield await sse({"type": "error", "error": str(exc)})
+            finally:
+                tasks.chat_in_flight = max(0, tasks.chat_in_flight - 1)
+                tasks.note_chat_activity()
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(
@@ -5273,6 +6177,28 @@ def create_app(
         threading.Thread(target=retrain_manager.run, kwargs={"trigger": "web"}, daemon=True).start()
         return {"status": "started", "detail": retrain_manager.status}
 
+    @app.get("/api/metrics/summary")
+    def metrics_summary(endpoint: str | None = Query(None, max_length=40)):
+        return {
+            "overall": db.metric_summary(endpoint),
+            "chat": db.metric_summary("chat"),
+            "agent_step": db.metric_summary("agent_step"),
+        }
+
+    @app.get("/api/metrics/run/{conversation_id}")
+    def metrics_for_run(conversation_id: str):
+        """Per-step prompt tokens for one conversation.
+
+        A rising curve here is the agent re-sending its whole prompt each step.
+        Flat means a prefix cache is doing its job.
+        """
+        steps = db.run_step_metrics(conversation_id)
+        return {
+            "conversation_id": conversation_id,
+            "steps": steps,
+            "total_prompt_tokens": sum(s["prompt_tokens"] or 0 for s in steps),
+        }
+
     @app.get("/api/metrics")
     def metrics(limit: int = Query(100, ge=1, le=1000)):
         rows = db.execute(
@@ -5331,6 +6257,146 @@ def doctor(web_port: int, model_port: int) -> None:
     print(f"\nother loopback listeners in 8000-8100: {others or 'none'}")
     print("\nA healthy web UI answers GET / with 200 text/html and")
     print("GET /api/health with 200 application/json. Anything else is the wrong port.")
+
+
+def benchmark(
+    config: Config,
+    prompts: int = 3,
+    prompt_tokens: int = 512,
+    baseline_path: Path | None = None,
+    save: bool = False,
+) -> int:
+    """Measure prefill and decode against a running model server.
+
+    Reports time to first token separately from decode throughput, because on
+    this hardware they respond to completely different fixes: TTFT is prompt
+    processing and scales with how much context the agent re-sends, decode is
+    memory bandwidth and scales with model size. A change that helps one often
+    does nothing for the other.
+    """
+    import urllib.error
+    import urllib.request
+
+    if not port_open(config.model_port):
+        print(f"No model server on port {config.model_port}. Start the app first.")
+        return 1
+
+    sizes = [64, prompt_tokens, prompt_tokens * 4]
+    # Size the filler for the LARGEST prompt, or the biggest sample silently
+    # runs short and the prefill curve looks flatter than it is.
+    sentence = "The quick brown fox jumps over the lazy dog. "
+    repeats = (max(sizes) * CHARS_PER_TOKEN) // len(sentence) + 2
+    filler = sentence * repeats
+    print(f"model : {config.model}")
+    print(f"port  : {config.model_port}")
+    print()
+    print(f"{'prompt tok':>11}  {'ttft ms':>8}  {'decode tok/s':>12}  {'total ms':>9}")
+
+    failures = 0
+    samples: list[dict] = []
+    for size in sizes:
+        text = filler[: size * CHARS_PER_TOKEN]
+        body = json.dumps({
+            "model": config.model,
+            "messages": [
+                {"role": "user", "content": text + "\n\nReply with exactly one short sentence."}
+            ],
+            "max_tokens": 64,
+            "temperature": 0.0,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{config.model_port}/v1/chat/completions",
+            data=body, headers={"Content-Type": "application/json"}, method="POST",
+        )
+        started = time.time()
+        first_at: float | None = None
+        completion = 0
+        prompt_reported = 0
+        try:
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                for raw in resp:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data: "):
+                        continue
+                    chunk = line[6:]
+                    if chunk == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(chunk)
+                    except Exception:
+                        continue
+                    if data.get("usage"):
+                        prompt_reported = int(data["usage"].get("prompt_tokens") or 0)
+                        completion = int(data["usage"].get("completion_tokens") or completion)
+                    choices = data.get("choices") or []
+                    if choices and (choices[0].get("delta") or {}).get("content"):
+                        if first_at is None:
+                            first_at = time.time()
+                        completion = completion or 0
+                        completion += 1
+        except Exception as exc:
+            print(f"{size:>11}  request failed: {exc}")
+            failures += 1
+            continue
+
+        total_ms = (time.time() - started) * 1000
+        ttft_ms = ((first_at - started) * 1000) if first_at else total_ms
+        decode_ms = max(1.0, total_ms - ttft_ms)
+        tps = completion / (decode_ms / 1000.0)
+        samples.append({
+            "requested": size,
+            "prompt_tokens": prompt_reported or size,
+            "ttft_ms": round(ttft_ms, 1),
+            "tps": round(tps, 2),
+            "total_ms": round(total_ms, 1),
+        })
+        print(f"{prompt_reported or size:>11}  {ttft_ms:>8.0f}  {tps:>12.1f}  {total_ms:>9.0f}")
+
+    print()
+    if baseline_path is not None:
+        _report_against_baseline(baseline_path, config.model, samples, save)
+
+    print("TTFT rising steeply with prompt size is re-prefill cost. That is what")
+    print("prompt caching, smaller tool results and a tighter tool catalogue attack.")
+    print("Flat TTFT with low tok/s is memory bandwidth: use a smaller model.")
+    return 1 if failures == len(sizes) else 0
+
+
+def _report_against_baseline(path: Path, model: str, samples: list[dict], save: bool) -> None:
+    """Compare this run to a saved one. Optimizing without this is guessing."""
+    previous: dict = {}
+    if path.is_file():
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log(f"Could not read the benchmark baseline: {exc}", logging.WARNING)
+
+    prior = previous.get("samples") if previous.get("model") == model else None
+    if prior:
+        print(f"vs baseline from {previous.get('recorded_at', 'unknown')}:")
+        print(f"{'prompt tok':>11}  {'ttft delta':>12}  {'tok/s delta':>12}")
+        by_size = {sample["requested"]: sample for sample in prior}
+        for sample in samples:
+            was = by_size.get(sample["requested"])
+            if not was:
+                continue
+            ttft_delta = sample["ttft_ms"] - was["ttft_ms"]
+            tps_delta = sample["tps"] - was["tps"]
+            print(f"{sample['prompt_tokens']:>11}  {ttft_delta:>+11.0f}ms  {tps_delta:>+12.1f}")
+        print()
+    elif previous:
+        print(f"(baseline is for {previous.get('model')}, not comparing)\n")
+
+    if save:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "model": model,
+            "recorded_at": iso(utc_now()),
+            "samples": samples,
+        }, indent=2), encoding="utf-8")
+        print(f"Baseline saved to {path}. Re-run --bench after a change to compare.")
 
 
 def selftest() -> int:
@@ -5602,6 +6668,70 @@ def selftest() -> int:
         finally:
             globals()["ADAPTER_DIR"], globals()["ADAPTER_BACKUP_DIR"] = original_dirs
 
+    # A reasoning model's chain of thought must not be executed as a tool call.
+    thinking = ('<think>Maybe {"tool": "web_search", "args": {"query": "no"}} fits.</think>'
+                '{"tool": "calculator", "args": {"expression": "2+2"}}')
+    parsed = parse_tool_call(thinking, {"calculator", "web_search"})
+    if parsed != ("calculator", {"expression": "2+2"}):
+        failures.append(f"a <think> block hijacked the tool call: {parsed}")
+    if parse_tool_call('<think>considering {"tool": "web_search"', {"web_search"}) is not None:
+        failures.append("an unterminated <think> block produced a tool call mid-stream")
+    if strip_reasoning("<reasoning>hidden</reasoning>visible") != "visible":
+        failures.append("strip_reasoning left the reasoning block in place")
+    if strip_reasoning("no tags here") != "no tags here":
+        failures.append("strip_reasoning mangled ordinary text")
+
+    # Deterministic routing, including the cases that must NOT route.
+    for text, expected in [
+        ("17*23", ("calculator", {"expression": "17*23"})),
+        ("https://example.com/a", ("fetch_url", {"url": "https://example.com/a"})),
+        ("what is the capital of France?", None),
+        ("2024", None),
+    ]:
+        if fast_path_call(text) != expected:
+            failures.append(f"fast_path_call({text!r}) returned {fast_path_call(text)!r}")
+
+    # Prefix stability: step k+1's prompt must start with step k's, so an
+    # extending prompt keeps matching a server-side cache.
+    def trace_prompts(stable: bool) -> list[list[str]]:
+        cfg = Config(context_size=1200, stable_prefix=stable)
+        probe = Agent(cfg, ToolRegistry(cfg), ModelClient(cfg))
+        base_msgs = [{"role": "system", "content": "sys"},
+                     {"role": "user", "content": "the question"}]
+        scratch: list[dict] = []
+        out = []
+        for index in range(12):
+            scratch.append({"role": "assistant", "content": f"call {index}"})
+            scratch.append({"role": "user", "content": "TOOL RESULT:\n" + "z" * 700})
+            messages, _ = probe.assemble(base_msgs, scratch, 128)
+            if messages[:2] != base_msgs:
+                failures.append("assemble evicted the pinned system prompt or question")
+            out.append([m["content"] for m in messages])
+        return out
+
+    def extend_hits(prompts: list[list[str]]) -> int:
+        return sum(1 for i in range(len(prompts) - 1)
+                   if prompts[i + 1][:len(prompts[i])] == prompts[i])
+
+    stable_hits = extend_hits(trace_prompts(True))
+    drop_hits = extend_hits(trace_prompts(False))
+    if stable_hits <= drop_hits:
+        failures.append(f"stable_prefix did not improve prefix reuse ({stable_hits} vs {drop_hits})")
+
+    # The raw tool cap must stay above the context cap, or the summariser never
+    # sees enough text to summarise and silently becomes dead code.
+    sized = Config()
+    sized.apply({"tool_result_chars": 4000, "tool_raw_chars": 500})
+    if sized.tool_raw_chars < sized.tool_result_chars:
+        failures.append("tool_raw_chars was allowed below tool_result_chars")
+
+    # Generation accounting.
+    sample = GenerationStats(prompt_tokens=900, completion_tokens=30, ttft_ms=500, total_ms=2500)
+    if abs(sample.decode_tps - 15.0) > 0.1:
+        failures.append(f"decode_tps computed {sample.decode_tps}, expected 15")
+    if sample.as_event()["estimated"] is not True:
+        failures.append("stats without server usage were not marked estimated")
+
     catalog = model_catalog(Config(model="someone/custom-model"))
     if not any(entry["current"] and entry["id"] == "someone/custom-model" for entry in catalog):
         failures.append("model_catalog did not include the model currently in use")
@@ -5651,6 +6781,7 @@ def selftest() -> int:
     print("PASS  file tools, argument aliasing, tool allowlist, fetch guard")
     print("PASS  task scheduling, run lifecycle, event replay, model catalogue")
     print("PASS  model swapping keeps mismatched adapters out of the server")
+    print("PASS  reasoning stripping, fast path, prefix reuse, token accounting")
     print("PASS  context trimming and runtime config guardrails")
     return 0
 
@@ -5715,6 +6846,10 @@ def main() -> None:
     parser.add_argument("--list-feedback", action="store_true")
     parser.add_argument("--doctor", action="store_true",
                         help="Probe the ports and report what is actually listening, then exit.")
+    parser.add_argument("--bench", action="store_true",
+                        help="Measure prefill and decode against a running model server, then exit.")
+    parser.add_argument("--bench-save", action="store_true",
+                        help="With --bench, save the result as the baseline to compare against later.")
     parser.add_argument("--selftest", action="store_true",
                         help="Verify this file is intact and the embedded UI parses, then exit.")
     parser.add_argument("--export-format", choices=["jsonl", "csv"], default="jsonl")
@@ -5728,6 +6863,14 @@ def main() -> None:
     if args.doctor:
         doctor(args.web_port, args.model_port)
         return
+
+    if args.bench:
+        ensure_dirs()
+        sys.exit(benchmark(
+            Config(model=args.model, model_port=args.model_port),
+            baseline_path=DATA_DIR / "bench_baseline.json",
+            save=args.bench_save,
+        ))
 
     if args.list_models or args.list_tasks or args.add_task:
         ensure_dirs()
@@ -5850,7 +6993,10 @@ def main() -> None:
         return
 
     model_manager = ModelServerManager(
-        config.model, config.model_port, ADAPTER_DIR, config.max_kv_size, config.adapter
+        config.model, config.model_port, ADAPTER_DIR, config.max_kv_size, config.adapter,
+        kv_bits=config.kv_bits, kv_group_size=config.kv_group_size,
+        quantized_kv_start=config.quantized_kv_start,
+        prompt_cache_dir=config.prompt_cache_dir,
     )
     retrain_manager = RetrainManager(db, model_manager, config)
 
