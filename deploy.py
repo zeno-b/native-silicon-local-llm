@@ -23,20 +23,38 @@ Usage:
    python3 deploy.py --system-prompt "You are a pirate"
    python3 deploy.py --agent --context-size 8192 --max-tokens 512
    python3 deploy.py --tool-test web_search --tool-args '{"query": "mlx lora"}'
+   python3 deploy.py --list-models
+   python3 deploy.py --model mlx-community/Qwen2.5-1.5B-Instruct-4bit --adapter none
+   python3 deploy.py --add-task '{"name": "news", "goal": "Search for MLX news", "interval_seconds": 3600}'
 
 Environment overrides:
    MODEL_ID, MODEL_PORT, WEB_PORT, TRAIN_ITERS, TRAIN_LR, TRAIN_SEQ_LEN,
    MAX_TOKENS, SYSTEM_PROMPT, AUTO_RETRAIN_THRESHOLD,
    CONTEXT_SIZE, MAX_KV_SIZE, TEMPERATURE, HISTORY_TURNS,
-   AGENT_ENABLED, AGENT_MAX_STEPS, ALLOW_PYTHON,
+   AGENT_ENABLED, AGENT_MAX_STEPS, ALLOW_PYTHON, ALLOW_SHELL,
+   AGENT_TOOLS (comma-separated allowlist), ALLOW_LOCAL_FETCH,
+   ADAPTER (latest|none|<backup id>), MODEL_CATALOG,
+   MAX_CONCURRENT_TASKS, TASK_POLL_SECONDS,
    SEARCH_BACKEND (ddg|brave|tavily|searxng), SEARCH_RESULTS,
+   TOOL_TIMEOUT, TOOL_RESULT_CHARS,
    BRAVE_API_KEY, TAVILY_API_KEY, SEARXNG_URL
 
 Notes:
 - This script creates ./.venv and installs dependencies on first run.
 - It stores data in ./data and logs in ./logs.
 - Agent tools that touch the filesystem are confined to ./workspace.
+- fetch_url refuses loopback and private addresses unless ALLOW_LOCAL_FETCH=1.
+- run_python and run_shell are off unless you pass --allow-python/--allow-shell.
+  They are not sandboxed: the model gets the same rights as the user running it.
 - Retraining stops the model server temporarily, trains, then restarts it.
+- Tasks are agent runs that happen on their own: give one a goal and an
+  interval, and the scheduler runs it and keeps every step of every run. The
+  Tasks tab in the web UI streams a live run and replays finished ones.
+- Models can be swapped from the Models tab without restarting this process.
+  Uncached weights download on first use; watch the model server log for it.
+- Run --selftest after editing this file. It checks the embedded UI, the
+  database schema, tool parsing and the workspace guard without touching the
+  network or loading a model.
 """
 
 from __future__ import annotations
@@ -65,7 +83,7 @@ import threading
 import time
 import urllib.parse
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Literal
@@ -98,7 +116,7 @@ CONTEXT_SAFETY_MARGIN = 256
 
 # Bump when HTML_PAGE changes. Shown in the header and returned by /api/health so
 # a stale browser cache is immediately visible rather than silently misleading.
-UI_BUILD = "2026-08-06.4-agent"
+UI_BUILD = "2026-08-07.6-tasks"
 
 # Setup logging
 logging.basicConfig(
@@ -122,6 +140,15 @@ def in_venv() -> bool:
     return sys.prefix != sys.base_prefix or bool(os.environ.get("VIRTUAL_ENV"))
 
 
+REQUIRED_MODULES = ["mlx_lm", "fastapi", "uvicorn", "httpx", "pydantic"]
+REQUIRED_PACKAGES = ["mlx-lm", "fastapi", "uvicorn", "httpx", "pydantic"]
+# Guards the install-then-re-exec handoff. A package that installs cleanly but
+# still cannot be imported (mlx-lm off Apple Silicon, a broken wheel) otherwise
+# sends bootstrap round the same install and exec forever, with nothing on
+# stdout but pip repeating itself.
+BOOTSTRAP_MARKER = "LOCAL_LLM_BOOTSTRAP_ATTEMPT"
+
+
 def bootstrap() -> None:
     """Create venv and install dependencies if needed. Re-executes inside venv."""
     if sys.version_info < (3, 9):
@@ -140,35 +167,54 @@ def bootstrap() -> None:
             log("Creating virtual environment...")
             run_cmd([sys.executable, "-m", "venv", str(venv_dir)])
 
-        log("Upgrading pip...")
-        try:
-            run_cmd([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"])
-        except Exception as exc:
-            log(f"Warning: pip upgrade failed: {exc}", logging.WARNING)
+        # Probe before installing. The previous version ran a pip upgrade and a
+        # full install on every launch, which is several seconds on every
+        # --list-models, --list-tasks or --doctor even when nothing is missing.
+        probe = subprocess.run(
+            [str(venv_python), "-c", "import " + ", ".join(REQUIRED_MODULES)],
+            capture_output=True,
+        )
+        if probe.returncode != 0:
+            log("Upgrading pip...")
+            try:
+                run_cmd([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"])
+            except Exception as exc:
+                log(f"Warning: pip upgrade failed: {exc}", logging.WARNING)
 
-        log("Installing dependencies...")
-        run_cmd([
-            str(venv_python), "-m", "pip", "install",
-            "mlx-lm", "fastapi", "uvicorn", "httpx", "pydantic",
-        ])
+            log("Installing dependencies...")
+            run_cmd([
+                str(venv_python), "-m", "pip", "install", *REQUIRED_PACKAGES,
+            ])
 
-        log("Restarting script inside virtual environment...")
+        os.environ[BOOTSTRAP_MARKER] = str(int(os.environ.get(BOOTSTRAP_MARKER, "0")) + 1)
         os.execv(
             str(venv_python),
             [str(venv_python), str(Path(__file__).resolve())] + sys.argv[1:],
         )
 
     missing = []
-    for module_name in ["mlx_lm", "fastapi", "uvicorn", "httpx", "pydantic"]:
+    for module_name in REQUIRED_MODULES:
         try:
             __import__(module_name)
         except Exception:
             missing.append(module_name)
 
     if missing:
+        attempt = int(os.environ.get(BOOTSTRAP_MARKER, "0"))
+        if attempt >= 2:
+            sys.exit(
+                "Cannot import " + ", ".join(missing) + " even after installing "
+                "them into " + sys.prefix + ".\n"
+                "mlx-lm only imports on Apple Silicon: on any other machine this "
+                "script can still run --selftest, --doctor and --list-models, but "
+                "not the model server.\n"
+                "Otherwise delete ./.venv and try again, or install by hand with:\n"
+                f"  {sys.executable} -m pip install " + " ".join(REQUIRED_PACKAGES)
+            )
         packages = ["mlx-lm" if m == "mlx_lm" else m for m in missing]
         log("Installing missing dependencies: " + ", ".join(packages))
         run_cmd([sys.executable, "-m", "pip", "install", *packages])
+        os.environ[BOOTSTRAP_MARKER] = str(attempt + 1)
         os.execv(
             sys.executable,
             [sys.executable, str(Path(__file__).resolve())] + sys.argv[1:],
@@ -178,6 +224,14 @@ def bootstrap() -> None:
 def ensure_dirs() -> None:
     for d in [DATA_DIR, SFT_DIR, LOG_DIR, ADAPTER_DIR.parent, ADAPTER_BACKUP_DIR, WORKSPACE_DIR]:
         d.mkdir(parents=True, exist_ok=True)
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso(moment: datetime | None) -> str | None:
+    return moment.isoformat() if moment else None
 
 
 def estimate_tokens(text: str) -> int:
@@ -198,22 +252,28 @@ def trim_to_context(
     user: dict,
     context_size: int,
     reserve: int,
+    pinned: list[dict] | None = None,
 ) -> tuple[list[dict], int]:
     """Drop the oldest history until the request fits the context window.
 
     Returns the message list actually sent and the number of dropped messages.
-    The system prompt and the current user turn are never dropped: if they alone
-    exceed the budget the caller has a configuration problem, not a history
-    problem, and silently truncating them would hide it.
+    The system prompt, anything in `pinned`, and the current user turn are never
+    dropped: if those alone exceed the budget the caller has a configuration
+    problem, not a history problem, and silently truncating them would hide it.
+
+    `pinned` exists for the agent loop. Without it the oldest message dropped
+    from a long tool trace is the original question, and the model ends up
+    summarising tool output while no longer knowing what was asked.
     """
+    pinned = list(pinned or [])
     budget = max(256, context_size - reserve - CONTEXT_SAFETY_MARGIN)
-    fixed = messages_tokens([system, user])
+    fixed = messages_tokens([system, *pinned, user])
     kept = list(history)
     dropped = 0
     while kept and fixed + messages_tokens(kept) > budget:
         kept.pop(0)
         dropped += 1
-    return [system, *kept, user], dropped
+    return [system, *pinned, *kept, user], dropped
 
 
 class Database:
@@ -224,10 +284,17 @@ class Database:
         self._local = threading.local()
         self._all_conns: list[sqlite3.Connection] = []
         self._conns_lock = threading.Lock()
+        # Bumped by close(). A thread holding a connection from an older
+        # generation reconnects instead of raising ProgrammingError, which is
+        # what happened when close() ran on the main thread while a worker
+        # thread still had its own handle cached.
+        self._generation = 0
         self._init_db()
 
     def _connection(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
+        if conn is not None and getattr(self._local, "generation", -1) != self._generation:
+            conn = None
         if conn is None:
             conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
             conn.row_factory = sqlite3.Row
@@ -235,6 +302,7 @@ class Database:
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA busy_timeout=30000")
             self._local.conn = conn
+            self._local.generation = self._generation
             with self._conns_lock:
                 self._all_conns.append(conn)
         return conn
@@ -313,6 +381,69 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_tool_calls_conversation
                 ON tool_calls(conversation_id, id)
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    goal TEXT NOT NULL,
+                    enabled INTEGER DEFAULT 1,
+                    interval_seconds INTEGER DEFAULT 0,
+                    max_steps INTEGER DEFAULT 6,
+                    tools TEXT DEFAULT '',
+                    system_prompt TEXT,
+                    use_history INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_run_at TIMESTAMP,
+                    next_run_at TIMESTAMP,
+                    run_count INTEGER DEFAULT 0,
+                    last_status TEXT,
+                    last_answer TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS task_runs (
+                    id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    trigger TEXT,
+                    status TEXT NOT NULL,
+                    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    finished_at TIMESTAMP,
+                    steps INTEGER DEFAULT 0,
+                    answer TEXT,
+                    error TEXT,
+                    elapsed_ms REAL,
+                    tools_used TEXT,
+                    model TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_task_runs_task
+                ON task_runs(task_id, started_at DESC)
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS task_events (
+                    id INTEGER PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    type TEXT NOT NULL,
+                    payload TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_task_events_run
+                ON task_events(run_id, seq)
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS memories (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    conversation_id TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             conn.commit()
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
@@ -326,6 +457,7 @@ class Database:
         """Close every connection this Database has handed out, across all threads."""
         with self._conns_lock:
             conns, self._all_conns = self._all_conns, []
+            self._generation += 1
         for conn in conns:
             try:
                 conn.close()
@@ -503,12 +635,275 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def remember(self, key: str, value: str, conversation_id: str | None = None) -> None:
+        """Upsert a durable note the agent can read back in a later session."""
+        stamp = datetime.now(timezone.utc).isoformat()
+        self.execute(
+            "INSERT INTO memories (key, value, conversation_id, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "conversation_id = excluded.conversation_id, updated_at = excluded.updated_at",
+            (key, value, conversation_id, stamp),
+        )
+        self.commit()
+
+    def recall(self, query: str | None = None, limit: int = 10) -> list[dict]:
+        if query:
+            rows = self.execute(
+                "SELECT * FROM memories WHERE key LIKE ? OR value LIKE ? "
+                "ORDER BY updated_at DESC LIMIT ?",
+                (f"%{query}%", f"%{query}%", limit),
+            ).fetchall()
+        else:
+            rows = self.execute(
+                "SELECT * FROM memories ORDER BY updated_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    # ---------------------------------------------------------------- tasks --
+
+    TASK_FIELDS = (
+        "name", "goal", "enabled", "interval_seconds", "max_steps",
+        "tools", "system_prompt", "use_history",
+    )
+
+    def create_task(self, **fields: Any) -> dict:
+        task_id = str(uuid.uuid4())[:12]
+        interval = int(fields.get("interval_seconds") or 0)
+        enabled = 1 if fields.get("enabled", True) else 0
+        # A repeating task is due immediately so the operator sees a first run
+        # rather than waiting out a one-hour interval to find out it is wrong.
+        next_run = iso(utc_now()) if (enabled and interval > 0) else None
+        self.execute(
+            "INSERT INTO tasks (id, name, goal, enabled, interval_seconds, max_steps, "
+            "tools, system_prompt, use_history, next_run_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                str(fields.get("name") or "task").strip()[:120],
+                str(fields.get("goal") or "").strip(),
+                enabled,
+                interval,
+                int(fields.get("max_steps") or 6),
+                str(fields.get("tools") or ""),
+                fields.get("system_prompt"),
+                1 if fields.get("use_history") else 0,
+                next_run,
+            ),
+        )
+        self.commit()
+        return self.get_task(task_id) or {}
+
+    def get_task(self, task_id: str) -> dict | None:
+        row = self.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_tasks(self) -> list[dict]:
+        rows = self.execute("SELECT * FROM tasks ORDER BY created_at DESC").fetchall()
+        return [dict(row) for row in rows]
+
+    def update_task(self, task_id: str, updates: dict) -> dict | None:
+        task = self.get_task(task_id)
+        if task is None:
+            return None
+        sets, params = [], []
+        for key in self.TASK_FIELDS:
+            if key not in updates or updates[key] is None:
+                continue
+            value = updates[key]
+            if key in ("enabled", "use_history"):
+                value = 1 if value else 0
+            elif key in ("interval_seconds", "max_steps"):
+                value = int(value)
+            sets.append(f"{key} = ?")
+            params.append(value)
+        if not sets:
+            return task
+
+        # Re-arm or disarm the schedule to match the new settings, rather than
+        # leaving a stale next_run_at that fires a task the user just disabled.
+        enabled = updates.get("enabled", task["enabled"])
+        interval = int(updates.get("interval_seconds", task["interval_seconds"]) or 0)
+        if not enabled or interval <= 0:
+            next_run = None
+        elif task["next_run_at"] and int(task["interval_seconds"] or 0) == interval and task["enabled"]:
+            next_run = task["next_run_at"]
+        else:
+            next_run = iso(utc_now())
+        sets.append("next_run_at = ?")
+        params.append(next_run)
+        sets.append("updated_at = ?")
+        params.append(iso(utc_now()))
+        params.append(task_id)
+        self.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", tuple(params))
+        self.commit()
+        return self.get_task(task_id)
+
+    def delete_task(self, task_id: str) -> bool:
+        run_ids = [row["id"] for row in
+                   self.execute("SELECT id FROM task_runs WHERE task_id = ?", (task_id,)).fetchall()]
+        for run_id in run_ids:
+            self.execute("DELETE FROM task_events WHERE run_id = ?", (run_id,))
+        self.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+        cursor = self.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        self.commit()
+        return cursor.rowcount > 0
+
+    def due_tasks(self) -> list[dict]:
+        rows = self.execute(
+            "SELECT * FROM tasks WHERE enabled = 1 AND next_run_at IS NOT NULL "
+            "AND next_run_at <= ? ORDER BY next_run_at",
+            (iso(utc_now()),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def schedule_next(self, task_id: str, interval_seconds: int) -> None:
+        from datetime import timedelta
+        next_run = (iso(utc_now() + timedelta(seconds=interval_seconds))
+                    if interval_seconds > 0 else None)
+        self.execute("UPDATE tasks SET next_run_at = ? WHERE id = ?", (next_run, task_id))
+        self.commit()
+
+    # ----------------------------------------------------------------- runs --
+
+    def create_run(self, task_id: str, trigger: str, model: str) -> str:
+        run_id = str(uuid.uuid4())[:16]
+        self.execute(
+            "INSERT INTO task_runs (id, task_id, trigger, status, started_at, model) "
+            "VALUES (?, ?, ?, 'running', ?, ?)",
+            (run_id, task_id, trigger, iso(utc_now()), model),
+        )
+        self.execute(
+            "UPDATE tasks SET last_run_at = ?, last_status = 'running', "
+            "run_count = run_count + 1 WHERE id = ?",
+            (iso(utc_now()), task_id),
+        )
+        self.commit()
+        return run_id
+
+    def finish_run(
+        self,
+        run_id: str,
+        status: str,
+        answer: str = "",
+        error: str | None = None,
+        steps: int = 0,
+        elapsed_ms: float = 0.0,
+        tools_used: list[str] | None = None,
+    ) -> None:
+        self.execute(
+            "UPDATE task_runs SET status = ?, finished_at = ?, steps = ?, answer = ?, "
+            "error = ?, elapsed_ms = ?, tools_used = ? WHERE id = ?",
+            (status, iso(utc_now()), steps, answer, error, elapsed_ms,
+             ",".join(tools_used or []), run_id),
+        )
+        row = self.execute("SELECT task_id FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        if row:
+            self.execute(
+                "UPDATE tasks SET last_status = ?, last_answer = ? WHERE id = ?",
+                (status, answer, row["task_id"]),
+            )
+        self.commit()
+
+    def get_run(self, run_id: str) -> dict | None:
+        row = self.execute("SELECT * FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_runs(self, task_id: str | None = None, limit: int = 20) -> list[dict]:
+        if task_id:
+            rows = self.execute(
+                "SELECT * FROM task_runs WHERE task_id = ? ORDER BY started_at DESC LIMIT ?",
+                (task_id, limit),
+            ).fetchall()
+        else:
+            rows = self.execute(
+                "SELECT * FROM task_runs ORDER BY started_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def append_event(self, run_id: str, seq: int, event_type: str, payload: dict) -> None:
+        self.execute(
+            "INSERT INTO task_events (run_id, seq, type, payload) VALUES (?, ?, ?, ?)",
+            (run_id, seq, event_type, json.dumps(payload, ensure_ascii=False, default=str)[:20000]),
+        )
+        self.commit()
+
+    def run_events(self, run_id: str, after_seq: int = 0, limit: int = 500) -> list[dict]:
+        rows = self.execute(
+            "SELECT seq, type, payload, created_at FROM task_events "
+            "WHERE run_id = ? AND seq > ? ORDER BY seq LIMIT ?",
+            (run_id, after_seq, limit),
+        ).fetchall()
+        events = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"]) if row["payload"] else {}
+            except json.JSONDecodeError:
+                payload = {}
+            payload.update({"seq": row["seq"], "type": row["type"], "at": row["created_at"]})
+            events.append(payload)
+        return events
+
+    def prune_runs(self, task_id: str, keep: int = 25) -> int:
+        stale = self.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? ORDER BY started_at DESC LIMIT -1 OFFSET ?",
+            (task_id, keep),
+        ).fetchall()
+        for row in stale:
+            self.execute("DELETE FROM task_events WHERE run_id = ?", (row["id"],))
+            self.execute("DELETE FROM task_runs WHERE id = ?", (row["id"],))
+        self.commit()
+        return len(stale)
+
+    def reset_orphan_runs(self) -> int:
+        """Mark runs that were live when the process died, so nothing shows as running forever."""
+        cursor = self.execute(
+            "UPDATE task_runs SET status = 'interrupted', finished_at = ?, "
+            "error = 'process exited during this run' WHERE status = 'running'",
+            (iso(utc_now()),),
+        )
+        self.execute("UPDATE tasks SET last_status = 'interrupted' WHERE last_status = 'running'")
+        self.commit()
+        return cursor.rowcount
+
+    def count_memories(self) -> int:
+        return self.execute("SELECT COUNT(*) as cnt FROM memories").fetchone()["cnt"]
+
+    def forget(self, key: str) -> bool:
+        cursor = self.execute("DELETE FROM memories WHERE key = ?", (key,))
+        self.commit()
+        return cursor.rowcount > 0
+
     def log_metric(self, endpoint: str, duration_ms: float, status_code: int, error: str | None = None) -> None:
         self.execute(
             "INSERT INTO metrics (endpoint, duration_ms, status_code, error) VALUES (?, ?, ?, ?)",
             (endpoint, duration_ms, status_code, error),
         )
         self.commit()
+
+
+LOG_FILES = {"model": "model_server.log", "train": "train.log", "tasks": "tasks.log"}
+
+
+def tail_log(name: str, lines: int = 120) -> str:
+    """Return the last N lines of one of the app's log files.
+
+    The model server writes its download progress here, so the UI can show why a
+    swap to an uncached model is taking four minutes instead of appearing hung.
+    """
+    filename = LOG_FILES.get(name)
+    if filename is None:
+        raise ValueError(f"unknown log: {name}")
+    path = LOG_DIR / filename
+    if not path.exists():
+        return ""
+    with open(path, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        block = min(size, max(4096, lines * 200))
+        handle.seek(size - block)
+        raw = handle.read()
+    text = raw.decode("utf-8", "replace")
+    return "\n".join(text.splitlines()[-lines:])
 
 
 def port_open(port: int) -> bool:
@@ -531,9 +926,20 @@ def get_free_port(preferred: int, exclude: set[int] | None = None) -> int:
     raise RuntimeError(f"Could not find a free port near {preferred}")
 
 
-def wait_for_port(port: int, timeout: int = 300, proc: subprocess.Popen | None = None) -> None:
+class StartupCancelled(RuntimeError):
+    """Raised when a stop request arrives while the model server is still loading."""
+
+
+def wait_for_port(
+    port: int,
+    timeout: int = 300,
+    proc: subprocess.Popen | None = None,
+    cancel: threading.Event | None = None,
+) -> None:
     start = time.time()
     while time.time() - start < timeout:
+        if cancel is not None and cancel.is_set():
+            raise StartupCancelled("startup cancelled")
         if proc is not None and proc.poll() is not None:
             raise RuntimeError("Model server process exited early. Check logs/model_server.log.")
         if port_open(port):
@@ -547,6 +953,7 @@ def wait_for_model_ready(
     port: int,
     timeout: int = 900,
     proc: subprocess.Popen | None = None,
+    cancel: threading.Event | None = None,
 ) -> None:
     """Block until the model actually answers a completion.
 
@@ -567,6 +974,8 @@ def wait_for_model_ready(
     start = time.time()
     last_error: str = "no response"
     while time.time() - start < timeout:
+        if cancel is not None and cancel.is_set():
+            raise StartupCancelled("startup cancelled")
         if proc is not None and proc.poll() is not None:
             raise RuntimeError("Model server process exited while loading. Check logs/model_server.log.")
         req = urllib.request.Request(
@@ -581,11 +990,16 @@ def wait_for_model_ready(
                     return
                 last_error = f"HTTP {resp.status}"
         except urllib.error.HTTPError as exc:
-            # A 4xx means the server is up and routing, just unhappy with us.
             body = exc.read(200).decode("utf-8", "replace")
-            raise RuntimeError(
-                f"Model server rejected the readiness probe: HTTP {exc.code} {body}"
-            )
+            # 5xx and 429 are what a server that is up but still loading weights
+            # returns. Only a genuine routing or contract error is fatal, so the
+            # probe no longer aborts a working startup on one transient 500.
+            if exc.code >= 500 or exc.code == 429:
+                last_error = f"HTTP {exc.code} {body[:120]}"
+            else:
+                raise RuntimeError(
+                    f"Model server rejected the readiness probe: HTTP {exc.code} {body}"
+                )
         except Exception as exc:
             last_error = str(exc)
         time.sleep(2)
@@ -611,23 +1025,68 @@ def render_ui() -> str:
 def check_ui_syntax() -> list[str]:
     """Cheap structural check on the rendered <script>, no Node required.
 
-    Catches the failure above by finding string literals broken by a real
-    newline. Returns a list of problems; empty means the script is well formed.
+    Catches the failure above by scanning the script as a character stream and
+    reporting a real newline inside a single- or double-quoted literal. The
+    previous version counted quotes per line, which flagged any correct line
+    containing an apostrophe ("it's") and then refused to start the server. A
+    scanner that tracks comments, escapes and template literals has no such
+    false positive. Returns a list of problems; empty means well formed.
     """
-    import re as _re
-
-    script = _re.search(r"<script>(.*?)</script>", render_ui(), _re.S)
+    script = re.search(r"<script>(.*?)</script>", render_ui(), re.S)
     if not script:
         return ["no <script> block found in HTML_PAGE"]
+    return scan_js_strings(script.group(1))
 
-    problems = []
-    for lineno, line in enumerate(script.group(1).splitlines(), 1):
-        stripped = _re.sub(r"\\.", "", line)          # drop escaped chars
-        stripped = _re.sub(r"//.*$", "", stripped)     # drop line comments
-        for quote in ('"', "'"):
-            if stripped.count(quote) % 2:
-                problems.append(f"line {lineno}: unterminated {quote} string: {line.strip()[:70]}")
-                break
+
+def scan_js_strings(body: str) -> list[str]:
+    """Report string literals broken by a real newline, and unclosed comments."""
+    problems: list[str] = []
+    quote: str | None = None
+    quote_line = 0
+    line = 1
+    index = 0
+    length = len(body)
+
+    while index < length:
+        char = body[index]
+        nxt = body[index + 1] if index + 1 < length else ""
+
+        if char == "\n":
+            line += 1
+            if quote in ('"', "'"):
+                problems.append(f"line {quote_line}: unterminated {quote} string literal")
+                quote = None
+            index += 1
+            continue
+
+        if quote is None:
+            if char == "/" and nxt == "/":
+                while index < length and body[index] != "\n":
+                    index += 1
+                continue
+            if char == "/" and nxt == "*":
+                end = body.find("*/", index + 2)
+                if end == -1:
+                    problems.append(f"line {line}: unterminated block comment")
+                    break
+                line += body.count("\n", index, end)
+                index = end + 2
+                continue
+            if char in ('"', "'", "`"):
+                quote = char
+                quote_line = line
+            index += 1
+            continue
+
+        if char == "\\":
+            index += 2
+            continue
+        if char == quote:
+            quote = None
+        index += 1
+
+    if quote is not None:
+        problems.append(f"line {quote_line}: unterminated {quote} string literal at end of script")
     return problems
 
 
@@ -659,8 +1118,136 @@ def add_if_supported(
     return False
 
 
-def adapter_ready() -> bool:
-    return ADAPTER_DIR.exists() and any(ADAPTER_DIR.iterdir())
+def adapter_ready(path: Path | None = None) -> bool:
+    target = path or ADAPTER_DIR
+    return target.exists() and any(target.iterdir())
+
+
+# Written into an adapter directory at the end of a successful training run.
+# A LoRA adapter only fits the base model it was trained on: handing a Qwen
+# adapter to a Llama server is a shape mismatch, and the start would fall back
+# to the base model silently. Recording the base makes the mismatch visible and
+# skippable instead.
+ADAPTER_BASE_FILE = "base_model.txt"
+
+
+def adapter_base(path: Path) -> str | None:
+    """The model an adapter was trained against, or None for adapters predating this."""
+    marker = path / ADAPTER_BASE_FILE
+    try:
+        return marker.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def write_adapter_base(path: Path, model_id: str) -> None:
+    try:
+        (path / ADAPTER_BASE_FILE).write_text(model_id + "\n", encoding="utf-8")
+    except OSError as exc:
+        log(f"Could not record the adapter base model: {exc}", logging.WARNING)
+
+
+def adapter_fits(path: Path, model_id: str) -> bool:
+    """An untagged adapter is trusted; a tagged one must match the current model."""
+    recorded = adapter_base(path)
+    return recorded is None or recorded == model_id
+
+
+def list_adapters() -> list[dict]:
+    """Every adapter that can be loaded: the live one plus every backup."""
+    entries: list[dict] = []
+    if adapter_ready(ADAPTER_DIR):
+        stat = ADAPTER_DIR.stat()
+        entries.append({
+            "id": "latest",
+            "path": str(ADAPTER_DIR),
+            "base_model": adapter_base(ADAPTER_DIR),
+            "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+        })
+    if ADAPTER_BACKUP_DIR.exists():
+        for item in sorted(ADAPTER_BACKUP_DIR.iterdir(), reverse=True):
+            if item.is_dir() and adapter_ready(item):
+                entries.append({
+                    "id": item.name,
+                    "path": str(item),
+                    "base_model": adapter_base(item),
+                    "modified": datetime.fromtimestamp(
+                        item.stat().st_mtime, timezone.utc).isoformat(),
+                })
+    return entries
+
+
+def resolve_adapter_quietly(choice: str | None) -> Path | None:
+    """resolve_adapter without raising, for read-only reporting."""
+    try:
+        return resolve_adapter(choice)
+    except ValueError:
+        return None
+
+
+def resolve_adapter(choice: str | None) -> Path | None:
+    """Map an adapter id from the UI onto a directory, or None for the base model."""
+    if not choice or choice == "none":
+        return None
+    if choice == "latest":
+        return ADAPTER_DIR if adapter_ready(ADAPTER_DIR) else None
+    candidate = (ADAPTER_BACKUP_DIR / choice).resolve()
+    if ADAPTER_BACKUP_DIR.resolve() not in candidate.parents:
+        raise ValueError("adapter id escapes the backups directory")
+    if not adapter_ready(candidate):
+        raise ValueError(f"no adapter called {choice}")
+    return candidate
+
+
+# Small enough to run on 8GB alongside the web process. Anything on Hugging Face
+# works too; the UI accepts a free-text repo id.
+DEFAULT_MODEL_CATALOG = [
+    "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+    "mlx-community/Qwen2.5-1.5B-Instruct-4bit",
+    "mlx-community/Qwen2.5-3B-Instruct-4bit",
+    "mlx-community/Llama-3.2-1B-Instruct-4bit",
+    "mlx-community/Llama-3.2-3B-Instruct-4bit",
+    "mlx-community/Phi-3.5-mini-instruct-4bit",
+    "mlx-community/gemma-2-2b-it-4bit",
+]
+
+
+def hf_cache_dir() -> Path:
+    """Where huggingface_hub keeps downloaded repos."""
+    if os.environ.get("HF_HUB_CACHE"):
+        return Path(os.environ["HF_HUB_CACHE"])
+    if os.environ.get("HF_HOME"):
+        return Path(os.environ["HF_HOME"]) / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def model_is_cached(model_id: str) -> bool:
+    """True when the weights are already on disk, so switching is instant.
+
+    A miss is not an error: mlx_lm.server downloads on first use. The UI shows
+    this so a switch that is about to pull several gigabytes says so up front.
+    """
+    if Path(model_id).expanduser().is_dir():
+        return True
+    folder = "models--" + model_id.replace("/", "--")
+    path = hf_cache_dir() / folder / "snapshots"
+    try:
+        return path.is_dir() and any(path.iterdir())
+    except OSError:
+        return False
+
+
+def model_catalog(config: "Config") -> list[dict]:
+    ids = [item.strip() for item in (config.model_catalog or "").split(",") if item.strip()]
+    for known in DEFAULT_MODEL_CATALOG:
+        if known not in ids:
+            ids.append(known)
+    if config.model not in ids:
+        ids.insert(0, config.model)
+    return [
+        {"id": item, "cached": model_is_cached(item), "current": item == config.model}
+        for item in ids
+    ]
 
 
 @dataclass
@@ -689,6 +1276,20 @@ class Config:
     agent_max_steps: int = field(default_factory=lambda: int(os.environ.get("AGENT_MAX_STEPS", "6")))
     allow_python: bool = field(default_factory=lambda: os.environ.get("ALLOW_PYTHON", "0") == "1")
     allow_shell: bool = field(default_factory=lambda: os.environ.get("ALLOW_SHELL", "0") == "1")
+    # Comma-separated allowlist. Empty means every registered tool is offered.
+    agent_tools: str = field(default_factory=lambda: os.environ.get("AGENT_TOOLS", ""))
+    # Which LoRA adapter the model server loads: latest, none, or a backup id.
+    adapter: str = field(default_factory=lambda: os.environ.get("ADAPTER", "latest"))
+    # Extra model ids to offer in the switcher, on top of DEFAULT_MODEL_CATALOG.
+    model_catalog: str = field(default_factory=lambda: os.environ.get("MODEL_CATALOG", ""))
+    # How many background task runs may execute at once. The model server
+    # serves one request at a time, so more than one mostly adds queueing.
+    max_concurrent_tasks: int = field(default_factory=lambda: int(os.environ.get("MAX_CONCURRENT_TASKS", "1")))
+    task_poll_seconds: int = field(default_factory=lambda: int(os.environ.get("TASK_POLL_SECONDS", "2")))
+    # fetch_url refuses loopback and RFC1918 targets unless this is on, so a
+    # prompt-injected page cannot make the agent read the machine's own
+    # services (including this app's API) and hand the result back.
+    allow_local_fetch: bool = field(default_factory=lambda: os.environ.get("ALLOW_LOCAL_FETCH", "0") == "1")
 
     # Tools
     search_backend: str = field(default_factory=lambda: os.environ.get("SEARCH_BACKEND", "ddg"))
@@ -710,13 +1311,20 @@ class Config:
         "search_backend", "search_results", "tool_result_chars",
     )
 
+    SEARCH_BACKENDS = ("ddg", "brave", "tavily", "searxng")
+
     def public(self) -> dict:
         data = {k: v for k, v in asdict(self).items()}
         data["mutable"] = list(self.MUTABLE)
         return data
 
     def apply(self, updates: dict) -> list[str]:
-        """Apply a settings patch. Returns the names of the fields changed."""
+        """Apply a settings patch. Returns the names of the fields changed.
+
+        Values are clamped afterwards, and any field the clamp moved is reported
+        as changed too, so the UI never shows a setting the process did not
+        actually adopt.
+        """
         changed = []
         for key, value in updates.items():
             if key not in self.MUTABLE or value is None:
@@ -730,27 +1338,48 @@ class Config:
                 value = float(value)
             else:
                 value = str(value)
+            if key == "search_backend":
+                value = str(value).lower()
+                if value not in self.SEARCH_BACKENDS:
+                    log(f"Ignoring unknown search backend: {value}", logging.WARNING)
+                    continue
             if value != current:
                 setattr(self, key, value)
                 changed.append(key)
-        if self.context_size < 512:
-            self.context_size = 512
-        if self.max_tokens < 16:
-            self.max_tokens = 16
+
+        before = {name: getattr(self, name) for name in
+                  ("context_size", "max_tokens", "temperature", "agent_max_steps",
+                   "history_turns", "search_results", "tool_result_chars")}
+        self.context_size = max(512, self.context_size)
+        self.max_tokens = max(16, self.max_tokens)
         if self.max_tokens >= self.context_size:
             self.max_tokens = max(16, self.context_size // 2)
         self.temperature = min(2.0, max(0.0, self.temperature))
         self.agent_max_steps = min(20, max(1, self.agent_max_steps))
+        self.history_turns = min(200, max(0, self.history_turns))
+        self.search_results = min(10, max(1, self.search_results))
+        self.tool_result_chars = min(40000, max(200, self.tool_result_chars))
+        for name, old in before.items():
+            if getattr(self, name) != old and name not in changed:
+                changed.append(name)
         return changed
 
 
 class ModelServerManager:
     """Manages the MLX model server with health probes and auto-restart."""
 
-    def __init__(self, model_id: str, model_port: int, adapter_dir: Path, max_kv_size: int = 0):
+    def __init__(
+        self,
+        model_id: str,
+        model_port: int,
+        adapter_dir: Path,
+        max_kv_size: int = 0,
+        adapter_choice: str = "latest",
+    ):
         self.model_id = model_id
         self.model_port = model_port
         self.adapter_dir = adapter_dir
+        self.adapter_choice = adapter_choice
         self.max_kv_size = max_kv_size
         self.proc: subprocess.Popen | None = None
         self.status = "stopped"
@@ -759,6 +1388,9 @@ class ModelServerManager:
         self._log_file: Any = None
         self._watchdog_thread: threading.Thread | None = None
         self._watchdog_stop = threading.Event()
+        # Set by stop(). Both readiness waits poll it, so a stop or a retrain no
+        # longer blocks behind a start that is 900 seconds from timing out.
+        self._cancel = threading.Event()
 
     def _build_cmd(self, use_adapter: bool) -> list[str]:
         cmd = [sys.executable, "-m", "mlx_lm.server"]
@@ -777,9 +1409,61 @@ class ModelServerManager:
                     "Installed mlx_lm.server has no --max-kv-size; the KV cache stays unbounded.",
                     logging.WARNING,
                 )
-        if use_adapter and adapter_ready():
-            add_if_supported(cmd, self._server_help, ["--adapter-path", "--adapter"], str(self.adapter_dir))
+        adapter_path = self.adapter_path()
+        if use_adapter and adapter_path is not None:
+            add_if_supported(cmd, self._server_help, ["--adapter-path", "--adapter"], str(adapter_path))
         return cmd
+
+    def adapter_path(self) -> Path | None:
+        """The adapter directory the next start will use, or None for the base model."""
+        try:
+            path = resolve_adapter(self.adapter_choice)
+        except ValueError as exc:
+            log(f"Adapter {self.adapter_choice!r} unusable ({exc}); falling back to the base model.",
+                logging.WARNING)
+            return None
+        if path is not None and not adapter_fits(path, self.model_id):
+            log(
+                f"Adapter {self.adapter_choice!r} was trained on {adapter_base(path)}, "
+                f"not {self.model_id}. Serving the base model instead. Retrain to get "
+                "an adapter for this model.",
+                logging.WARNING,
+            )
+            return None
+        return path
+
+    def describe(self) -> dict:
+        selected = resolve_adapter_quietly(self.adapter_choice)
+        active = self.adapter_path()
+        return {
+            "model": self.model_id,
+            "adapter": self.adapter_choice,
+            "adapter_path": str(active or ""),
+            "adapter_active": active is not None,
+            "adapter_base": adapter_base(selected) if selected is not None else None,
+            "adapter_mismatch": bool(
+                selected is not None and not adapter_fits(selected, self.model_id)
+            ),
+            "max_kv_size": self.max_kv_size,
+            "status": self.status,
+            "cached": model_is_cached(self.model_id),
+        }
+
+    def swap(self, model_id: str | None = None, adapter_choice: str | None = None) -> bool:
+        """Point at a different model or adapter. Returns True if a restart is due."""
+        changed = False
+        with self.lock:
+            if model_id and model_id != self.model_id:
+                self.model_id = model_id
+                changed = True
+            if adapter_choice is not None and adapter_choice != self.adapter_choice:
+                # Validate before adopting, so a bad id cannot leave the manager
+                # pointing at something that fails on every future start.
+                if adapter_choice not in ("latest", "none"):
+                    resolve_adapter(adapter_choice)
+                self.adapter_choice = adapter_choice
+                changed = True
+        return changed
 
     def _start_watchdog(self) -> None:
         # A restart triggered from inside the watchdog thread must not spawn a second one.
@@ -791,17 +1475,29 @@ class ModelServerManager:
         self._watchdog_thread.start()
 
     def _watchdog_loop(self) -> None:
-        """Auto-restart model server if it crashes unexpectedly."""
+        """Auto-restart the model server if it crashes unexpectedly."""
         while not self._watchdog_stop.wait(5):
-            with self.lock:
+            # A timed acquire, not a blocking one: a retrain holds this lock for
+            # the length of a training run, and a watchdog parked on it would
+            # never see its own stop event.
+            if not self.lock.acquire(timeout=1):
+                continue
+            try:
+                if self._watchdog_stop.is_set():
+                    return
                 if self.status == "ready" and self.proc is not None and self.proc.poll() is not None:
                     log("Watchdog: Model server crashed, restarting...", logging.WARNING)
                     self.status = "restarting"
                     try:
                         self._start_internal()
+                    except StartupCancelled:
+                        log("Watchdog restart cancelled by an explicit stop.", logging.WARNING)
+                        self.status = "stopped"
                     except Exception as exc:
                         log(f"Watchdog restart failed: {exc}", logging.ERROR)
                         self.status = f"error: {exc}"
+            finally:
+                self.lock.release()
 
     def _stop_watchdog(self) -> None:
         self._watchdog_stop.set()
@@ -811,23 +1507,31 @@ class ModelServerManager:
             thread.join(timeout=2)
             self._watchdog_thread = None
 
+    def _terminate_proc(self) -> None:
+        """Kill the child and release its log handle. Caller holds the lock."""
+        if self.proc is not None and self.proc.poll() is None:
+            log("Stopping model server...")
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                try:
+                    self.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    log("Model server did not exit after SIGKILL.", logging.WARNING)
+        self.proc = None
+        self._close_log_file()
+
     def stop(self) -> None:
+        # Signal before taking the lock. Whoever holds it is inside a readiness
+        # wait and will bail out on the next poll instead of holding us for
+        # minutes.
+        self._cancel.set()
         self._stop_watchdog()
         with self.lock:
-            if self.proc is not None and self.proc.poll() is None:
-                log("Stopping model server...")
-                self.proc.terminate()
-                try:
-                    self.proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    self.proc.kill()
-                    try:
-                        self.proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        log("Model server did not exit after SIGKILL.", logging.WARNING)
-            self.proc = None
+            self._terminate_proc()
             self.status = "stopped"
-            self._close_log_file()
         # Give the OS a moment to release the port. Done outside the lock.
         time.sleep(0.5)
 
@@ -841,8 +1545,9 @@ class ModelServerManager:
 
     def _start_internal(self) -> None:
         """Internal start without lock acquisition (caller must hold lock)."""
+        self._cancel.clear()
         candidates = []
-        if adapter_ready():
+        if self.adapter_path() is not None:
             candidates.append(self._build_cmd(True))
         candidates.append(self._build_cmd(False))
 
@@ -857,17 +1562,28 @@ class ModelServerManager:
             if proc.poll() is None:
                 self.proc = proc
                 try:
-                    wait_for_port(self.model_port, timeout=300, proc=proc)
+                    wait_for_port(self.model_port, timeout=300, proc=proc, cancel=self._cancel)
                     self.status = "loading"
                     log(f"Port {self.model_port} open. Waiting for weights to load...")
-                    wait_for_model_ready(self.model_id, self.model_port, timeout=900, proc=proc)
+                    wait_for_model_ready(
+                        self.model_id, self.model_port,
+                        timeout=900, proc=proc, cancel=self._cancel,
+                    )
                     self.status = "ready"
                     log(f"Model loaded and responding at http://127.0.0.1:{self.model_port}")
                     self._start_watchdog()
                     return
+                except StartupCancelled:
+                    # Do not fall through to the no-adapter candidate: the caller
+                    # asked for a stop, not for a different command line.
+                    self._terminate_proc()
+                    self.status = "stopped"
+                    raise
                 except Exception as exc:
                     last_error = exc
-                    self.stop()
+                    # _terminate_proc, not stop(): stop() would set the cancel
+                    # flag and abort the very retry we are about to make.
+                    self._terminate_proc()
             else:
                 self._close_log_file()
                 last_error = RuntimeError(
@@ -1003,8 +1719,10 @@ class RetrainManager:
         if not examples:
             return 0, []
 
-        random.seed(42)
-        random.shuffle(examples)
+        # A private Random keeps the split reproducible without reseeding the
+        # process-wide generator, which every other caller of random shares.
+        rng = random.Random(42)
+        rng.shuffle(examples)
 
         split = max(1, int(len(examples) * 0.9))
         train_examples = examples[:split]
@@ -1052,6 +1770,7 @@ class RetrainManager:
                 if proc.returncode != 0:
                     raise RuntimeError(f"Training failed with exit code {proc.returncode}. See logs/train.log.")
 
+            write_adapter_base(ADAPTER_DIR, self.config.model)
             self.db.mark_trained(exported_ids)
 
             self.status["message"] = "Training complete. Restarting model server."
@@ -1073,6 +1792,38 @@ class RetrainManager:
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " \
              "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+
+# Hard ceiling on a single fetch_url download, independent of tool_result_chars.
+MAX_FETCH_BYTES = 2_000_000
+
+
+def guard_public_url(url: str) -> None:
+    """Reject URLs that resolve to the local machine or a private network.
+
+    Without this, a page the agent fetches can instruct it to fetch
+    http://127.0.0.1:8000/api/config or a LAN device, and the model will comply:
+    the tool loop treats page text as input, and small models follow it. The
+    check runs against the resolved address, so a hostname pointing at 127.0.0.1
+    is caught too.
+    """
+    import ipaddress
+
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname
+    if not host:
+        raise ValueError("url has no host")
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
+    except socket.gaierror as exc:
+        raise ValueError(f"could not resolve {host}: {exc}") from exc
+    for info in infos:
+        address = ipaddress.ip_address(info[4][0])
+        if (address.is_private or address.is_loopback or address.is_link_local
+                or address.is_reserved or address.is_multicast):
+            raise ValueError(
+                f"refusing to fetch {host} ({address}): private or loopback address. "
+                "Set ALLOW_LOCAL_FETCH=1 if this is deliberate."
+            )
 
 
 def strip_html(raw: str) -> str:
@@ -1328,12 +2079,49 @@ class Tool:
 class ToolRegistry:
     """The tools the agent can call, built from the live config."""
 
+    # Argument names small models reach for that are not the ones in the spec.
+    ARG_ALIASES = {
+        "q": "query", "search_query": "query", "search": "query", "keywords": "query",
+        "link": "url", "href": "url", "uri": "url", "address": "url",
+        "file": "path", "filename": "path", "file_path": "path", "filepath": "path",
+        "dir": "path", "directory": "path", "folder": "path",
+        "text": "content", "body": "content", "data": "content",
+        "expr": "expression", "equation": "expression", "math": "expression",
+        "cmd": "command", "shell": "command", "script": "code", "source": "code",
+        "old": "find", "old_str": "find", "new": "replace", "new_str": "replace",
+        "regex": "pattern", "tz": "timezone", "name": "key", "note": "value",
+        "response": "answer", "result": "answer", "final": "answer",
+    }
+
     def __init__(self, config: Config, db: Database | None = None):
         self.config = config
         self.db = db
         self.search = SearchBackend(config)
         self._tools: dict[str, Tool] = {}
+        # Set per request so memory writes can record where they came from.
+        self.conversation_id: str | None = None
         self._register_defaults()
+
+    def normalise_args(self, tool: Tool, args: dict) -> dict:
+        """Map common argument-name mistakes onto the tool's real parameters.
+
+        A 0.5B model calls web_search with {"q": ...} often enough that dropping
+        the argument and reporting a missing one wastes a whole agent step.
+        """
+        clean: dict[str, Any] = {}
+        for key, value in args.items():
+            if key in tool.parameters:
+                clean[key] = value
+                continue
+            alias = self.ARG_ALIASES.get(str(key).lower())
+            if alias and alias in tool.parameters and alias not in clean:
+                clean[alias] = value
+        # A single unnamed value against a single-required-argument tool.
+        if not clean and len(tool.required) == 1 and len(args) == 1:
+            only = next(iter(args.values()))
+            if isinstance(only, (str, int, float)):
+                clean[tool.required[0]] = only
+        return clean
 
     def _add(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
@@ -1379,7 +2167,10 @@ class ToolRegistry:
         self._add(Tool(
             name="list_files",
             description="List files in the workspace directory.",
-            parameters={"path": "subdirectory, default the workspace root"},
+            parameters={
+                "path": "subdirectory, default the workspace root",
+                "recursive": "true to walk subdirectories, default false",
+            },
             required=[],
             handler=self._list_files,
         ))
@@ -1398,11 +2189,74 @@ class ToolRegistry:
             handler=self._write_file,
         ))
         self._add(Tool(
+            name="edit_file",
+            description=(
+                "Replace an exact snippet inside a workspace file. Prefer this over "
+                "write_file when changing part of a file you have already read."
+            ),
+            parameters={
+                "path": "file path relative to the workspace",
+                "find": "exact text to replace, must appear in the file",
+                "replace": "replacement text",
+                "count": "how many occurrences to replace, default all",
+            },
+            required=["path", "find", "replace"],
+            handler=self._edit_file,
+        ))
+        self._add(Tool(
+            name="search_files",
+            description="Search workspace files for a regular expression and return matching lines.",
+            parameters={
+                "pattern": "regular expression",
+                "path": "subdirectory to search, default the workspace root",
+                "max_results": "how many matching lines, default 40",
+            },
+            required=["pattern"],
+            handler=self._search_files,
+        ))
+        self._add(Tool(
             name="recall_feedback",
             description="Search stored user feedback for earlier questions and corrected answers.",
             parameters={"query": "text to look for", "limit": "how many rows, default 5"},
             required=["query"],
             handler=self._recall_feedback,
+        ))
+        self._add(Tool(
+            name="remember",
+            description=(
+                "Store a durable note under a short key. Survives restarts and is "
+                "visible in later conversations. Use for facts the user tells you "
+                "about themselves, their setup, or their preferences."
+            ),
+            parameters={"key": "short identifier, for example user.timezone",
+                        "value": "the note to store"},
+            required=["key", "value"],
+            handler=self._remember,
+        ))
+        self._add(Tool(
+            name="recall_memory",
+            description="Look up notes stored earlier with remember. Omit the query to list the most recent.",
+            parameters={"query": "text to match against keys and values",
+                        "limit": "how many notes, default 10"},
+            required=[],
+            handler=self._recall_memory,
+        ))
+        self._add(Tool(
+            name="forget",
+            description="Delete a note stored with remember.",
+            parameters={"key": "the key to delete"},
+            required=["key"],
+            handler=self._forget,
+        ))
+        self._add(Tool(
+            name="final_answer",
+            description=(
+                "End the loop and give the user your answer. Call this when you have "
+                "enough information. The answer argument is shown verbatim."
+            ),
+            parameters={"answer": "the complete answer, in plain text"},
+            required=["answer"],
+            handler=lambda answer: str(answer),
         ))
         if self.config.allow_python:
             self._add(Tool(
@@ -1420,6 +2274,18 @@ class ToolRegistry:
                 required=["command"],
                 handler=self._run_shell,
             ))
+
+        allow = {name.strip() for name in (self.config.agent_tools or "").split(",") if name.strip()}
+        if allow:
+            unknown = allow - set(self._tools)
+            if unknown:
+                log(f"AGENT_TOOLS names tools that do not exist: {', '.join(sorted(unknown))}",
+                    logging.WARNING)
+            # final_answer is the loop's exit condition, never filtered out.
+            self._tools = {
+                name: tool for name, tool in self._tools.items()
+                if name in allow or name == "final_answer"
+            }
 
     def _web_search(self, query: str, num_results: Any = None) -> str:
         try:
@@ -1439,28 +2305,50 @@ class ToolRegistry:
         import httpx
         if not url.lower().startswith(("http://", "https://")):
             raise ValueError("url must start with http:// or https://")
+        if not self.config.allow_local_fetch:
+            guard_public_url(url)
         limit = self.config.tool_result_chars
         try:
             if max_chars:
                 limit = min(20000, max(200, int(max_chars)))
         except (TypeError, ValueError):
             pass
+        # Read a bounded number of bytes rather than resp.text. An unbounded
+        # read of a large file is how a tool call turns into an out-of-memory
+        # kill on a machine with 8GB shared between the app and the model.
+        byte_cap = min(MAX_FETCH_BYTES, max(4096, limit * 8))
         with httpx.Client(
             timeout=self.config.tool_timeout,
             follow_redirects=True,
             headers={"User-Agent": USER_AGENT},
         ) as client:
-            resp = client.get(url)
-            resp.raise_for_status()
-            content_type = resp.headers.get("content-type", "")
-            body = resp.text
+            with client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                if not self.config.allow_local_fetch:
+                    guard_public_url(str(resp.url))
+                content_type = resp.headers.get("content-type", "").lower()
+                if content_type and not any(
+                    kind in content_type
+                    for kind in ("text/", "json", "xml", "html", "javascript", "csv")
+                ):
+                    return f"{url}\n\n[skipped: unsupported content type {content_type}]"
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in resp.iter_bytes():
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if total >= byte_cap:
+                        break
+                encoding = resp.encoding or "utf-8"
+        body = b"".join(chunks).decode(encoding, "replace")
         text = strip_html(body) if "html" in content_type or "<" in body[:200] else body
         title = ""
         match = re.search(r"(?is)<title[^>]*>(.*?)</title>", body)
         if match:
             title = strip_html(match.group(1))
         header = f"{title}\n{url}\n\n" if title else f"{url}\n\n"
-        return (header + text)[:limit]
+        truncated = "\n\n[truncated]" if total >= byte_cap else ""
+        return (header + text)[:limit] + truncated
 
     def _calculator(self, expression: str) -> str:
         return str(safe_eval(expression))
@@ -1475,12 +2363,24 @@ class ToolRegistry:
         label = timezone if tz else "UTC"
         return now.strftime(f"%Y-%m-%d %H:%M:%S ({label}), %A")
 
-    def _list_files(self, path: str = "") -> str:
+    def _list_files(self, path: str = "", recursive: Any = False) -> str:
         target = resolve_in_workspace(path)
         if not target.exists():
             return "Directory does not exist."
         if target.is_file():
             return f"{target.name} ({target.stat().st_size} bytes)"
+        if str(recursive).lower() in ("1", "true", "yes"):
+            root = WORKSPACE_DIR.resolve()
+            entries = sorted(
+                (item for item in target.rglob("*")),
+                key=lambda item: str(item),
+            )
+            lines = [
+                f"{item.relative_to(root)}{'/' if item.is_dir() else ''}"
+                f"{'' if item.is_dir() else f' ({item.stat().st_size} bytes)'}"
+                for item in entries[:400]
+            ]
+            return "\n".join(lines) or "Empty directory."
         entries = sorted(target.iterdir())
         if not entries:
             return "Empty directory."
@@ -1501,6 +2401,57 @@ class ToolRegistry:
         target.write_text(str(content), encoding="utf-8")
         return f"Wrote {len(str(content))} characters to {target.relative_to(WORKSPACE_DIR.resolve())}"
 
+    def _edit_file(self, path: str, find: str, replace: str, count: Any = None) -> str:
+        target = resolve_in_workspace(path)
+        if not target.is_file():
+            raise ValueError(f"no such file: {path}")
+        original = target.read_text(encoding="utf-8", errors="replace")
+        occurrences = original.count(find)
+        if occurrences == 0:
+            raise ValueError(
+                "the find text does not appear in the file. Read the file first "
+                "and copy the snippet exactly, including indentation."
+            )
+        try:
+            limit = int(count) if count not in (None, "") else occurrences
+        except (TypeError, ValueError):
+            limit = occurrences
+        updated = original.replace(find, str(replace), max(1, limit))
+        target.write_text(updated, encoding="utf-8")
+        replaced = min(occurrences, max(1, limit))
+        return (f"Replaced {replaced} of {occurrences} occurrence(s) in "
+                f"{target.relative_to(WORKSPACE_DIR.resolve())}")
+
+    def _search_files(self, pattern: str, path: str = "", max_results: Any = None) -> str:
+        root = resolve_in_workspace(path)
+        if not root.exists():
+            return "Directory does not exist."
+        try:
+            limit = min(200, max(1, int(max_results)))
+        except (TypeError, ValueError):
+            limit = 40
+        try:
+            regex = re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(f"invalid regular expression: {exc}") from exc
+
+        workspace = WORKSPACE_DIR.resolve()
+        targets = [root] if root.is_file() else sorted(root.rglob("*"))
+        hits: list[str] = []
+        for item in targets:
+            if not item.is_file() or item.stat().st_size > 2_000_000:
+                continue
+            try:
+                text = item.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            for lineno, line in enumerate(text.splitlines(), 1):
+                if regex.search(line):
+                    hits.append(f"{item.relative_to(workspace)}:{lineno}: {line.strip()[:200]}")
+                    if len(hits) >= limit:
+                        return "\n".join(hits) + "\n[result limit reached]"
+        return "\n".join(hits) or "No matches."
+
     def _recall_feedback(self, query: str, limit: Any = 5) -> str:
         if self.db is None:
             return "Feedback store unavailable."
@@ -1516,6 +2467,32 @@ class ToolRegistry:
             answer = row.get("corrected_response") or row.get("assistant_response") or ""
             lines.append(f"Q: {row.get('user_prompt', '')}\nA: {answer}")
         return "\n\n".join(lines)
+
+    def _remember(self, key: str, value: str) -> str:
+        if self.db is None:
+            return "Memory store unavailable."
+        key = str(key).strip()[:120]
+        if not key:
+            raise ValueError("key must not be empty")
+        self.db.remember(key, str(value), self.conversation_id)
+        return f"Stored under {key}."
+
+    def _recall_memory(self, query: str = "", limit: Any = 10) -> str:
+        if self.db is None:
+            return "Memory store unavailable."
+        try:
+            count = min(50, max(1, int(limit)))
+        except (TypeError, ValueError):
+            count = 10
+        rows = self.db.recall(query or None, count)
+        if not rows:
+            return "No stored notes." if not query else f"No stored notes matching {query!r}."
+        return "\n".join(f"{row['key']}: {row['value']}" for row in rows)
+
+    def _forget(self, key: str) -> str:
+        if self.db is None:
+            return "Memory store unavailable."
+        return f"Deleted {key}." if self.db.forget(str(key)) else f"No note called {key}."
 
     def _run_python(self, code: str) -> str:
         WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1546,20 +2523,27 @@ class ToolRegistry:
         """Run a tool. Returns (result text, error message or None)."""
         tool = self.get(name)
         start = time.time()
+        self.conversation_id = conversation_id
         if tool is None:
             error = f"Unknown tool: {name}. Available: {', '.join(self.names())}"
             if self.db:
                 self.db.log_tool_call(conversation_id, name, args, "", 0.0, error)
             return error, error
 
-        missing = [key for key in tool.required if key not in args or args[key] in (None, "")]
+        normalised = self.normalise_args(tool, args)
+        missing = [
+            key for key in tool.required
+            if key not in normalised or normalised[key] in (None, "")
+        ]
         if missing:
-            error = f"Missing required argument(s) for {name}: {', '.join(missing)}"
+            expected = ", ".join(f"{k} ({v})" for k, v in tool.parameters.items())
+            error = (f"Missing required argument(s) for {name}: {', '.join(missing)}. "
+                     f"Expected arguments: {expected}")
             if self.db:
                 self.db.log_tool_call(conversation_id, name, args, "", 0.0, error)
             return error, error
 
-        clean = {k: v for k, v in args.items() if k in tool.parameters}
+        clean = self.normalise_args(tool, args)
         try:
             result = str(tool.handler(**clean))
             error = None
@@ -1581,10 +2565,19 @@ TOOL_PROTOCOL = textwrap.dedent("""\
     You can call tools. To call one, reply with a single JSON object and nothing
     else:
     {"tool": "tool_name", "args": {"arg": "value"}}
-    You will then receive a message beginning with TOOL RESULT. Use it to answer.
-    Call one tool at a time. When you can answer, reply with plain text and no
-    JSON. Never invent tool output. Never claim you searched unless a TOOL RESULT
-    says so.
+
+    Rules:
+    - One tool per reply. Use the exact argument names listed below.
+    - You will then receive a message beginning with TOOL RESULT. Read it before
+      deciding what to do next.
+    - When you have enough information, either reply in plain text with no JSON,
+      or call final_answer with your complete answer.
+    - Never invent tool output, and never say you searched, read or ran anything
+      unless a TOOL RESULT above shows it.
+    - If a tool returns an error, fix the arguments and try once more, or answer
+      without it. Do not repeat an identical call.
+    - Prefer web_search then fetch_url for anything current. Prefer the
+      calculator over doing arithmetic yourself.
 
     Available tools:
     """)
@@ -1645,13 +2638,23 @@ def extract_json_object(text: str) -> dict | None:
     return None
 
 
-def parse_tool_call(text: str) -> tuple[str, dict] | None:
-    """Return (tool name, args) if the reply is a tool call, else None."""
+def parse_tool_call(text: str, known: set[str] | None = None) -> tuple[str, dict] | None:
+    """Return (tool name, args) if the reply is a tool call, else None.
+
+    `known` is the set of registered tool names. When it is supplied, a JSON
+    object whose name is not a real tool is only treated as a call if it used
+    the explicit "tool" key. That stops a final answer that happens to contain
+    JSON (a config snippet, a parsed record) from being executed as a tool call.
+    """
     parsed = extract_json_object(text)
     if not parsed:
         return None
+    explicit = "tool" in parsed or "tool_name" in parsed
     name = parsed.get("tool") or parsed.get("name") or parsed.get("tool_name")
     if not isinstance(name, str) or not name:
+        return None
+    name = name.strip()
+    if known is not None and name not in known and not explicit:
         return None
     args = parsed.get("args") or parsed.get("arguments") or parsed.get("parameters") or {}
     if isinstance(args, str):
@@ -1674,21 +2677,32 @@ class ModelClient:
     def url(self) -> str:
         return f"http://127.0.0.1:{self.config.model_port}/v1/chat/completions"
 
-    def payload(self, messages: list[dict], stream: bool, max_tokens: int | None = None) -> dict:
+    def payload(
+        self,
+        messages: list[dict],
+        stream: bool,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> dict:
         return {
             "model": self.config.model,
             "messages": messages,
             "stream": stream,
-            "temperature": self.config.temperature,
+            "temperature": self.config.temperature if temperature is None else temperature,
             "max_tokens": max_tokens or self.config.max_tokens,
         }
 
-    async def complete(self, messages: list[dict], max_tokens: int | None = None) -> str:
+    async def complete(
+        self,
+        messages: list[dict],
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> str:
         import httpx
         async with httpx.AsyncClient(timeout=600) as client:
-            resp = await client.post(self.url, json=self.payload(messages, False, max_tokens))
+            resp = await client.post(self.url, json=self.payload(messages, False, max_tokens, temperature))
             if resp.status_code != 200:
-                fallback = self.payload(messages, False, max_tokens)
+                fallback = self.payload(messages, False, max_tokens, temperature)
                 fallback.pop("max_tokens", None)
                 resp = await client.post(self.url, json=fallback)
             if resp.status_code != 200:
@@ -1696,10 +2710,17 @@ class ModelClient:
             data = resp.json()
             return data["choices"][0]["message"]["content"]
 
-    async def stream(self, messages: list[dict], max_tokens: int | None = None) -> AsyncGenerator[str, None]:
+    async def stream(
+        self,
+        messages: list[dict],
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> AsyncGenerator[str, None]:
         import httpx
         async with httpx.AsyncClient(timeout=600) as client:
-            async with client.stream("POST", self.url, json=self.payload(messages, True, max_tokens)) as resp:
+            async with client.stream(
+                "POST", self.url, json=self.payload(messages, True, max_tokens, temperature)
+            ) as resp:
                 if resp.status_code != 200:
                     body = (await resp.aread()).decode("utf-8", "replace")
                     raise RuntimeError(f"model server returned {resp.status_code}: {body[:300]}")
@@ -1732,7 +2753,13 @@ class Agent:
         self.registry = registry
         self.client = client
 
-    def build_messages(self, history: list[dict], user_message: str) -> tuple[list[dict], int]:
+    def build_base(
+        self,
+        history: list[dict],
+        user_message: str,
+        reserve: int,
+    ) -> tuple[list[dict], int]:
+        """Assemble [system, trimmed history, user]. This prefix is never cut later."""
         system = {
             "role": "system",
             "content": build_agent_system_prompt(self.config.system_prompt, self.registry),
@@ -1743,34 +2770,85 @@ class Agent:
             [{"role": m["role"], "content": m["content"]} for m in history],
             user,
             self.config.context_size,
-            self.config.max_tokens,
+            reserve,
         )
+
+    def assemble(self, base: list[dict], scratch: list[dict], reserve: int) -> tuple[list[dict], int]:
+        """base + as much of the tool trace as fits, dropping the oldest first.
+
+        The previous version re-trimmed the whole list every step, which meant a
+        long trace eventually evicted the user's question and left the model
+        summarising tool output it no longer had a reason for. base is fixed.
+        """
+        budget = max(256, self.config.context_size - reserve - CONTEXT_SAFETY_MARGIN)
+        fixed = messages_tokens(base)
+        kept = list(scratch)
+        dropped = 0
+        while kept and fixed + messages_tokens(kept) > budget:
+            kept.pop(0)
+            dropped += 1
+        return [*base, *kept], dropped
+
+    def _tool_budget(self, reserve: int) -> int:
+        """Characters of a single tool result allowed into the context."""
+        room = max(512, (self.config.context_size - reserve) // 3) * CHARS_PER_TOKEN
+        return int(min(self.config.tool_result_chars, room))
 
     async def run(
         self,
         user_message: str,
         history: list[dict],
         conversation_id: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        cancel: asyncio.Event | None = None,
     ) -> AsyncGenerator[dict, None]:
-        """Yield events: step, token, tool_call, tool_result, final, error."""
-        messages, dropped = self.build_messages(history, user_message)
-        if dropped:
-            yield {"type": "context", "dropped": dropped, "tokens": messages_tokens(messages)}
+        """Yield events: context, step, token, tool_call, tool_result, final, error, cancelled."""
+        started = time.time()
+        reserve = max_tokens or self.config.max_tokens
+        known = set(self.registry.names())
 
+        base, dropped = self.build_base(history, user_message, reserve)
+        if dropped:
+            yield {"type": "context", "dropped": dropped, "tokens": messages_tokens(base)}
+
+        scratch: list[dict] = []
         seen_calls: list[str] = []
         trace: list[dict] = []
+        nudges = 0
+
+        def done(answer: str, step: int, truncated: bool = False) -> dict:
+            return {
+                "type": "final",
+                "answer": answer,
+                "steps": step,
+                "trace": trace,
+                "tools_used": [entry["name"] for entry in trace],
+                "elapsed_ms": round((time.time() - started) * 1000),
+                "truncated": truncated,
+            }
 
         for step in range(1, self.config.agent_max_steps + 1):
+            if cancel is not None and cancel.is_set():
+                yield {"type": "cancelled", "step": step, "trace": trace}
+                return
+
+            messages, _ = self.assemble(base, scratch, reserve)
             yield {"type": "step", "step": step, "max_steps": self.config.agent_max_steps}
+
             buffer = ""
-            stream = self.client.stream(messages)
+            cancelled = False
+            stream = self.client.stream(messages, reserve, temperature)
             try:
                 async for token in stream:
+                    if cancel is not None and cancel.is_set():
+                        cancelled = True
+                        break
                     buffer += token
                     yield {"type": "token", "token": token, "step": step}
                     # A tool call is complete as soon as the JSON object closes;
                     # letting the model ramble past it wastes seconds per step.
-                    if buffer.lstrip().startswith(("{", "```")) and parse_tool_call(buffer):
+                    if buffer.lstrip().startswith(("{", "```")) and parse_tool_call(buffer, known):
                         break
             except Exception as exc:
                 yield {"type": "error", "error": str(exc)}
@@ -1781,20 +2859,54 @@ class Agent:
                 # per abandoned step.
                 await stream.aclose()
 
-            call = parse_tool_call(buffer)
+            if cancelled:
+                yield {"type": "cancelled", "step": step, "partial": buffer.strip(), "trace": trace}
+                return
+
+            call = parse_tool_call(buffer, known)
+
             if call is None:
                 answer = buffer.strip()
-                yield {"type": "final", "answer": answer, "steps": step, "trace": trace}
+                if answer:
+                    yield done(answer, step)
+                    return
+                # An empty reply is a hiccup, not an answer. Nudge once.
+                if nudges == 0 and step < self.config.agent_max_steps:
+                    nudges += 1
+                    scratch.append({"role": "assistant", "content": "(empty)"})
+                    scratch.append({
+                        "role": "user",
+                        "content": "That reply was empty. Answer the question in plain text, "
+                                   "or call exactly one tool as a JSON object.",
+                    })
+                    continue
+                yield done("", step)
                 return
 
             name, args = call
-            signature = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
+
+            if name == "final_answer":
+                answer = str(args.get("answer") or "").strip()
+                if answer:
+                    yield {"type": "tool_call", "name": name, "args": args, "step": step}
+                    yield done(answer, step)
+                    return
+                scratch.append({"role": "assistant", "content": buffer.strip()})
+                scratch.append({
+                    "role": "user",
+                    "content": "final_answer needs a non-empty answer argument. "
+                               "Reply again with the full answer.",
+                })
+                continue
+
+            signature = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)}"
             yield {"type": "tool_call", "name": name, "args": args, "step": step}
 
             if signature in seen_calls:
                 result = (
                     f"You already called {name} with these arguments and received a result. "
-                    "Answer the user now using what you have."
+                    "Do not repeat it. Answer the user now with what you have, or call a "
+                    "different tool."
                 )
                 error = None
             else:
@@ -1803,38 +2915,340 @@ class Agent:
                     self.registry.call, name, args, conversation_id
                 )
 
+            budget = self._tool_budget(reserve)
+            if len(result) > budget:
+                result_for_model = result[:budget] + "\n[truncated]"
+            else:
+                result_for_model = result
+
             trace.append({"name": name, "args": args, "result": result[:1000], "error": error})
             yield {"type": "tool_result", "name": name, "result": result, "error": error, "step": step}
 
-            messages.append({"role": "assistant", "content": buffer.strip()})
-            messages.append({
+            scratch.append({"role": "assistant", "content": buffer.strip()})
+            scratch.append({
                 "role": "user",
-                "content": f"TOOL RESULT [{name}]:\n{result}\n\n"
-                           "Answer the original question now, or call one more tool if you truly need it.",
+                "content": f"TOOL RESULT [{name}]:\n{result_for_model}\n\n"
+                           "Use this to answer the original question, or call one more tool "
+                           "if you genuinely still need it.",
             })
-            messages, _ = trim_to_context(
-                messages[0], messages[1:-1], messages[-1],
-                self.config.context_size, self.config.max_tokens,
-            )
 
-        # Step budget exhausted. Force a plain answer with tools withheld.
+        # Step budget exhausted. Force a plain answer with the tool protocol withheld.
+        messages, _ = self.assemble(base, scratch, reserve)
         final_messages = [
             {"role": "system", "content": self.config.system_prompt},
             *messages[1:],
-            {"role": "user", "content": "Give your best final answer now. Do not call any tool."},
+            {"role": "user", "content": "Give your best final answer now, in plain text. "
+                                        "Do not call any tool and do not output JSON."},
         ]
         try:
-            answer = await self.client.complete(final_messages)
+            answer = await self.client.complete(final_messages, reserve, temperature)
         except Exception as exc:
             yield {"type": "error", "error": str(exc)}
             return
-        yield {
-            "type": "final",
-            "answer": answer.strip(),
-            "steps": self.config.agent_max_steps,
-            "trace": trace,
-            "truncated": True,
+        yield done(answer.strip(), self.config.agent_max_steps, truncated=True)
+
+
+class TaskRun:
+    """Live state for one run: the event buffer plus everyone tailing it.
+
+    Events are buffered in memory so a browser that connects halfway through
+    still sees the whole run, and the interesting ones are also persisted so a
+    run survives a page reload or a restart. Tokens are deliberately not
+    persisted: one run would otherwise write thousands of rows.
+    """
+
+    BUFFER_LIMIT = 4000
+
+    def __init__(self, run_id: str, task_id: str, task_name: str):
+        self.run_id = run_id
+        self.task_id = task_id
+        self.task_name = task_name
+        self.seq = 0
+        self.events: list[dict] = []
+        self.subscribers: set[asyncio.Queue] = set()
+        self.cancel = asyncio.Event()
+        self.done = False
+        self.status = "running"
+        self.answer = ""
+        self.started = time.time()
+
+    def publish(self, event: dict) -> dict:
+        self.seq += 1
+        stamped = dict(event)
+        stamped["seq"] = self.seq
+        stamped["run_id"] = self.run_id
+        stamped["task_id"] = self.task_id
+        self.events.append(stamped)
+        if len(self.events) > self.BUFFER_LIMIT:
+            # Drop the oldest tokens first; the structural events are the record.
+            self.events = ([e for e in self.events if e["type"] != "token"][-self.BUFFER_LIMIT:]
+                           or self.events[-self.BUFFER_LIMIT:])
+        for queue in list(self.subscribers):
+            try:
+                queue.put_nowait(stamped)
+            except asyncio.QueueFull:
+                # A tab that cannot keep up loses tokens, not the run.
+                pass
+        return stamped
+
+    def close(self) -> None:
+        self.done = True
+        for queue in list(self.subscribers):
+            try:
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
+
+
+class TaskManager:
+    """Runs agent tasks in the background, on demand or on an interval.
+
+    One scheduler coroutine on the web process's event loop polls for due tasks.
+    Runs are gated by a semaphore because the model server answers one request
+    at a time: firing five tasks at once just queues them inside mlx_lm with no
+    way to see the queue.
+    """
+
+    # Everything except tokens goes to the database.
+    PERSISTED = {"start", "context", "step", "tool_call", "tool_result",
+                 "final", "error", "cancelled"}
+
+    def __init__(
+        self,
+        config: Config,
+        db: Database,
+        model_manager: ModelServerManager,
+        retrain_manager: RetrainManager,
+        client: ModelClient,
+    ):
+        self.config = config
+        self.db = db
+        self.model_manager = model_manager
+        self.retrain_manager = retrain_manager
+        self.client = client
+        self.active: dict[str, TaskRun] = {}
+        self.by_task: dict[str, TaskRun] = {}
+        self.recent: dict[str, TaskRun] = {}
+        self._scheduler: asyncio.Task | None = None
+        self._semaphore: asyncio.Semaphore | None = None
+        self._stopping = False
+
+    # ------------------------------------------------------------ lifecycle --
+
+    async def start(self) -> None:
+        self._semaphore = asyncio.Semaphore(max(1, self.config.max_concurrent_tasks))
+        orphans = self.db.reset_orphan_runs()
+        if orphans:
+            log(f"Marked {orphans} task run(s) interrupted by the previous shutdown.",
+                logging.WARNING)
+        self._scheduler = asyncio.create_task(self._scheduler_loop())
+        log("Task scheduler started.")
+
+    async def stop(self) -> None:
+        self._stopping = True
+        for run in list(self.active.values()):
+            run.cancel.set()
+        if self._scheduler is not None:
+            self._scheduler.cancel()
+            try:
+                await self._scheduler
+            except (asyncio.CancelledError, Exception):
+                pass
+        deadline = time.time() + 5
+        while self.active and time.time() < deadline:
+            await asyncio.sleep(0.1)
+
+    async def _scheduler_loop(self) -> None:
+        while not self._stopping:
+            try:
+                await asyncio.sleep(max(1, self.config.task_poll_seconds))
+                if self.model_manager.status != "ready":
+                    continue
+                if self.retrain_manager.status.get("running"):
+                    continue
+                for task in self.db.due_tasks():
+                    if task["id"] in self.by_task:
+                        continue
+                    # Re-arm before running: a task whose run outlives its own
+                    # interval must not stack up a backlog of overdue firings.
+                    self.db.schedule_next(task["id"], int(task["interval_seconds"] or 0))
+                    await self.launch(task, trigger="schedule")
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                log(f"Task scheduler error: {exc}", logging.ERROR)
+                await asyncio.sleep(5)
+
+    # ---------------------------------------------------------------- runs --
+
+    async def launch(self, task: dict, trigger: str = "manual") -> TaskRun:
+        if task["id"] in self.by_task:
+            raise ValueError("this task is already running")
+        run_id = self.db.create_run(task["id"], trigger, self.config.model)
+        run = TaskRun(run_id, task["id"], task["name"])
+        self.active[run_id] = run
+        self.by_task[task["id"]] = run
+        asyncio.create_task(self._execute(task, run, trigger))
+        return run
+
+    def _task_config(self, task: dict) -> Config:
+        """A config copy scoped to one task, so its tools and step budget are its own."""
+        return dataclass_replace(
+            self.config,
+            system_prompt=task.get("system_prompt") or self.config.system_prompt,
+            agent_tools=task.get("tools") or self.config.agent_tools,
+            agent_max_steps=int(task.get("max_steps") or self.config.agent_max_steps),
+        )
+
+    async def _execute(self, task: dict, run: TaskRun, trigger: str) -> None:
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(max(1, self.config.max_concurrent_tasks))
+        conversation_id = f"task:{task['id']}"
+        answer = ""
+        error: str | None = None
+        steps = 0
+        tools_used: list[str] = []
+        status = "ok"
+
+        try:
+            async with self._semaphore:
+                if run.cancel.is_set():
+                    raise asyncio.CancelledError
+                self._emit(run, {"type": "start", "task": task["name"], "trigger": trigger,
+                                 "model": self.config.model})
+                append_task_log(f"run {run.run_id} start: {task['name']} ({trigger})")
+
+                task_config = self._task_config(task)
+                registry = ToolRegistry(task_config, self.db)
+                agent = Agent(task_config, registry, ModelClient(task_config))
+
+                history: list[dict] = []
+                if task.get("use_history"):
+                    rows = self.db.get_messages(conversation_id, limit=self.config.history_turns * 2)
+                    history = [{"role": r["role"], "content": r["content"]} for r in rows]
+
+                async for event in agent.run(
+                    task["goal"], history, conversation_id, cancel=run.cancel
+                ):
+                    self._emit(run, event)
+                    if event["type"] == "final":
+                        answer = event["answer"]
+                        steps = event.get("steps", 0)
+                        tools_used = event.get("tools_used", [])
+                    elif event["type"] == "error":
+                        error = event["error"]
+                        status = "error"
+                    elif event["type"] == "cancelled":
+                        status = "cancelled"
+
+                if task.get("use_history") and answer:
+                    self.db.add_message(conversation_id, "user", task["goal"])
+                    self.db.add_message(conversation_id, "assistant", answer)
+
+        except asyncio.CancelledError:
+            status = "cancelled"
+            self._emit(run, {"type": "cancelled", "reason": "shutdown or cancel request"})
+        except Exception as exc:
+            status = "error"
+            error = f"{type(exc).__name__}: {exc}"
+            log(f"Task {task['name']} failed: {error}", logging.ERROR)
+            self._emit(run, {"type": "error", "error": error})
+        finally:
+            elapsed = (time.time() - run.started) * 1000
+            run.status = status
+            run.answer = answer
+            self.db.finish_run(run.run_id, status, answer, error, steps, elapsed, tools_used)
+            self.db.prune_runs(task["id"], keep=25)
+            append_task_log(
+                f"run {run.run_id} {status} in {elapsed:.0f}ms"
+                + (f": {error}" if error else f": {answer[:120]}")
+            )
+            self._emit(run, {"type": "done", "status": status, "answer": answer,
+                             "elapsed_ms": round(elapsed), "error": error})
+            run.close()
+            self.active.pop(run.run_id, None)
+            if self.by_task.get(task["id"]) is run:
+                self.by_task.pop(task["id"], None)
+            self.recent[run.run_id] = run
+            while len(self.recent) > 20:
+                self.recent.pop(next(iter(self.recent)))
+
+    def _emit(self, run: TaskRun, event: dict) -> None:
+        stamped = run.publish(event)
+        if event["type"] in self.PERSISTED:
+            payload = {k: v for k, v in stamped.items() if k not in ("run_id", "task_id")}
+            try:
+                self.db.append_event(run.run_id, stamped["seq"], event["type"], payload)
+            except Exception as exc:
+                log(f"Could not persist task event: {exc}", logging.WARNING)
+
+    # -------------------------------------------------------------- control --
+
+    def cancel_task(self, task_id: str) -> bool:
+        run = self.by_task.get(task_id)
+        if run is None:
+            return False
+        run.cancel.set()
+        return True
+
+    def cancel_run(self, run_id: str) -> bool:
+        run = self.active.get(run_id)
+        if run is None:
+            return False
+        run.cancel.set()
+        return True
+
+    def live_status(self, task_id: str) -> dict | None:
+        run = self.by_task.get(task_id)
+        if run is None:
+            return None
+        last_step = next((e for e in reversed(run.events) if e["type"] == "step"), None)
+        last_tool = next((e for e in reversed(run.events) if e["type"] == "tool_call"), None)
+        return {
+            "run_id": run.run_id,
+            "step": (last_step or {}).get("step", 0),
+            "max_steps": (last_step or {}).get("max_steps", 0),
+            "tool": (last_tool or {}).get("name"),
+            "elapsed_ms": round((time.time() - run.started) * 1000),
         }
+
+    async def subscribe(self, run_id: str) -> AsyncGenerator[dict, None]:
+        """Replay a run then follow it live. Falls back to the database when finished."""
+        run = self.active.get(run_id) or self.recent.get(run_id)
+        if run is None:
+            for event in self.db.run_events(run_id, limit=2000):
+                yield event
+            return
+
+        queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
+        # Subscribe before snapshotting, then drop anything the snapshot already
+        # covered. The other order loses events published in between.
+        run.subscribers.add(queue)
+        try:
+            backlog = list(run.events)
+            highest = backlog[-1]["seq"] if backlog else 0
+            for event in backlog:
+                yield event
+            if run.done:
+                return
+            while True:
+                event = await queue.get()
+                if event is None:
+                    return
+                if event["seq"] <= highest:
+                    continue
+                yield event
+        finally:
+            run.subscribers.discard(queue)
+
+
+def append_task_log(line: str) -> None:
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_DIR / LOG_FILES["tasks"], "a", encoding="utf-8") as handle:
+            handle.write(f"[{iso(utc_now())}] {line}\n")
+    except OSError:
+        pass
 
 
 HTML_PAGE = r"""
@@ -2008,12 +3422,86 @@ HTML_PAGE = r"""
    .meter > div { height: 100%; background: var(--accent); width: 0%; }
    .hint { font-size: 11px; color: #777; margin-top: 6px; line-height: 1.4; }
    .tools-list { font-size: 11px; color: #888; font-family: ui-monospace, monospace; line-height: 1.6; }
+
+   nav.views { display: flex; gap: 4px; }
+   nav.views button { padding: 6px 12px; }
+   nav.views button.active { background: var(--accent); border-color: var(--accent); color: white; }
+   .view { flex: 1; display: flex; overflow: hidden; }
+   .view.hidden { display: none; }
+
+   #tasksView { flex-direction: row; }
+   .task-list { width: 340px; min-width: 300px; border-right: 1px solid var(--border); overflow-y: auto; padding: 14px; }
+   .task-monitor { flex: 1; overflow-y: auto; padding: 14px 16px; }
+   .card {
+     border: 1px solid var(--border);
+     border-radius: 10px;
+     padding: 10px 12px;
+     margin-bottom: 10px;
+     background: var(--surface);
+     cursor: pointer;
+   }
+   .card.selected { border-color: var(--accent); }
+   .card h4 { margin: 0 0 4px; font-size: 13px; display: flex; justify-content: space-between; gap: 8px; }
+   .card .goal { font-size: 12px; color: #aaa; line-height: 1.4; max-height: 48px; overflow: hidden; }
+   .card .meta { font-size: 11px; color: #777; margin-top: 6px; font-family: ui-monospace, monospace; }
+   .card .card-actions { display: flex; gap: 4px; margin-top: 8px; flex-wrap: wrap; }
+   .card .card-actions button { padding: 3px 8px; font-size: 12px; }
+   .pill {
+     font-size: 10px;
+     padding: 1px 7px;
+     border-radius: 999px;
+     border: 1px solid #555;
+     color: #bbb;
+     white-space: nowrap;
+     font-family: ui-monospace, monospace;
+   }
+   .pill.ok { border-color: var(--success); color: var(--success); }
+   .pill.error, .pill.interrupted { border-color: var(--error); color: var(--error); }
+   .pill.running { border-color: var(--accent); color: var(--accent); }
+   .pill.cancelled { border-color: var(--warn); color: var(--warn); }
+   .form-grid label { display: block; font-size: 12px; color: #999; margin: 10px 0 4px; }
+   .form-grid input, .form-grid textarea, .form-grid select { width: 100%; }
+   .form-grid textarea { min-height: 64px; resize: vertical; }
+   #runFeed { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+   .feed-line { font-size: 12px; color: #999; font-family: ui-monospace, monospace; }
+   .feed-answer {
+     border: 1px solid var(--success);
+     border-radius: 10px;
+     padding: 10px 12px;
+     white-space: pre-wrap;
+     line-height: 1.4;
+   }
+   .feed-partial { color: #ccc; white-space: pre-wrap; font-size: 13px; line-height: 1.4; }
+   .logbox {
+     background: #0c0c0c;
+     border: 1px solid var(--border);
+     border-radius: 8px;
+     padding: 10px;
+     font-family: ui-monospace, monospace;
+     font-size: 11px;
+     white-space: pre-wrap;
+     max-height: 260px;
+     overflow: auto;
+     color: #bbb;
+   }
+   table.models { width: 100%; border-collapse: collapse; font-size: 13px; }
+   table.models td { padding: 7px 6px; border-bottom: 1px solid #262626; }
+   table.models tr:last-child td { border-bottom: none; }
+   table.models td.id { font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; }
+   .panel { max-width: 760px; padding: 16px; overflow-y: auto; flex: 1; }
+   .panel h3 { margin: 18px 0 8px; font-size: 14px; }
+   .panel h3:first-child { margin-top: 0; }
  </style>
 </head>
 <body>
  <header>
    <div><strong>Local LLM</strong> <span style="color:#666;font-size:11px">build {{UI_BUILD}}</span></div>
    <div id="status">Starting...</div>
+   <nav class="views">
+     <button id="navChat" class="active" onclick="showView('chat')">Chat</button>
+     <button id="navTasks" onclick="showView('tasks')">Tasks</button>
+     <button id="navModels" onclick="showView('models')">Models</button>
+   </nav>
    <div class="actions">
      <button onclick="newChat()">New chat</button>
      <button onclick="retrain()">Retrain</button>
@@ -2022,7 +3510,118 @@ HTML_PAGE = r"""
  </header>
 
  <div id="main">
-   <div id="chat"></div>
+   <div id="chatView" class="view"><div id="chat"></div></div>
+
+   <div id="tasksView" class="view hidden">
+     <div class="task-list">
+       <div style="display:flex;justify-content:space-between;align-items:center">
+         <strong style="font-size:13px">Tasks</strong>
+         <button onclick="toggleTaskForm()">New task</button>
+       </div>
+
+       <div id="taskForm" class="form-grid" style="display:none;margin-top:10px">
+         <label>Name</label>
+         <input id="tfName" type="text" placeholder="Morning news sweep">
+         <label>Goal, written as an instruction to the agent</label>
+         <textarea id="tfGoal" placeholder="Search for news about MLX released in the last day and summarise anything new in three bullets."></textarea>
+         <div class="row">
+           <div>
+             <label>Repeat every (seconds)</label>
+             <input id="tfInterval" type="number" min="0" step="60" value="0">
+           </div>
+           <div>
+             <label>Max steps</label>
+             <input id="tfSteps" type="number" min="1" max="20" value="6">
+           </div>
+         </div>
+         <label>Tools (comma separated, blank for all)</label>
+         <input id="tfTools" type="text" placeholder="web_search, fetch_url, remember">
+         <label>System prompt override (optional)</label>
+         <textarea id="tfSystem" placeholder="Leave blank to use the global system prompt."></textarea>
+         <div class="row" style="margin-top:10px">
+           <div>
+             <label>Keep conversation history</label>
+             <select id="tfHistory">
+               <option value="false">no, each run is fresh</option>
+               <option value="true">yes, runs build on each other</option>
+             </select>
+           </div>
+         </div>
+         <div class="row" style="margin-top:12px">
+           <button class="primary" onclick="createTask()">Create</button>
+           <button onclick="toggleTaskForm()">Cancel</button>
+         </div>
+         <div class="hint">
+           Interval 0 means the task only runs when you press Run. A repeating
+           task fires once as soon as it is created, so you find out quickly
+           whether the goal is worded well.
+         </div>
+       </div>
+
+       <div id="taskCards" style="margin-top:12px">loading...</div>
+     </div>
+
+     <div class="task-monitor">
+       <div id="monitorHeader" style="color:#888;font-size:13px">
+         Select a task to watch its runs, or create one.
+       </div>
+       <div id="runControls" style="display:none;margin-top:10px">
+         <div class="row" style="max-width:520px">
+           <div>
+             <label style="font-size:12px;color:#999">Run</label>
+             <select id="runPicker" onchange="openRun(this.value)"></select>
+           </div>
+           <div style="flex:0 0 auto;display:flex;align-items:flex-end;gap:6px">
+             <button onclick="runSelectedTask()">Run now</button>
+             <button onclick="cancelSelectedTask()">Cancel</button>
+           </div>
+         </div>
+       </div>
+       <div id="runFeed"></div>
+     </div>
+   </div>
+
+   <div id="modelsView" class="view hidden">
+     <div class="panel">
+       <h3>Current</h3>
+       <div id="modelCurrent" class="logbox" style="max-height:none">loading...</div>
+
+       <h3>Switch model</h3>
+       <table class="models"><tbody id="modelTable"></tbody></table>
+       <label style="display:block;font-size:12px;color:#999;margin:12px 0 4px">
+         Or any Hugging Face repo id
+       </label>
+       <div class="row">
+         <div><input id="modelCustom" type="text" placeholder="mlx-community/Qwen2.5-7B-Instruct-4bit"></div>
+         <div style="flex:0 0 auto"><button onclick="useModel(document.getElementById('modelCustom').value.trim())">Use</button></div>
+       </div>
+
+       <h3>Adapter and cache</h3>
+       <div class="row">
+         <div>
+           <label style="font-size:12px;color:#999">LoRA adapter</label>
+           <select id="adapterSelect"></select>
+         </div>
+         <div>
+           <label style="font-size:12px;color:#999">KV cache cap (0 = unbounded)</label>
+           <input id="kvSize" type="number" min="0" step="512">
+         </div>
+       </div>
+       <div class="row" style="margin-top:12px">
+         <button class="primary" onclick="applyModel()">Apply and restart</button>
+         <button onclick="loadModels()">Refresh</button>
+       </div>
+       <div class="hint">
+         Switching to a model that is not cached downloads it on first use, which
+         can take minutes and several gigabytes. The log below is the model
+         server's own output, including download progress.
+       </div>
+
+       <h3>Model server log</h3>
+       <div id="modelLog" class="logbox">loading...</div>
+     </div>
+   </div>
+
    <aside id="settings">
      <h3>Generation</h3>
      <label>System prompt</label>
@@ -2091,14 +3690,30 @@ HTML_PAGE = r"""
        the model server only changes on restart.
      </div>
 
+     <h3 style="margin-top:18px">Memory</h3>
+     <div class="row">
+       <div><input id="memKey" type="text" placeholder="key"></div>
+       <div><input id="memValue" type="text" placeholder="value"></div>
+     </div>
+     <div class="row" style="margin-top:8px">
+       <button onclick="saveMemory()">Store</button>
+       <button onclick="loadMemory()">Refresh</button>
+     </div>
+     <div class="tools-list" id="memoryList" style="margin-top:8px">loading...</div>
+     <div class="hint">
+       Notes the agent stores with the remember tool, and anything you add here.
+       They persist across restarts.
+     </div>
+
      <h3 style="margin-top:18px">Tools</h3>
      <div class="tools-list" id="toolsList">loading...</div>
    </aside>
  </div>
 
- <footer>
+ <footer id="composer">
    <textarea id="input" placeholder="Send a message. Shift+Enter for a new line." rows="1"></textarea>
    <label class="agent-toggle"><input id="agentToggle" type="checkbox"> agent</label>
+   <button id="stopBtn" onclick="stopStream()" disabled>Stop</button>
    <button id="sendBtn" class="primary" onclick="send()">Send</button>
  </footer>
 
@@ -2106,6 +3721,7 @@ HTML_PAGE = r"""
    var chat = document.getElementById("chat");
    var input = document.getElementById("input");
    var sendBtn = document.getElementById("sendBtn");
+   var stopBtn = document.getElementById("stopBtn");
    var statusEl = document.getElementById("status");
    var agentToggle = document.getElementById("agentToggle");
    var settingsEl = document.getElementById("settings");
@@ -2115,6 +3731,7 @@ HTML_PAGE = r"""
    var contextSize = 4096;
    var usedTokens = 0;
    var busy = false;
+   var controller = null;
 
    function randomId() {
      return Math.random().toString(36).slice(2, 12);
@@ -2130,6 +3747,15 @@ HTML_PAGE = r"""
        send();
      }
    });
+
+   input.addEventListener("input", function() {
+     input.style.height = "auto";
+     input.style.height = Math.min(200, input.scrollHeight) + "px";
+   });
+
+   function stopStream() {
+     if (controller) controller.abort();
+   }
 
    function scrollDown() {
      chat.scrollTop = chat.scrollHeight;
@@ -2226,8 +3852,11 @@ HTML_PAGE = r"""
      if (!message) return;
 
      input.value = "";
+     input.style.height = "auto";
      busy = true;
      sendBtn.disabled = true;
+     stopBtn.disabled = false;
+     controller = new AbortController();
      addMessage("user", message);
      updateContextMeter(estimateTokens(message));
 
@@ -2240,6 +3869,7 @@ HTML_PAGE = r"""
        var res = await fetch("/api/chat/stream", {
          method: "POST",
          headers: { "Content-Type": "application/json" },
+         signal: controller.signal,
          body: JSON.stringify({
            message: message,
            conversation_id: conversationId,
@@ -2308,6 +3938,11 @@ HTML_PAGE = r"""
            answered = true;
            updateContextMeter(estimateTokens(event.answer));
            addFeedbackBar(message, event.answer);
+           if (event.tools_used && event.tools_used.length) {
+             addSystem("Used " + event.tools_used.join(", ") + " over " +
+                       event.steps + " step(s) in " +
+                       Math.round((event.elapsed_ms || 0) / 100) / 10 + "s.");
+           }
            if (event.truncated) {
              addSystem("Agent hit the step limit and answered with what it had.");
            }
@@ -2324,12 +3959,74 @@ HTML_PAGE = r"""
          if (!bubble.textContent) bubble.textContent = "(no response)";
        }
      } catch (err) {
-       bubble.textContent = "Error: " + err.message;
+       if (err.name === "AbortError") {
+         bubble.textContent = (bubble.textContent || "") + "\n(stopped)";
+       } else {
+         bubble.textContent = "Error: " + err.message;
+       }
        bubble.classList.remove("pending");
      } finally {
        busy = false;
+       controller = null;
        sendBtn.disabled = false;
+       stopBtn.disabled = true;
        input.focus();
+     }
+   }
+
+   async function loadMemory() {
+     var list = document.getElementById("memoryList");
+     try {
+       var out = await fetchJSON("/api/memory?limit=50");
+       var items = out.data.memories || [];
+       list.innerHTML = "";
+       if (!items.length) {
+         list.textContent = "No stored notes.";
+         return;
+       }
+       items.forEach(function(item) {
+         var row = document.createElement("div");
+         var del = document.createElement("button");
+         del.textContent = "x";
+         del.title = "Forget this note";
+         del.style.marginRight = "6px";
+         del.style.padding = "0 6px";
+         del.onclick = function() { forgetMemory(item.key); };
+         var label = document.createElement("span");
+         label.textContent = item.key + ": " + item.value;
+         row.appendChild(del);
+         row.appendChild(label);
+         list.appendChild(row);
+       });
+     } catch (err) {
+       list.textContent = "Memory unavailable: " + err.message;
+     }
+   }
+
+   async function saveMemory() {
+     var key = document.getElementById("memKey").value.trim();
+     var value = document.getElementById("memValue").value.trim();
+     if (!key || !value) return;
+     try {
+       await fetchJSON("/api/memory", {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+         body: JSON.stringify({ key: key, value: value })
+       });
+       document.getElementById("memKey").value = "";
+       document.getElementById("memValue").value = "";
+       loadMemory();
+     } catch (err) {
+       addSystem("Memory error: " + err.message);
+     }
+   }
+
+   async function forgetMemory(key) {
+     try {
+       await fetchJSON("/api/memory/" + encodeURIComponent(key), { method: "DELETE" });
+       loadMemory();
+     } catch (err) {
+       addSystem("Memory error: " + err.message);
      }
    }
 
@@ -2473,6 +4170,18 @@ HTML_PAGE = r"""
          msg += "  |  feedback " + data.stats.total + " total, " + data.stats.approved
               + " approved, " + data.stats.untrained + " untrained";
        }
+       if (typeof data.memories === "number") {
+         msg += ", " + data.memories + " notes";
+       }
+       if (data.tasks) {
+         var running = data.tasks.running || [];
+         msg += "\nTasks: " + data.tasks.total + " defined, " + running.length + " running";
+         if (running.length) {
+           msg += " (" + running.map(function(item) {
+             return "step " + item.step + "/" + item.max_steps;
+           }).join(", ") + ")";
+         }
+       }
        statusEl.textContent = msg;
        statusEl.className = "";
        if (data.model_status && data.model_status.indexOf("error") === 0) statusEl.className = "error";
@@ -2483,7 +4192,470 @@ HTML_PAGE = r"""
      }
    }
 
+   // ------------------------------------------------------------- views ---
+
+   var currentView = "chat";
+   var selectedTask = null;
+   var runSource = null;
+   var currentRunId = null;
+   var tasksTimer = null;
+   var modelLogTimer = null;
+
+   function showView(name) {
+     currentView = name;
+     ["chat", "tasks", "models"].forEach(function(view) {
+       var el = document.getElementById(view + "View");
+       if (el) el.classList.toggle("hidden", view !== name);
+       var nav = document.getElementById("nav" + view.charAt(0).toUpperCase() + view.slice(1));
+       if (nav) nav.classList.toggle("active", view === name);
+     });
+     document.getElementById("composer").style.display = name === "chat" ? "flex" : "none";
+
+     if (tasksTimer) { clearInterval(tasksTimer); tasksTimer = null; }
+     if (modelLogTimer) { clearInterval(modelLogTimer); modelLogTimer = null; }
+
+     if (name === "tasks") {
+       loadTasks();
+       tasksTimer = setInterval(loadTasks, 3000);
+     } else if (name === "models") {
+       loadModels();
+       loadModelLog();
+       modelLogTimer = setInterval(loadModelLog, 4000);
+     }
+   }
+
+   // ------------------------------------------------------------- tasks ---
+
+   function toggleTaskForm() {
+     var form = document.getElementById("taskForm");
+     form.style.display = form.style.display === "none" ? "block" : "none";
+   }
+
+   function statusPill(status) {
+     var pill = document.createElement("span");
+     pill.className = "pill " + (status || "");
+     pill.textContent = status || "never run";
+     return pill;
+   }
+
+   function relativeTime(value) {
+     if (!value) return "never";
+     var then = new Date(value.indexOf("Z") < 0 && value.indexOf("+") < 0 ? value + "Z" : value);
+     var seconds = Math.round((Date.now() - then.getTime()) / 1000);
+     if (isNaN(seconds)) return value;
+     if (seconds < 0) return "in " + Math.abs(seconds) + "s";
+     if (seconds < 60) return seconds + "s ago";
+     if (seconds < 3600) return Math.round(seconds / 60) + "m ago";
+     if (seconds < 86400) return Math.round(seconds / 3600) + "h ago";
+     return Math.round(seconds / 86400) + "d ago";
+   }
+
+   async function loadTasks() {
+     try {
+       var out = await fetchJSON("/api/tasks");
+       renderTasks(out.data.tasks || []);
+     } catch (err) {
+       document.getElementById("taskCards").textContent = "Could not load tasks: " + err.message;
+     }
+   }
+
+   function renderTasks(items) {
+     var host = document.getElementById("taskCards");
+     host.innerHTML = "";
+     if (!items.length) {
+       host.textContent = "No tasks yet.";
+       return;
+     }
+     items.forEach(function(task) {
+       var card = document.createElement("div");
+       card.className = "card" + (selectedTask === task.id ? " selected" : "");
+       card.onclick = function(e) {
+         if (e.target.tagName === "BUTTON") return;
+         selectTask(task.id);
+       };
+
+       var head = document.createElement("h4");
+       var title = document.createElement("span");
+       title.textContent = task.name;
+       head.appendChild(title);
+       head.appendChild(statusPill(task.live ? "running" : task.last_status));
+       card.appendChild(head);
+
+       var goal = document.createElement("div");
+       goal.className = "goal";
+       goal.textContent = task.goal;
+       card.appendChild(goal);
+
+       var meta = document.createElement("div");
+       meta.className = "meta";
+       var parts = [];
+       parts.push(task.enabled ? "enabled" : "disabled");
+       parts.push(task.interval_seconds > 0 ? "every " + task.interval_seconds + "s" : "manual");
+       parts.push(task.run_count + " runs");
+       parts.push("last " + relativeTime(task.last_run_at));
+       if (task.live) {
+         parts.push("step " + task.live.step + "/" + task.live.max_steps);
+         if (task.live.tool) parts.push("tool " + task.live.tool);
+       } else if (task.next_run_at) {
+         parts.push("next " + relativeTime(task.next_run_at));
+       }
+       meta.textContent = parts.join(" | ");
+       card.appendChild(meta);
+
+       var actions = document.createElement("div");
+       actions.className = "card-actions";
+       actions.appendChild(taskButton("Run", function() { runTask(task.id); }));
+       actions.appendChild(taskButton("Cancel", function() { cancelTask(task.id); }));
+       actions.appendChild(taskButton(task.enabled ? "Disable" : "Enable", function() {
+         updateTask(task.id, { enabled: !task.enabled });
+       }));
+       actions.appendChild(taskButton("Delete", function() { deleteTask(task.id, task.name); }));
+       card.appendChild(actions);
+
+       host.appendChild(card);
+     });
+   }
+
+   function taskButton(label, handler) {
+     var button = document.createElement("button");
+     button.textContent = label;
+     button.onclick = handler;
+     return button;
+   }
+
+   async function createTask() {
+     var body = {
+       name: document.getElementById("tfName").value.trim(),
+       goal: document.getElementById("tfGoal").value.trim(),
+       interval_seconds: Number(document.getElementById("tfInterval").value) || 0,
+       max_steps: Number(document.getElementById("tfSteps").value) || 6,
+       tools: document.getElementById("tfTools").value.trim(),
+       system_prompt: document.getElementById("tfSystem").value.trim() || null,
+       use_history: document.getElementById("tfHistory").value === "true",
+       enabled: true
+     };
+     if (!body.name || !body.goal) {
+       alert("A task needs a name and a goal.");
+       return;
+     }
+     try {
+       var out = await fetchJSON("/api/tasks", {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+         body: JSON.stringify(body)
+       });
+       document.getElementById("tfName").value = "";
+       document.getElementById("tfGoal").value = "";
+       toggleTaskForm();
+       selectTask(out.data.task.id);
+       loadTasks();
+     } catch (err) {
+       alert("Could not create the task: " + err.message);
+     }
+   }
+
+   async function updateTask(taskId, patch) {
+     try {
+       await fetchJSON("/api/tasks/" + taskId, {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+         body: JSON.stringify(patch)
+       });
+       loadTasks();
+     } catch (err) {
+       alert("Could not update the task: " + err.message);
+     }
+   }
+
+   async function deleteTask(taskId, name) {
+     if (!window.confirm("Delete " + name + " and its run history?")) return;
+     try {
+       await fetchJSON("/api/tasks/" + taskId, { method: "DELETE" });
+       if (selectedTask === taskId) {
+         selectedTask = null;
+         closeRun();
+         document.getElementById("runControls").style.display = "none";
+         document.getElementById("monitorHeader").textContent = "Select a task to watch its runs.";
+         document.getElementById("runFeed").innerHTML = "";
+       }
+       loadTasks();
+     } catch (err) {
+       alert("Could not delete the task: " + err.message);
+     }
+   }
+
+   async function runTask(taskId) {
+     try {
+       var out = await fetchJSON("/api/tasks/" + taskId + "/run", { method: "POST" });
+       if (out.data.error) {
+         alert(out.data.error);
+         return;
+       }
+       selectedTask = taskId;
+       await loadRuns(taskId);
+       openRun(out.data.run_id);
+       loadTasks();
+     } catch (err) {
+       alert("Could not start the run: " + err.message);
+     }
+   }
+
+   async function cancelTask(taskId) {
+     try {
+       await fetchJSON("/api/tasks/" + taskId + "/cancel", { method: "POST" });
+       loadTasks();
+     } catch (err) {
+       alert("Could not cancel: " + err.message);
+     }
+   }
+
+   function runSelectedTask() { if (selectedTask) runTask(selectedTask); }
+   function cancelSelectedTask() { if (selectedTask) cancelTask(selectedTask); }
+
+   async function selectTask(taskId) {
+     selectedTask = taskId;
+     document.getElementById("runControls").style.display = "block";
+     try {
+       var out = await fetchJSON("/api/tasks/" + taskId);
+       var task = out.data.task;
+       document.getElementById("monitorHeader").textContent =
+         task.name + " -- " + task.goal;
+       renderRunPicker(out.data.runs || []);
+       if (out.data.runs && out.data.runs.length) {
+         openRun(out.data.runs[0].id);
+       } else {
+         closeRun();
+         document.getElementById("runFeed").innerHTML = "";
+       }
+       loadTasks();
+     } catch (err) {
+       document.getElementById("monitorHeader").textContent = "Could not load task: " + err.message;
+     }
+   }
+
+   async function loadRuns(taskId) {
+     try {
+       var out = await fetchJSON("/api/tasks/" + taskId + "/runs?limit=20");
+       renderRunPicker(out.data.runs || []);
+     } catch (err) {
+       // Leave the picker as it is; the stream is the important part.
+     }
+   }
+
+   function renderRunPicker(runs) {
+     var picker = document.getElementById("runPicker");
+     picker.innerHTML = "";
+     runs.forEach(function(run) {
+       var option = document.createElement("option");
+       option.value = run.id;
+       option.textContent = run.status + " -- " + relativeTime(run.started_at) +
+                            " -- " + run.trigger;
+       picker.appendChild(option);
+     });
+     if (currentRunId) picker.value = currentRunId;
+   }
+
+   function closeRun() {
+     if (runSource) {
+       runSource.close();
+       runSource = null;
+     }
+     currentRunId = null;
+   }
+
+   function feedLine(text, className) {
+     var div = document.createElement("div");
+     div.className = className || "feed-line";
+     div.textContent = text;
+     document.getElementById("runFeed").appendChild(div);
+     return div;
+   }
+
+   function openRun(runId) {
+     if (!runId) return;
+     closeRun();
+     currentRunId = runId;
+     document.getElementById("runPicker").value = runId;
+     var feed = document.getElementById("runFeed");
+     feed.innerHTML = "";
+     var partial = null;
+     var currentCard = null;
+
+     runSource = new EventSource("/api/runs/" + runId + "/stream");
+     runSource.onmessage = function(message) {
+       if (message.data === "[DONE]") {
+         closeRun();
+         loadTasks();
+         return;
+       }
+       var event;
+       try {
+         event = JSON.parse(message.data);
+       } catch (err) {
+         return;
+       }
+
+       if (event.type === "start") {
+         feedLine("started by " + event.trigger + " on " + event.model);
+       } else if (event.type === "context") {
+         feedLine("trimmed " + event.dropped + " old messages to fit the context");
+       } else if (event.type === "step") {
+         partial = null;
+         feedLine("step " + event.step + " of " + event.max_steps);
+       } else if (event.type === "token") {
+         if (!partial) partial = feedLine("", "feed-partial");
+         partial.textContent += event.token;
+       } else if (event.type === "tool_call") {
+         partial = null;
+         currentCard = addToolCardTo(feed, event.name, event.args);
+       } else if (event.type === "tool_result") {
+         if (currentCard) {
+           currentCard.body.textContent = event.result;
+           if (event.error) currentCard.card.classList.add("failed");
+           currentCard = null;
+         }
+       } else if (event.type === "final") {
+         partial = null;
+         feedLine(event.answer || "(empty answer)", "feed-answer");
+         if (event.tools_used && event.tools_used.length) {
+           feedLine("tools: " + event.tools_used.join(", ") +
+                    " | steps: " + event.steps +
+                    " | " + Math.round((event.elapsed_ms || 0) / 100) / 10 + "s");
+         }
+       } else if (event.type === "cancelled") {
+         feedLine("cancelled");
+       } else if (event.type === "error") {
+         feedLine("error: " + event.error, "feed-answer");
+       } else if (event.type === "done") {
+         feedLine("run finished: " + event.status);
+         closeRun();
+         loadTasks();
+       }
+       feed.scrollIntoView({ block: "end" });
+     };
+     runSource.onerror = function() {
+       // The server closes the stream when the run ends. Do not let EventSource
+       // reconnect and replay the whole run in a loop.
+       closeRun();
+     };
+   }
+
+   function addToolCardTo(host, name, args) {
+     var card = document.createElement("div");
+     card.className = "tool-card";
+     var head = document.createElement("div");
+     head.className = "name";
+     head.textContent = "tool: " + name;
+     var argsEl = document.createElement("div");
+     argsEl.className = "args";
+     argsEl.textContent = JSON.stringify(args);
+     var body = document.createElement("pre");
+     body.textContent = "running...";
+     card.appendChild(head);
+     card.appendChild(argsEl);
+     card.appendChild(body);
+     host.appendChild(card);
+     return { card: card, body: body };
+   }
+
+   // ------------------------------------------------------------ models ---
+
+   async function loadModels() {
+     try {
+       var out = await fetchJSON("/api/models");
+       var current = out.data.current;
+       document.getElementById("modelCurrent").textContent =
+         "model    : " + current.model + (current.cached ? "  (cached)" : "  (not downloaded)") +
+         "\nadapter  : " + current.adapter + (current.adapter_path ? "  " + current.adapter_path : "") +
+         "\nkv cache : " + (current.max_kv_size || "unbounded") +
+         "\nstatus   : " + current.status +
+         "\ncache dir: " + out.data.cache_dir;
+
+       var table = document.getElementById("modelTable");
+       table.innerHTML = "";
+       (out.data.catalog || []).forEach(function(item) {
+         var row = document.createElement("tr");
+         var id = document.createElement("td");
+         id.className = "id";
+         id.textContent = item.id;
+         var state = document.createElement("td");
+         state.style.width = "110px";
+         state.appendChild(statusPill(item.current ? "running" : (item.cached ? "ok" : "")));
+         state.lastChild.textContent = item.current ? "in use" : (item.cached ? "cached" : "download");
+         var action = document.createElement("td");
+         action.style.width = "70px";
+         var button = document.createElement("button");
+         button.textContent = "Use";
+         button.disabled = item.current;
+         button.onclick = function() { useModel(item.id); };
+         action.appendChild(button);
+         row.appendChild(id);
+         row.appendChild(state);
+         row.appendChild(action);
+         table.appendChild(row);
+       });
+
+       var select = document.getElementById("adapterSelect");
+       select.innerHTML = "";
+       (out.data.adapters || []).forEach(function(item) {
+         var option = document.createElement("option");
+         option.value = item.id;
+         option.textContent = item.id + (item.modified ? "  (" + relativeTime(item.modified) + ")" : "");
+         select.appendChild(option);
+       });
+       select.value = current.adapter;
+       document.getElementById("kvSize").value = current.max_kv_size || 0;
+     } catch (err) {
+       document.getElementById("modelCurrent").textContent = "Could not load models: " + err.message;
+     }
+   }
+
+   async function postModel(body) {
+     try {
+       var out = await fetchJSON("/api/models/select", {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+         body: JSON.stringify(body)
+       });
+       if (out.data.error) {
+         alert(out.data.error);
+         return;
+       }
+       loadModels();
+       loadModelLog();
+     } catch (err) {
+       alert("Could not switch: " + err.message);
+     }
+   }
+
+   function useModel(modelId) {
+     if (!modelId) return;
+     if (!window.confirm("Switch to " + modelId + "? The model server restarts, " +
+                         "and an uncached model downloads first.")) return;
+     postModel({ model: modelId, restart: true });
+   }
+
+   function applyModel() {
+     postModel({
+       adapter: document.getElementById("adapterSelect").value,
+       max_kv_size: Number(document.getElementById("kvSize").value) || 0,
+       restart: true
+     });
+   }
+
+   async function loadModelLog() {
+     try {
+       var out = await fetchJSON("/api/logs/model?lines=120");
+       var box = document.getElementById("modelLog");
+       box.textContent = out.data.text || "(no output yet)";
+       box.scrollTop = box.scrollHeight;
+     } catch (err) {
+       document.getElementById("modelLog").textContent = "Log unavailable: " + err.message;
+     }
+   }
+
    loadConfig();
+   loadMemory();
    setInterval(refreshHealth, 3000);
    refreshHealth();
  </script>
@@ -2500,6 +4672,10 @@ FeedbackRequest: Any = None
 ChatResponse: Any = None
 ConfigRequest: Any = None
 ToolRequest: Any = None
+MemoryRequest: Any = None
+TaskRequest: Any = None
+TaskUpdateRequest: Any = None
+ModelSelectRequest: Any = None
 
 
 def _define_api_models() -> None:
@@ -2512,6 +4688,7 @@ def _define_api_models() -> None:
     treating the body parameter as a query parameter and every POST returns 422.
     """
     global ChatRequest, FeedbackRequest, ChatResponse, ConfigRequest, ToolRequest
+    global MemoryRequest, TaskRequest, TaskUpdateRequest, ModelSelectRequest
     if ChatRequest is not None:
         return
     from pydantic import BaseModel, Field
@@ -2550,6 +4727,36 @@ def _define_api_models() -> None:
         args: dict = Field(default_factory=dict)
         conversation_id: str | None = Field(None, max_length=64)
 
+    class MemoryRequest(BaseModel):  # noqa: F811
+        key: str = Field(..., min_length=1, max_length=120)
+        value: str = Field(..., min_length=1, max_length=8000)
+
+    class TaskRequest(BaseModel):  # noqa: F811
+        name: str = Field(..., min_length=1, max_length=120)
+        goal: str = Field(..., min_length=1, max_length=8000)
+        enabled: bool = True
+        interval_seconds: int = Field(0, ge=0, le=2_592_000)
+        max_steps: int = Field(6, ge=1, le=20)
+        tools: str = Field("", max_length=500)
+        system_prompt: str | None = Field(None, max_length=8000)
+        use_history: bool = False
+
+    class TaskUpdateRequest(BaseModel):  # noqa: F811
+        name: str | None = Field(None, min_length=1, max_length=120)
+        goal: str | None = Field(None, min_length=1, max_length=8000)
+        enabled: bool | None = None
+        interval_seconds: int | None = Field(None, ge=0, le=2_592_000)
+        max_steps: int | None = Field(None, ge=1, le=20)
+        tools: str | None = Field(None, max_length=500)
+        system_prompt: str | None = Field(None, max_length=8000)
+        use_history: bool | None = None
+
+    class ModelSelectRequest(BaseModel):  # noqa: F811
+        model: str | None = Field(None, min_length=1, max_length=200)
+        adapter: str | None = Field(None, max_length=100)
+        max_kv_size: int | None = Field(None, ge=0, le=1_048_576)
+        restart: bool = True
+
 
 def create_app(
     config: Config,
@@ -2565,11 +4772,24 @@ def create_app(
 
     _define_api_models()
 
+    from contextlib import asynccontextmanager
+
     registry = registry or ToolRegistry(config, db)
     model_client = ModelClient(config)
     agent = Agent(config, registry, model_client)
+    tasks = TaskManager(config, db, model_manager, retrain_manager, model_client)
 
-    app = FastAPI(title="Local LLM")
+    @asynccontextmanager
+    async def lifespan(_app):
+        await tasks.start()
+        try:
+            yield
+        finally:
+            await tasks.stop()
+
+    app = FastAPI(title="Local LLM", lifespan=lifespan)
+    # Exposed so tests and the CLI can reach the scheduler without a global.
+    app.state.tasks = tasks
 
     # The UI is same-origin, so only the loopback origins this process serves are allowed.
     # A wildcard here would let any site the user visits drive /api/retrain and
@@ -2617,6 +4837,15 @@ def create_app(
             "temperature": config.temperature,
             "tools": registry.names(),
             "search_backend": config.search_backend,
+            "memories": db.count_memories(),
+            "adapter": model_manager.adapter_choice,
+            "tasks": {
+                "total": len(db.list_tasks()),
+                "running": [
+                    {"task_id": task_id, **(tasks.live_status(task_id) or {})}
+                    for task_id in list(tasks.by_task)
+                ],
+            },
         }
 
     @app.get("/api/feedback")
@@ -2663,15 +4892,21 @@ def create_app(
             return blocked
 
         conversation_id, history = load_history(request)
-        max_tokens, _ = overrides(request)
+        max_tokens, temperature = overrides(request)
         use_agent = config.agent_enabled if request.agent is None else request.agent
+
+        # Recorded before generating, so a failed or empty run still leaves the
+        # question in the transcript instead of silently dropping the turn.
+        db.add_message(conversation_id, "user", request.message)
 
         try:
             if use_agent:
                 answer = ""
                 trace: list[dict] = []
                 error: str | None = None
-                async for event in agent.run(request.message, history, conversation_id):
+                async for event in agent.run(
+                    request.message, history, conversation_id, max_tokens, temperature
+                ):
                     if event["type"] == "final":
                         answer = event["answer"]
                         trace = event.get("trace", [])
@@ -2686,10 +4921,9 @@ def create_app(
                 messages, _ = trim_to_context(
                     system, history, user, config.context_size, max_tokens
                 )
-                answer = await model_client.complete(messages, max_tokens)
+                answer = await model_client.complete(messages, max_tokens, temperature)
                 trace = []
 
-            db.add_message(conversation_id, "user", request.message)
             db.add_message(
                 conversation_id, "assistant", answer,
                 meta={"trace": trace} if trace else None,
@@ -2717,7 +4951,7 @@ def create_app(
             return blocked
 
         conversation_id, history = load_history(request)
-        max_tokens, _ = overrides(request)
+        max_tokens, temperature = overrides(request)
         use_agent = config.agent_enabled if request.agent is None else request.agent
 
         async def sse(event: dict) -> str:
@@ -2729,8 +4963,11 @@ def create_app(
             start_time = time.time()
             try:
                 yield await sse({"type": "start", "conversation_id": conversation_id, "agent": use_agent})
+                db.add_message(conversation_id, "user", request.message)
                 if use_agent:
-                    async for event in agent.run(request.message, history, conversation_id):
+                    async for event in agent.run(
+                        request.message, history, conversation_id, max_tokens, temperature
+                    ):
                         yield await sse(event)
                         if event["type"] == "final":
                             answer = event["answer"]
@@ -2744,13 +4981,12 @@ def create_app(
                     if dropped:
                         yield await sse({"type": "context", "dropped": dropped,
                                          "tokens": messages_tokens(messages)})
-                    async for token in model_client.stream(messages, max_tokens):
+                    async for token in model_client.stream(messages, max_tokens, temperature):
                         answer += token
                         yield await sse({"type": "token", "token": token, "step": 1})
                     yield await sse({"type": "final", "answer": answer, "steps": 1, "trace": []})
 
                 if answer:
-                    db.add_message(conversation_id, "user", request.message)
                     db.add_message(
                         conversation_id, "assistant", answer,
                         meta={"trace": trace} if trace else None,
@@ -2810,6 +5046,165 @@ def create_app(
     def conversations(limit: int = Query(50, ge=1, le=200)):
         return {"conversations": db.list_conversations(limit)}
 
+    def task_view(task: dict) -> dict:
+        view = dict(task)
+        view["live"] = tasks.live_status(task["id"])
+        return view
+
+    @app.get("/api/tasks")
+    def list_tasks():
+        return {"tasks": [task_view(task) for task in db.list_tasks()]}
+
+    @app.post("/api/tasks")
+    def create_task(request: TaskRequest):
+        task = db.create_task(**request.model_dump())
+        log(f"Task created: {task['name']} ({task['id']})")
+        return {"task": task_view(task)}
+
+    @app.get("/api/tasks/{task_id}")
+    def get_task(task_id: str):
+        task = db.get_task(task_id)
+        if task is None:
+            return JSONResponse(content={"error": "no such task"}, status_code=404)
+        return {"task": task_view(task), "runs": db.list_runs(task_id, 20)}
+
+    @app.post("/api/tasks/{task_id}")
+    def update_task(task_id: str, request: TaskUpdateRequest):
+        task = db.update_task(task_id, request.model_dump(exclude_none=True))
+        if task is None:
+            return JSONResponse(content={"error": "no such task"}, status_code=404)
+        return {"task": task_view(task)}
+
+    @app.delete("/api/tasks/{task_id}")
+    def delete_task(task_id: str):
+        tasks.cancel_task(task_id)
+        return {"deleted": db.delete_task(task_id)}
+
+    @app.post("/api/tasks/{task_id}/run")
+    async def run_task(task_id: str):
+        task = db.get_task(task_id)
+        if task is None:
+            return JSONResponse(content={"error": "no such task"}, status_code=404)
+        blocked = not_ready()
+        if blocked is not None:
+            return blocked
+        try:
+            run = await tasks.launch(task, trigger="manual")
+        except ValueError as exc:
+            return JSONResponse(content={"error": str(exc)}, status_code=409)
+        return {"run_id": run.run_id, "task_id": task_id}
+
+    @app.post("/api/tasks/{task_id}/cancel")
+    def cancel_task(task_id: str):
+        return {"cancelling": tasks.cancel_task(task_id)}
+
+    @app.get("/api/tasks/{task_id}/runs")
+    def task_runs(task_id: str, limit: int = Query(20, ge=1, le=200)):
+        return {"runs": db.list_runs(task_id, limit)}
+
+    @app.get("/api/runs/{run_id}")
+    def get_run(run_id: str):
+        run = db.get_run(run_id)
+        if run is None:
+            return JSONResponse(content={"error": "no such run"}, status_code=404)
+        return {"run": run, "events": db.run_events(run_id, limit=2000)}
+
+    @app.post("/api/runs/{run_id}/cancel")
+    def cancel_run(run_id: str):
+        return {"cancelling": tasks.cancel_run(run_id)}
+
+    @app.get("/api/runs/{run_id}/stream")
+    async def stream_run(run_id: str):
+        """Replay a run from the start, then follow it live until it finishes."""
+        async def event_generator() -> AsyncGenerator[str, None]:
+            try:
+                async for event in tasks.subscribe(run_id):
+                    yield f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
+            except Exception as exc:
+                yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/models")
+    def list_models():
+        return {
+            "current": model_manager.describe(),
+            "catalog": model_catalog(config),
+            "adapters": [{"id": "none", "path": "", "modified": None}] + list_adapters(),
+            "cache_dir": str(hf_cache_dir()),
+        }
+
+    @app.post("/api/models/select")
+    def select_model(request: ModelSelectRequest):
+        """Point the model server at a different model or adapter and restart it."""
+        if retrain_manager.status.get("running"):
+            return JSONResponse(
+                content={"error": "Retraining is running and owns the model server."},
+                status_code=409,
+            )
+        running = list(tasks.by_task)
+        if running:
+            return JSONResponse(
+                content={"error": f"{len(running)} task run(s) in flight. Cancel them first.",
+                         "running": running},
+                status_code=409,
+            )
+        try:
+            changed = model_manager.swap(request.model, request.adapter)
+        except ValueError as exc:
+            return JSONResponse(content={"error": str(exc)}, status_code=400)
+
+        if request.model:
+            config.model = request.model
+        if request.adapter is not None:
+            config.adapter = request.adapter
+        if request.max_kv_size is not None and request.max_kv_size != config.max_kv_size:
+            config.max_kv_size = request.max_kv_size
+            model_manager.max_kv_size = request.max_kv_size
+            changed = True
+
+        if changed or request.restart:
+            log(f"Switching to {config.model} (adapter: {config.adapter}). Restarting model server.")
+            threading.Thread(target=model_manager.restart, daemon=True).start()
+        return {
+            "restarting": bool(changed or request.restart),
+            "changed": changed,
+            "current": model_manager.describe(),
+            "note": "Weights download on first use. Watch /api/logs/model for progress.",
+        }
+
+    @app.get("/api/adapters")
+    def adapters():
+        return {"adapters": list_adapters(), "current": model_manager.adapter_choice}
+
+    @app.get("/api/logs/{name}")
+    def logs(name: str, lines: int = Query(120, ge=1, le=2000)):
+        try:
+            return {"name": name, "text": tail_log(name, lines)}
+        except ValueError as exc:
+            return JSONResponse(content={"error": str(exc)}, status_code=404)
+
+    @app.get("/api/memory")
+    def list_memory(
+        limit: int = Query(50, ge=1, le=500),
+        search: str | None = Query(None, max_length=100),
+    ):
+        return {"memories": db.recall(search, limit)}
+
+    @app.post("/api/memory")
+    def set_memory(request: MemoryRequest):
+        db.remember(request.key, request.value)
+        return {"stored": request.key}
+
+    @app.delete("/api/memory/{key}")
+    def delete_memory(key: str):
+        return {"deleted": db.forget(key)}
+
     @app.get("/api/conversation/{conversation_id}")
     def conversation(conversation_id: str, limit: int = Query(200, ge=1, le=1000)):
         messages = db.get_messages(conversation_id, limit)
@@ -2827,6 +5222,11 @@ def create_app(
     @app.post("/api/model/restart")
     def restart_model():
         """Restart the model server, picking up a changed KV cache size."""
+        if retrain_manager.status.get("running"):
+            return JSONResponse(
+                content={"error": "Retraining is running and already owns the model server."},
+                status_code=409,
+            )
         model_manager.max_kv_size = config.max_kv_size
         threading.Thread(target=model_manager.restart, daemon=True).start()
         return {"status": "restarting", "max_kv_size": config.max_kv_size}
@@ -2998,7 +5398,22 @@ def selftest() -> int:
             failures.append("tool call log did not round-trip")
         if db.clear_conversation("conv1") != 2:
             failures.append("clear_conversation did not remove both messages")
+
+        db.remember("user.city", "Brussels", "conv1")
+        db.remember("user.city", "Ghent", "conv1")
+        notes = db.recall("city")
+        if len(notes) != 1 or notes[0]["value"] != "Ghent":
+            failures.append("memory upsert did not replace the earlier value")
+        if not db.forget("user.city") or db.recall("city"):
+            failures.append("forget did not delete the note")
         db.close()
+        # close() must not leave this thread holding a dead handle.
+        try:
+            db.get_stats()
+        except Exception as exc:
+            failures.append(f"database did not reconnect after close(): {exc}")
+        finally:
+            db.close()
 
     # Tool call parsing has to survive whatever a small model wraps around it.
     parse_cases = [
@@ -3011,6 +5426,13 @@ def selftest() -> int:
     for text, expected in parse_cases:
         if parse_tool_call(text) != expected:
             failures.append(f"parse_tool_call mishandled: {text[:40]!r}")
+
+    # The JS scanner must not flag an apostrophe inside a well-formed literal,
+    # because check_ui_syntax failing means main() refuses to start.
+    if scan_js_strings('var msg = "it\'s fine"; // don\'t\n'):
+        failures.append("scan_js_strings flagged a valid apostrophe")
+    if not scan_js_strings('var broken = "starts here\nand ends there";\n'):
+        failures.append("scan_js_strings missed a string split across lines")
 
     if abs(safe_eval("(2+3)*sqrt(16)") - 20.0) > 1e-9:
         failures.append("safe_eval returned the wrong result")
@@ -3027,6 +5449,13 @@ def selftest() -> int:
     except ValueError:
         pass
 
+    for local in ["http://127.0.0.1:8000/api/config", "http://localhost:8080/v1/models"]:
+        try:
+            guard_public_url(local)
+            failures.append(f"guard_public_url allowed {local}")
+        except ValueError:
+            pass
+
     system = {"role": "system", "content": "s" * 400}
     history = [{"role": "user", "content": "h" * 4000} for _ in range(10)]
     user = {"role": "user", "content": "u" * 400}
@@ -3036,7 +5465,9 @@ def selftest() -> int:
 
     config = Config()
     registry = ToolRegistry(config)
-    for expected_tool in ["web_search", "fetch_url", "calculator", "read_file", "write_file"]:
+    for expected_tool in ["web_search", "fetch_url", "calculator", "read_file",
+                          "write_file", "edit_file", "search_files", "remember",
+                          "recall_memory", "final_answer"]:
         if registry.get(expected_tool) is None:
             failures.append(f"tool registry is missing {expected_tool}")
     if registry.get("run_shell") is not None:
@@ -3050,6 +5481,156 @@ def selftest() -> int:
     prompt = build_agent_system_prompt("base", registry)
     if "web_search" not in prompt or "TOOL RESULT" not in prompt:
         failures.append("agent system prompt is missing the tool protocol")
+
+    # Argument aliasing: a model that says {"q": ...} should still get a search.
+    search_tool = registry.get("web_search")
+    if registry.normalise_args(search_tool, {"q": "mlx lora"}) != {"query": "mlx lora"}:
+        failures.append("normalise_args did not map q onto query")
+    if registry.normalise_args(search_tool, {"nonsense": "x"}) != {"query": "x"}:
+        failures.append("normalise_args did not adopt a lone value for a single-argument tool")
+
+    # An allowlist must never remove the loop's exit tool.
+    limited = ToolRegistry(Config(agent_tools="calculator"))
+    if set(limited.names()) != {"calculator", "final_answer"}:
+        failures.append(f"AGENT_TOOLS allowlist produced {limited.names()}")
+
+    known = set(registry.names())
+    if parse_tool_call('Here is the config: {"name": "gpt", "temperature": 0.7}', known) is not None:
+        failures.append("parse_tool_call treated a JSON answer as a tool call")
+    if parse_tool_call('{"tool": "web_search", "args": {"query": "x"}}', known) is None:
+        failures.append("parse_tool_call rejected a valid call against the known set")
+
+    # Workspace file tools, against a throwaway workspace.
+    original_workspace = WORKSPACE_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        globals()["WORKSPACE_DIR"] = Path(tmp) / "workspace"
+        try:
+            registry.call("write_file", {"path": "notes/a.txt", "content": "alpha\nbeta\n"})
+            body, error = registry.call("read_file", {"path": "notes/a.txt"})
+            if error or "alpha" not in body:
+                failures.append(f"write_file/read_file round-trip failed: {body!r}")
+            _, error = registry.call(
+                "edit_file", {"path": "notes/a.txt", "find": "beta", "replace": "gamma"}
+            )
+            body, _ = registry.call("read_file", {"path": "notes/a.txt"})
+            if error or "gamma" not in body or "beta" in body:
+                failures.append("edit_file did not apply the replacement")
+            _, error = registry.call(
+                "edit_file", {"path": "notes/a.txt", "find": "absent", "replace": "x"}
+            )
+            if not error:
+                failures.append("edit_file accepted a snippet that is not in the file")
+            hits, error = registry.call("search_files", {"pattern": "gam+a"})
+            if error or "a.txt" not in hits:
+                failures.append(f"search_files did not find the match: {hits!r}")
+        finally:
+            globals()["WORKSPACE_DIR"] = original_workspace
+
+    # Tasks: creation, scheduling, the run lifecycle, and event replay.
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Database(Path(tmp) / "tasks.db")
+        task = db.create_task(name="nightly", goal="check the news", interval_seconds=3600)
+        if not task["id"] or task["next_run_at"] is None:
+            failures.append("a scheduled task was not armed on creation")
+        if [t["id"] for t in db.due_tasks()] != [task["id"]]:
+            failures.append("a task armed for now did not come back as due")
+
+        db.schedule_next(task["id"], 3600)
+        if db.due_tasks():
+            failures.append("schedule_next did not push the next run into the future")
+
+        if db.update_task(task["id"], {"enabled": False})["next_run_at"] is not None:
+            failures.append("disabling a task left it armed")
+        manual = db.create_task(name="manual", goal="do a thing", interval_seconds=0)
+        if manual["next_run_at"] is not None:
+            failures.append("a manual task was armed anyway")
+
+        run_id = db.create_run(task["id"], "manual", "test-model")
+        db.append_event(run_id, 1, "step", {"step": 1})
+        db.append_event(run_id, 2, "final", {"answer": "done"})
+        events = db.run_events(run_id)
+        if [e["type"] for e in events] != ["step", "final"]:
+            failures.append("task events did not round-trip in order")
+        if db.run_events(run_id, after_seq=1)[0]["type"] != "final":
+            failures.append("after_seq did not skip replayed events")
+        db.finish_run(run_id, "ok", "done", None, 2, 12.0, ["calculator"])
+        if db.get_run(run_id)["status"] != "ok":
+            failures.append("finish_run did not record the outcome")
+        if db.get_task(task["id"])["last_status"] != "ok":
+            failures.append("finish_run did not update the task summary")
+
+        stuck = db.create_run(task["id"], "manual", "test-model")
+        if db.reset_orphan_runs() != 1 or db.get_run(stuck)["status"] != "interrupted":
+            failures.append("reset_orphan_runs left a run marked running")
+
+        if not db.delete_task(task["id"]) or db.get_run(run_id) is not None:
+            failures.append("deleting a task left its runs behind")
+        db.close()
+
+    # Model and adapter selection.
+    if resolve_adapter("none") is not None or resolve_adapter("") is not None:
+        failures.append("resolve_adapter returned a path for the base model")
+    try:
+        resolve_adapter("../../etc")
+        failures.append("resolve_adapter allowed an id outside the backups directory")
+    except ValueError:
+        pass
+    # An adapter must never follow a model swap onto a base it does not fit.
+    with tempfile.TemporaryDirectory() as tmp:
+        original_dirs = (ADAPTER_DIR, ADAPTER_BACKUP_DIR)
+        globals()["ADAPTER_DIR"] = Path(tmp) / "adapters" / "latest"
+        globals()["ADAPTER_BACKUP_DIR"] = Path(tmp) / "adapters" / "backups"
+        try:
+            ADAPTER_DIR.mkdir(parents=True)
+            (ADAPTER_DIR / "adapters.safetensors").write_bytes(b"stub")
+            manager = ModelServerManager("org/base-a", 0, ADAPTER_DIR)
+            manager.adapter_choice = "latest"
+            if manager.adapter_path() != ADAPTER_DIR:
+                failures.append("an untagged adapter was refused")
+
+            write_adapter_base(ADAPTER_DIR, "org/base-a")
+            if manager.adapter_path() != ADAPTER_DIR:
+                failures.append("a matching adapter was refused")
+
+            manager.swap("org/base-b")
+            if manager.adapter_path() is not None:
+                failures.append("a mismatched adapter survived a model swap")
+            if not manager.describe()["adapter_mismatch"]:
+                failures.append("describe() did not report the adapter mismatch")
+            if any(flag in manager._build_cmd(True) for flag in ("--adapter-path", "--adapter")):
+                failures.append("the server command still passed a mismatched adapter")
+        finally:
+            globals()["ADAPTER_DIR"], globals()["ADAPTER_BACKUP_DIR"] = original_dirs
+
+    catalog = model_catalog(Config(model="someone/custom-model"))
+    if not any(entry["current"] and entry["id"] == "someone/custom-model" for entry in catalog):
+        failures.append("model_catalog did not include the model currently in use")
+    if len(catalog) != len({entry["id"] for entry in catalog}):
+        failures.append("model_catalog returned duplicates")
+
+    # The live event buffer must number events and survive a token flood.
+    live = TaskRun("run1", "task1", "demo")
+    live.publish({"type": "start"})
+    for index in range(TaskRun.BUFFER_LIMIT + 200):
+        live.publish({"type": "token", "token": str(index)})
+    live.publish({"type": "final", "answer": "x"})
+    if live.seq != TaskRun.BUFFER_LIMIT + 202:
+        failures.append("TaskRun did not number every published event")
+    if not any(e["type"] == "start" for e in live.events):
+        failures.append("TaskRun buffer dropped a structural event under token pressure")
+    if len(live.events) > TaskRun.BUFFER_LIMIT + 2:
+        failures.append("TaskRun buffer grew past its limit")
+
+    # The agent must keep the system prompt and the question no matter how long
+    # the tool trace gets.
+    agent = Agent(config, registry, ModelClient(config))
+    base, _ = agent.build_base([], "what is the capital of France?", 256)
+    long_scratch = [{"role": "user", "content": "t" * 8000} for _ in range(8)]
+    assembled, cut = agent.assemble(base, long_scratch, 256)
+    if cut == 0:
+        failures.append("agent.assemble kept a trace that cannot fit the context")
+    if assembled[: len(base)] != base:
+        failures.append("agent.assemble dropped part of the pinned question or system prompt")
 
     changed = config.apply({"max_tokens": 99999, "context_size": 1024, "model": "evil/model"})
     if config.model == "evil/model":
@@ -3067,6 +5648,9 @@ def selftest() -> int:
     print("PASS  embedded UI parses and renders")
     print("PASS  database schema round-trips")
     print("PASS  tool call parsing, calculator sandbox, workspace confinement")
+    print("PASS  file tools, argument aliasing, tool allowlist, fetch guard")
+    print("PASS  task scheduling, run lifecycle, event replay, model catalogue")
+    print("PASS  model swapping keeps mismatched adapters out of the server")
     print("PASS  context trimming and runtime config guardrails")
     return 0
 
@@ -3100,6 +5684,25 @@ def main() -> None:
                         help="Expose a run_python tool. The model gets code execution on this machine.")
     parser.add_argument("--allow-shell", action="store_true", default=os.environ.get("ALLOW_SHELL") == "1",
                         help="Expose a run_shell tool. The model gets shell access on this machine.")
+    parser.add_argument("--allow-local-fetch", action="store_true",
+                        default=os.environ.get("ALLOW_LOCAL_FETCH") == "1",
+                        help="Let fetch_url reach loopback and private addresses. Off by default.")
+    parser.add_argument("--agent-tools", default=os.environ.get("AGENT_TOOLS", ""),
+                        help="Comma-separated allowlist of tool names. Empty offers all of them.")
+    parser.add_argument("--adapter", default=os.environ.get("ADAPTER", "latest"),
+                        help="LoRA adapter to load: latest, none, or a backup id.")
+    parser.add_argument("--model-catalog", default=os.environ.get("MODEL_CATALOG", ""),
+                        help="Extra model ids to offer in the Models tab, comma separated.")
+    parser.add_argument("--max-concurrent-tasks", type=int,
+                        default=int(os.environ.get("MAX_CONCURRENT_TASKS", "1")),
+                        help="How many background task runs may execute at once.")
+    parser.add_argument("--list-models", action="store_true",
+                        help="Print the model catalogue and which weights are cached, then exit.")
+    parser.add_argument("--list-tasks", action="store_true",
+                        help="Print the defined tasks and their last run, then exit.")
+    parser.add_argument("--add-task", metavar="JSON",
+                        help='Create a task and exit, e.g. \'{"name": "n", "goal": "g", '
+                             '"interval_seconds": 3600}\'')
     parser.add_argument("--search-backend", default=os.environ.get("SEARCH_BACKEND", "ddg"),
                         choices=["ddg", "brave", "tavily", "searxng"])
     parser.add_argument("--search-results", type=int, default=int(os.environ.get("SEARCH_RESULTS", "5")))
@@ -3124,6 +5727,42 @@ def main() -> None:
     # and would therefore report on the wrong ones.
     if args.doctor:
         doctor(args.web_port, args.model_port)
+        return
+
+    if args.list_models or args.list_tasks or args.add_task:
+        ensure_dirs()
+        early_db = Database(DB_PATH)
+        try:
+            if args.list_models:
+                catalog_config = Config(model=args.model, model_catalog=args.model_catalog)
+                for entry in model_catalog(catalog_config):
+                    marker = "*" if entry["current"] else " "
+                    state = "cached" if entry["cached"] else "not downloaded"
+                    print(f"{marker} {entry['id']}  ({state})")
+                adapters = list_adapters()
+                print("\nadapters: " + (", ".join(
+                    a["id"] + (f" [{a['base_model']}]" if a.get("base_model") else "")
+                    for a in adapters) or "none"))
+                print(f"cache   : {hf_cache_dir()}")
+            if args.add_task:
+                try:
+                    spec = json.loads(args.add_task)
+                except json.JSONDecodeError as exc:
+                    sys.exit(f"--add-task is not valid JSON: {exc}")
+                if not spec.get("name") or not spec.get("goal"):
+                    sys.exit("--add-task needs at least a name and a goal.")
+                created = early_db.create_task(**spec)
+                print(f"Created task {created['id']}: {created['name']}")
+            if args.list_tasks:
+                for task in early_db.list_tasks():
+                    schedule = (f"every {task['interval_seconds']}s"
+                                if task["interval_seconds"] else "manual")
+                    print(f"{task['id']}  {task['name']}  [{schedule}] "
+                          f"{'enabled' if task['enabled'] else 'disabled'}  "
+                          f"runs={task['run_count']}  last={task['last_status'] or 'never'}")
+                    print(f"    goal: {task['goal'][:120]}")
+        finally:
+            early_db.close()
         return
 
     bootstrap()
@@ -3156,6 +5795,11 @@ def main() -> None:
         agent_max_steps=args.agent_max_steps,
         allow_python=args.allow_python,
         allow_shell=args.allow_shell,
+        agent_tools=args.agent_tools,
+        allow_local_fetch=args.allow_local_fetch,
+        adapter=args.adapter,
+        model_catalog=args.model_catalog,
+        max_concurrent_tasks=args.max_concurrent_tasks,
         search_backend=args.search_backend,
         search_results=args.search_results,
         seed_demo=args.seed_demo,
@@ -3205,7 +5849,9 @@ def main() -> None:
         db.close()
         return
 
-    model_manager = ModelServerManager(config.model, config.model_port, ADAPTER_DIR, config.max_kv_size)
+    model_manager = ModelServerManager(
+        config.model, config.model_port, ADAPTER_DIR, config.max_kv_size, config.adapter
+    )
     retrain_manager = RetrainManager(db, model_manager, config)
 
     if config.export_only:
@@ -3219,19 +5865,29 @@ def main() -> None:
 
     app = create_app(config, db, model_manager, retrain_manager, registry)
 
-    def handle_sigterm(signum, frame):
-        log("Received SIGTERM, shutting down...")
+    shutting_down = threading.Event()
+
+    def handle_signal(signum, frame):
+        if shutting_down.is_set():
+            return
+        shutting_down.set()
+        log(f"Received signal {signum}, shutting down...")
         model_manager.stop()
         db.close()
         sys.exit(0)
 
-    signal.signal(signal.SIGTERM, handle_sigterm)
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
 
     log(f"Model: {config.model}")
     log(f"System prompt: {config.system_prompt[:60]}...")
     log(f"Context: {config.context_size} tokens, max_tokens {config.max_tokens}, temperature {config.temperature}")
     log(f"Agent: {'on' if config.agent_enabled else 'off'}, max steps {config.agent_max_steps}, "
         f"tools: {', '.join(registry.names())}")
+    log(f"Adapter: {config.adapter} ({model_manager.adapter_path() or 'base model'})")
+    scheduled = [t for t in db.list_tasks() if t["enabled"] and t["interval_seconds"]]
+    log(f"Tasks: {len(db.list_tasks())} defined, {len(scheduled)} on a schedule, "
+        f"{config.max_concurrent_tasks} at a time")
     if config.allow_shell or config.allow_python:
         log("Code execution tools are enabled. The model can run commands on this machine.", logging.WARNING)
     log("=" * 62)
