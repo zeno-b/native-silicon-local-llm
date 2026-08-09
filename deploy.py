@@ -134,9 +134,23 @@ DEFAULT_MODEL = os.environ.get(
 )
 DEFAULT_SYSTEM_PROMPT = os.environ.get(
     "SYSTEM_PROMPT",
-    "You are a local coding assistant. Prefer complete, runnable code over "
-    "prose. State the language and any assumptions in one line, then give the "
-    "code. Say plainly when you do not know an API rather than inventing one.",
+    "You are a local coding and research assistant. Prefer complete, runnable "
+    "code over prose. State the language and any assumptions in one line, then "
+    "give the code. Say plainly when you do not know an API rather than "
+    "inventing one.\n"
+    # The routing layer sends look-up and current-events requests to web_search
+    # before you see them, so when a TOOL RESULT block is present, the work is
+    # to read those results and answer from them, with sources, not to decide
+    # whether the topic is allowed. Security topics are in scope for this tool: "
+    "When a message includes web search results, base your answer on them and "
+    "cite the URLs. Do not refuse to report on publicly documented software "
+    "vulnerabilities, CVEs, or the existence of published exploits and tools "
+    "(for example Metasploit modules or exploit-db entries): this is standard "
+    "defensive security research and the information is already public. Explain "
+    "what a vulnerability is, how it was fixed, and what public tooling exists, "
+    "and point to primary sources. Decline only a request to produce a working "
+    "exploit against a specified live target, and offer the defensive framing "
+    "instead.",
 )
 
 # Roughly four characters per token for English. Good enough for budgeting a
@@ -3270,6 +3284,42 @@ NEEDS_FRESH = re.compile(
 )
 
 
+# Instruction tails that pollute a search query. "look up X and explain the best
+# one" should search for X; the explaining happens after, when the model reads
+# the results. Split on these and keep only the part before.
+COMPOUND_TAIL = re.compile(
+    r"\s+(?:and|then|,)\s+(?:explain|tell|describe|summar|give|show|walk|"
+    r"detail|analy|compare|list|rank|pick|choose|find the best|"
+    r"which|what.s the best)\b.*$",
+    re.I,
+)
+# Leading filler left over after the command word is removed.
+QUERY_LEADING_FILLER = re.compile(
+    r"^(?:online|for me|whether|if|what|which|the|about|regarding|on|are|is|there)\s+",
+    re.I,
+)
+# Trailing filler that adds nothing to a query.
+QUERY_TRAILING_FILLER = re.compile(
+    r"\s+(?:exist|exists|are there|is there|are available|please|for me|online)\s*$",
+    re.I,
+)
+
+
+def clean_search_query(raw: str) -> str:
+    """Turn a spoken request into a query a search engine will do well on."""
+    query = COMPOUND_TAIL.sub("", raw).strip(" \t\"'")
+    # Filler can stack ("online what heartbleed exploits exist"), so peel
+    # repeatedly rather than once.
+    for _ in range(4):
+        before = query
+        query = QUERY_LEADING_FILLER.sub("", query)
+        query = QUERY_TRAILING_FILLER.sub("", query)
+        query = query.strip(" \t\"'")
+        if query == before:
+            break
+    return query
+
+
 def fast_path_call(message: str) -> tuple[str, dict] | None:
     """Route obvious requests straight to a tool, skipping a model round trip.
 
@@ -3289,7 +3339,7 @@ def fast_path_call(message: str) -> tuple[str, dict] | None:
     # a search query and costs a relevant result.
     command = SEARCH_COMMAND.match(text)
     if command:
-        query = command.group("query").strip(" \t\"'")
+        query = clean_search_query(command.group("query"))
         if 2 <= len(query) <= 200:
             return "web_search", {"query": query}
 
@@ -3298,7 +3348,7 @@ def fast_path_call(message: str) -> tuple[str, dict] | None:
     definitional = DEFINITIONAL.match(text) and not STRONG_RECENCY.search(text)
     if (NEEDS_FRESH.search(text) and text.endswith("?") and len(text) >= 12
             and not definitional):
-        return "web_search", {"query": text.rstrip("?").strip()}
+        return "web_search", {"query": clean_search_query(text.rstrip("?"))}
 
     expression = text.rstrip("=?").strip()
     # Require an operator so a bare number or a year is not "arithmetic".
@@ -3502,11 +3552,24 @@ class Agent:
                 if not error:
                     trace.append({"name": name, "args": args,
                                   "result": result[:1000], "error": None})
-                    yield done(result.strip(), 0)
-                    return
-                # A failed shortcut is not fatal; fall through to the model.
-                scratch.append({"role": "assistant", "content": f"I tried {name} and it failed."})
-                scratch.append({"role": "user", "content": f"TOOL RESULT [{name}]:\n{result}"})
+                    # calculator and fetch_url produce the answer itself: a
+                    # number, a page. Return it. web_search produces raw
+                    # material the user asked a question about, so seed it into
+                    # the loop and let the model read the results and answer,
+                    # rather than dumping titles and URLs as the reply. This is
+                    # also what lets "look up X and explain the best one" work:
+                    # the search runs here, the explanation happens below.
+                    if name != "web_search":
+                        yield done(result.strip(), 0)
+                        return
+                    scratch.append({"role": "assistant",
+                                    "content": json.dumps({"tool": name, "args": args})})
+                    scratch.append({"role": "user",
+                                    "content": f"TOOL RESULT [{name}]:\n{result}"})
+                else:
+                    # A failed shortcut is not fatal; fall through to the model.
+                    scratch.append({"role": "assistant", "content": f"I tried {name} and it failed."})
+                    scratch.append({"role": "user", "content": f"TOOL RESULT [{name}]:\n{result}"})
 
         for step in range(1, self.config.agent_max_steps + 1):
             if cancel is not None and cancel.is_set():
@@ -6664,6 +6727,7 @@ def selftest() -> int:
     registry = ToolRegistry(config)
     for text, expected in [
         ("look up CVEs online", "web_search"),
+        ("look up online what heartbleed exploits exist", "web_search"),
         ("what are the latest CVEs for openssl?", "web_search"),
         ("what is a CVE?", None),
         ("explain how LoRA works", None),
