@@ -127,11 +127,16 @@ DB_PATH = DATA_DIR / "feedback.db"
 
 DEFAULT_MODEL = os.environ.get(
     "MODEL_ID",
-    "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+    # Coding-focused default. ~1.9GB resident at 4-bit, which leaves enough
+    # headroom on an 8GB M1 for the KV cache, the web process and a LoRA run.
+    # Override with MODEL_ID for anything else in DEFAULT_MODEL_CATALOG.
+    "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit",
 )
 DEFAULT_SYSTEM_PROMPT = os.environ.get(
     "SYSTEM_PROMPT",
-    "You are a helpful local assistant.",
+    "You are a local coding assistant. Prefer complete, runnable code over "
+    "prose. State the language and any assumptions in one line, then give the "
+    "code. Say plainly when you do not know an API rather than inventing one.",
 )
 
 # Roughly four characters per token for English. Good enough for budgeting a
@@ -1328,6 +1333,15 @@ def resolve_adapter(choice: str | None) -> Path | None:
 #     disable_thinking (on by default) turns it off, and the agent strips any
 #     <think> block that arrives anyway.
 DEFAULT_MODEL_CATALOG = [
+    # Coding-specialised. Sizes are resident weights; add ~0.5-1.5GB for the KV
+    # cache at the context lengths this app uses.
+    "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",  # ~4.3GB, best code quality that
+                                                     # loads on 8GB. Inference only:
+                                                     # raise the wired limit first and
+                                                     # do not retrain against it.
+    "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit",  # ~1.9GB, default. Trains fine.
+    "mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit",# ~1.0GB, fast completion-style
+    # General purpose.
     "mlx-community/Qwen3.5-4B-OptiQ-4bit",       # ~2.5GB, mixed precision, agent-calibrated
     "mlx-community/Qwen3.5-4B-MLX-4bit",         # ~2.5GB, stock uniform 4-bit
     "mlx-community/Qwen2.5-3B-Instruct-4bit",    # ~1.7GB, no thinking mode
@@ -3612,6 +3626,11 @@ class TaskManager:
         self.recent: dict[str, TaskRun] = {}
         self._scheduler: asyncio.Task | None = None
         self._semaphore: asyncio.Semaphore | None = None
+        # Strong references to the in-flight run coroutines. The event loop only
+        # holds a weak reference to a Task, so a run whose handle is dropped can
+        # be garbage collected mid-execution and simply vanish. self.active
+        # holds the TaskRun record, not the Task, so it does not protect this.
+        self._runners: set[asyncio.Task] = set()
         self._stopping = False
         # Wall clock of the most recent interactive request. A scheduled run
         # landing mid-conversation puts two inference requests into a server
@@ -3650,9 +3669,13 @@ class TaskManager:
                 await self._scheduler
             except (asyncio.CancelledError, Exception):
                 pass
-        deadline = time.time() + 5
-        while self.active and time.time() < deadline:
-            await asyncio.sleep(0.1)
+        # Wait on the run tasks themselves. Polling self.active only observed
+        # the bookkeeping dict, so a runner still unwinding its finally block
+        # could outlive shutdown and write to a closed database.
+        if self._runners:
+            await asyncio.wait(set(self._runners), timeout=5)
+        for runner in list(self._runners):
+            runner.cancel()
 
     async def _scheduler_loop(self) -> None:
         while not self._stopping:
@@ -3688,7 +3711,9 @@ class TaskManager:
         run = TaskRun(run_id, task["id"], task["name"])
         self.active[run_id] = run
         self.by_task[task["id"]] = run
-        asyncio.create_task(self._execute(task, run, trigger))
+        runner = asyncio.create_task(self._execute(task, run, trigger))
+        self._runners.add(runner)
+        runner.add_done_callback(self._runners.discard)
         return run
 
     def _task_config(self, task: dict) -> Config:
