@@ -1448,6 +1448,12 @@ class Config:
     # Tool-selection steps want deterministic JSON; only the final answer wants
     # the configured temperature. One value for both costs malformed calls.
     tool_temperature: float = field(default_factory=lambda: float(os.environ.get("TOOL_TEMPERATURE", "0.0")))
+    # Multiplicative penalty on tokens already in the window. Small quantised
+    # models fall into verbatim repetition loops, and greedy decoding
+    # (tool_temperature 0.0) has no way out of one: the argmax that produced the
+    # loop keeps producing it until max_tokens runs out. 1.0 disables it.
+    repetition_penalty: float = field(default_factory=lambda: float(os.environ.get("REPETITION_PENALTY", "1.1")))
+    repetition_context_size: int = field(default_factory=lambda: int(os.environ.get("REPETITION_CONTEXT_SIZE", "64")))
     # Answer arithmetic and bare URLs without a model round trip at all.
     fast_path: bool = field(default_factory=lambda: os.environ.get("FAST_PATH", "1") == "1")
     # When the trace outgrows the context, collapse the oldest steps into one
@@ -1494,7 +1500,8 @@ class Config:
     # Settings the web UI is allowed to change at runtime. Anything not listed
     # here needs a process restart and is rejected by /api/config.
     MUTABLE = (
-        "system_prompt", "max_tokens", "temperature", "context_size",
+        "system_prompt", "max_tokens", "temperature", "repetition_penalty",
+        "repetition_context_size", "context_size",
         "history_turns", "agent_enabled", "agent_max_steps",
         "search_backend", "search_results", "tool_result_chars", "tool_raw_chars",
         "disable_thinking", "tool_temperature", "fast_path", "stable_prefix",
@@ -2281,6 +2288,41 @@ class SearchBackend:
         ]
 
 
+# Ceilings for the calculator. Exponentiation and factorial are the only
+# whitelisted operations whose cost is not bounded by the length of the
+# expression: 9**9**9 is seven characters and allocates until the kernel kills
+# the process. safe_eval runs in the web process, on the request thread, with
+# no subprocess timeout around it the way run_python and run_shell have, so an
+# unbounded intermediate takes the whole app down rather than one tool call.
+# 65536 bits is a 19,728-digit number, past any real calculator use.
+MAX_RESULT_BITS = 1 << 16
+MAX_FACTORIAL_INPUT = 1000
+
+
+def _guarded_pow(base: Any, exponent: Any) -> Any:
+    """base ** exponent, refusing results too large to hold in memory."""
+    if isinstance(base, int) and isinstance(exponent, int) and exponent > 0:
+        # bit_length() * exponent is the exact width of the result, computed
+        # without building it. 0 and 1 have no growth, so exempt them.
+        if base not in (0, 1, -1) and base.bit_length() * exponent > MAX_RESULT_BITS:
+            raise ValueError(
+                f"refusing to compute a number with about "
+                f"{base.bit_length() * exponent // 3.32:.0f} digits"
+            )
+    try:
+        return operator.pow(base, exponent)
+    except OverflowError as exc:
+        raise ValueError(f"result out of range: {exc}") from exc
+
+
+def _guarded_factorial(value: Any) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("factorial needs a whole number")
+    if not 0 <= value <= MAX_FACTORIAL_INPUT:
+        raise ValueError(f"factorial argument must be between 0 and {MAX_FACTORIAL_INPUT}")
+    return math.factorial(value)
+
+
 _SAFE_OPERATORS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -2288,7 +2330,7 @@ _SAFE_OPERATORS = {
     ast.Div: operator.truediv,
     ast.FloorDiv: operator.floordiv,
     ast.Mod: operator.mod,
-    ast.Pow: operator.pow,
+    ast.Pow: _guarded_pow,
     ast.USub: operator.neg,
     ast.UAdd: operator.pos,
 }
@@ -2300,6 +2342,8 @@ _SAFE_NAMES: dict[str, Any] = {
                  "factorial", "degrees", "radians", "hypot", "fabs")
 }
 _SAFE_NAMES.update({"abs": abs, "round": round, "min": min, "max": max, "sum": sum})
+# math.factorial is the other unbounded-cost entry: factorial(9**7) never returns.
+_SAFE_NAMES["factorial"] = _guarded_factorial
 
 
 def safe_eval(expression: str) -> float:
@@ -2321,7 +2365,12 @@ def safe_eval(expression: str) -> float:
                 return node.value
             raise ValueError("only numeric constants are allowed")
         if isinstance(node, ast.BinOp) and type(node.op) in _SAFE_OPERATORS:
-            return _SAFE_OPERATORS[type(node.op)](evaluate(node.left), evaluate(node.right))
+            result = _SAFE_OPERATORS[type(node.op)](evaluate(node.left), evaluate(node.right))
+            # Repeated multiplication reaches the same place as ** by a longer
+            # road, so bound every intermediate rather than only the pow.
+            if isinstance(result, int) and result.bit_length() > MAX_RESULT_BITS:
+                raise ValueError("intermediate result too large")
+            return result
         if isinstance(node, ast.UnaryOp) and type(node.op) in _SAFE_OPERATORS:
             return _SAFE_OPERATORS[type(node.op)](evaluate(node.operand))
         if isinstance(node, ast.Name) and node.id in _SAFE_NAMES:
@@ -3059,6 +3108,11 @@ class ModelClient:
             "temperature": self.config.temperature if temperature is None else temperature,
             "max_tokens": max_tokens or self.config.max_tokens,
         }
+        # mlx_lm.server reads these from the request body; they are not OpenAI
+        # parameters, and any server that does not know them ignores them.
+        if self.config.repetition_penalty and self.config.repetition_penalty != 1.0:
+            body["repetition_penalty"] = self.config.repetition_penalty
+            body["repetition_context_size"] = self.config.repetition_context_size
         if stream:
             # Ask for usage on the final chunk. Servers that do not know the
             # option ignore it, and the estimate below covers them.
@@ -3179,6 +3233,42 @@ class ModelClient:
 ARITHMETIC_ONLY = re.compile(r"^[\d\s+\-*/().,^%]+$")
 BARE_URL = re.compile(r"^\s*(https?://\S+)\s*$", re.I)
 
+# An explicit instruction to go and look something up. A 3B model asked to
+# "look up CVEs online" will often answer from weights instead of emitting a
+# tool call, because answering is the higher-probability continuation. Routing
+# these deterministically is more reliable than prompting harder, and it also
+# removes the prefill that the model would have spent deciding.
+SEARCH_COMMAND = re.compile(
+    r"^\s*(?:please\s+)?(?:can you\s+|could you\s+)?"
+    r"(?:look\s*up|search(?:\s+(?:for|the\s+web\s+for|online\s+for))?|"
+    r"google|web\s*search|find(?:\s+out)?(?:\s+online)?|check)\s+"
+    r"(?P<query>.+?)\s*(?:\s+online|\s+on\s+the\s+(?:web|internet))?\s*[.?!]*$",
+    re.I,
+)
+# Definitional phrasing. "what is a CVE" contains a recency keyword but wants a
+# concept, and a local model answers it faster and just as well as a search.
+DEFINITIONAL = re.compile(
+    r"^\s*(?:what|whats|what's)\s+(?:is|are)\s+(?:a|an|the)?\s*[\w\s-]{1,30}\?*\s*$"
+    r"|^\s*(?:explain|define|describe|what does)\b",
+    re.I,
+)
+# A recency word overrides the definitional shape: "what is the newest X" reads
+# like a definition and is a lookup.
+STRONG_RECENCY = re.compile(
+    r"\b(latest|newest|current(?:ly)?|right now|today|yesterday|this (?:week|month|year)|"
+    r"recent(?:ly)?|news|released?|announced|version|changelog|price|stock)\b",
+    re.I,
+)
+# Questions whose answer moves. Present tense plus a recency marker is the
+# signal; a bare "what is a CVE" is a definition and stays local.
+NEEDS_FRESH = re.compile(
+    r"\b(latest|newest|current|currently|right now|today|yesterday|this (?:week|month|year)|"
+    r"recent(?:ly)?|so far in \d{4}|as of \d{4}|news|released?|announced|version|changelog|"
+    r"CVE-\d{4}-\d{4,}|cves?|advisor(?:y|ies)|vulnerabilit(?:y|ies)|exploit|patch(?:ed)?|"
+    r"price|stock|score|who is the (?:current )?\w+ of)\b",
+    re.I,
+)
+
 
 def fast_path_call(message: str) -> tuple[str, dict] | None:
     """Route obvious requests straight to a tool, skipping a model round trip.
@@ -3193,6 +3283,22 @@ def fast_path_call(message: str) -> tuple[str, dict] | None:
     url = BARE_URL.match(text)
     if url:
         return "fetch_url", {"url": url.group(1)}
+
+    # "look up X online" / "search for X". Take the command word off and search
+    # the remainder rather than the whole sentence: the imperative is noise in
+    # a search query and costs a relevant result.
+    command = SEARCH_COMMAND.match(text)
+    if command:
+        query = command.group("query").strip(" \t\"'")
+        if 2 <= len(query) <= 200:
+            return "web_search", {"query": query}
+
+    # Not phrased as a command, but the answer is time-sensitive and a local
+    # model would answer from stale weights with no signal that it had.
+    definitional = DEFINITIONAL.match(text) and not STRONG_RECENCY.search(text)
+    if (NEEDS_FRESH.search(text) and text.endswith("?") and len(text) >= 12
+            and not definitional):
+        return "web_search", {"query": text.rstrip("?").strip()}
 
     expression = text.rstrip("=?").strip()
     # Require an operator so a bare number or a year is not "arithmetic".
@@ -6556,6 +6662,24 @@ def selftest() -> int:
 
     config = Config()
     registry = ToolRegistry(config)
+    for text, expected in [
+        ("look up CVEs online", "web_search"),
+        ("what are the latest CVEs for openssl?", "web_search"),
+        ("what is a CVE?", None),
+        ("explain how LoRA works", None),
+        ("17*23", "calculator"),
+        ("https://example.com", "fetch_url"),
+    ]:
+        routed = fast_path_call(text)
+        if (routed[0] if routed else None) != expected:
+            failures.append(f"fast_path_call({text!r}) routed to {routed!r}, expected {expected!r}")
+    for expr in ["9**9**9", "factorial(9**7)", "(10**20000)*(10**20000)"]:
+        try:
+            safe_eval(expr)
+            failures.append(f"safe_eval({expr!r}) was not refused: unbounded intermediate")
+        except ValueError:
+            pass
+
     for expected_tool in ["web_search", "fetch_url", "calculator", "read_file",
                           "write_file", "edit_file", "search_files", "remember",
                           "recall_memory", "final_answer"]:
