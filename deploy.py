@@ -2503,6 +2503,18 @@ class ToolRegistry:
             handler=self._fetch_url,
         ))
         self._add(Tool(
+            name="weather",
+            description=(
+                "Get the current conditions and multi-day forecast for a place. "
+                "Use this for any weather question instead of web_search: it returns "
+                "actual temperatures and conditions, which search snippets do not."
+            ),
+            parameters={"location": "city or place name, for example Brussels",
+                        "when": "today, tomorrow, or a weekday; default today"},
+            required=["location"],
+            handler=self._weather,
+        ))
+        self._add(Tool(
             name="calculator",
             description="Evaluate an arithmetic expression. Supports + - * / % ** and functions such as sqrt, log, sin, cos.",
             parameters={"expression": "for example (2+3)*sqrt(16)"},
@@ -2704,6 +2716,69 @@ class ToolRegistry:
 
     def _calculator(self, expression: str) -> str:
         return str(safe_eval(expression))
+
+    def _weather(self, location: str, when: str = "today") -> str:
+        """Plain-text forecast from wttr.in, which returns data an LLM can relay.
+
+        Search snippets for "weather" describe weather websites; they carry no
+        actual forecast. wttr.in returns the numbers directly as JSON, so the
+        model has something to answer from instead of a page of navigation.
+        """
+        import httpx
+        place = (location or "").strip()
+        if not place:
+            raise ValueError("location must not be empty")
+        when_key = (when or "today").strip().lower()
+        url = f"https://wttr.in/{urllib.parse.quote(place)}?format=j1"
+        try:
+            with httpx.Client(timeout=self.config.tool_timeout,
+                              headers={"User-Agent": "curl/8"}) as client:
+                resp = client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:
+            return f"Could not fetch weather for {place}: {exc}"
+
+        days = data.get("weather") or []
+        if not days:
+            return f"No forecast returned for {place}."
+        # Map the request to a day index. wttr.in gives today plus two days.
+        index = {"today": 0, "tomorrow": 1}.get(when_key)
+        if index is None:
+            # A weekday name: match it against each day's date.
+            import datetime as _dt
+            wanted = when_key[:3]
+            index = 0
+            for i, day in enumerate(days):
+                try:
+                    d = _dt.date.fromisoformat(day.get("date", ""))
+                    if d.strftime("%a").lower() == wanted:
+                        index = i
+                        break
+                except ValueError:
+                    continue
+        index = max(0, min(index, len(days) - 1))
+        day = days[index]
+
+        label = {0: "today", 1: "tomorrow"}.get(index, day.get("date", ""))
+        lines = [f"Weather for {place} ({label}, {day.get('date','')}):"]
+        lines.append(
+            f"  min {day.get('mintempC','?')}C / max {day.get('maxtempC','?')}C, "
+            f"sunrise {day.get('astronomy',[{}])[0].get('sunrise','?')}, "
+            f"sunset {day.get('astronomy',[{}])[0].get('sunset','?')}"
+        )
+        # A few representative hours rather than all 24, to stay inside budget.
+        for slot in day.get("hourly", []):
+            hour = int(slot.get("time", "0") or 0) // 100
+            if hour not in (9, 12, 15, 18):
+                continue
+            desc = (slot.get("weatherDesc") or [{}])[0].get("value", "").strip()
+            lines.append(
+                f"  {hour:02d}:00  {slot.get('tempC','?')}C, {desc}, "
+                f"rain {slot.get('chanceofrain','?')}%, wind {slot.get('windspeedKmph','?')} km/h"
+            )
+        lines.append("Source: wttr.in")
+        return "\n".join(lines)
 
     def _current_time(self, timezone: str = "UTC") -> str:
         try:
@@ -3252,6 +3327,42 @@ BARE_URL = re.compile(r"^\s*(https?://\S+)\s*$", re.I)
 # tool call, because answering is the higher-probability continuation. Routing
 # these deterministically is more reliable than prompting harder, and it also
 # removes the prefill that the model would have spent deciding.
+# Command and filler that precede the real weather phrase. Stripped before the
+# weather patterns run so "look up the weather in X" does not capture "look up
+# the" as the location.
+WEATHER_PREFIX_STRIP = re.compile(
+    r"^\s*(?:please\s+)?(?:can you\s+|could you\s+)?"
+    r"(?:look\s*up|search(?:\s+for)?|google|web\s*search|find(?:\s+out)?|check|"
+    r"get|show me|tell me|what(?:'s| is)|whats)?\s*(?:the|a|an)?\s*",
+    re.I,
+)
+_WEEKDAYS = r"monday|tuesday|wednesday|thursday|friday|saturday|sunday"
+# Applied to the prefix-stripped, lowercased text.
+WEATHER_QUERY = re.compile(
+    r"^(?:weather(?:\s+(?P<when1>today|tomorrow|tonight|" + _WEEKDAYS + r"))?"
+    r"\s+(?:in|for|at)\s+(?P<loc1>[a-z .'-]+?)"
+    r"|(?P<loc2>[a-z .'-]+?)\s+weather)"
+    r"(?:\s+(?:on\s+)?(?P<when2>today|tomorrow|tonight|" + _WEEKDAYS + r"))?"
+    r"\s*[?.!]*$",
+    re.I,
+)
+
+
+def weather_intent(text: str) -> tuple[str, str] | None:
+    """Return (location, when) if the message is a weather request, else None."""
+    if "weather" not in text.lower():
+        return None
+    stripped = WEATHER_PREFIX_STRIP.sub("", text).strip()
+    match = WEATHER_QUERY.match(stripped)
+    if not match:
+        return None
+    location = (match.group("loc1") or match.group("loc2") or "").strip(" ?.!,")
+    when = (match.group("when1") or match.group("when2") or "today").lower()
+    if not location or len(location) > 60:
+        return None
+    return location, when
+
+
 SEARCH_COMMAND = re.compile(
     r"^\s*(?:please\s+)?(?:can you\s+|could you\s+)?"
     r"(?:look\s*up|search(?:\s+(?:for|the\s+web\s+for|online\s+for))?|"
@@ -3337,6 +3448,12 @@ def fast_path_call(message: str) -> tuple[str, dict] | None:
     # "look up X online" / "search for X". Take the command word off and search
     # the remainder rather than the whole sentence: the imperative is noise in
     # a search query and costs a relevant result.
+    # Weather goes to the weather tool, not web_search: search snippets never
+    # contain the forecast, so routing it to search guarantees a dead end.
+    weather = weather_intent(text)
+    if weather:
+        return "weather", {"location": weather[0], "when": weather[1]}
+
     command = SEARCH_COMMAND.match(text)
     if command:
         query = clean_search_query(command.group("query"))
@@ -3580,7 +3697,10 @@ class Agent:
                     scratch.append({"role": "user",
                                     "content": f"TOOL RESULT [{name}]:\n{seeded}\n\n"
                                                "Answer my original question using these results "
-                                               "and cite the URLs. Do not search again."})
+                                               "and cite the URLs. If the snippets lack the detail "
+                                               "needed (a specific number, forecast or value), call "
+                                               "fetch_url on the most relevant URL to get it. Do not "
+                                               "repeat the same search."})
                 else:
                     # A failed shortcut is not fatal; fall through to the model.
                     scratch.append({"role": "assistant", "content": f"I tried {name} and it failed."})
@@ -6754,6 +6874,8 @@ def selftest() -> int:
     for text, expected in [
         ("look up CVEs online", "web_search"),
         ("look up online what heartbleed exploits exist", "web_search"),
+        ("look up the weather in brussels tomorrow", "weather"),
+        ("tokyo weather", "weather"),
         ("what are the latest CVEs for openssl?", "web_search"),
         ("what is a CVE?", None),
         ("explain how LoRA works", None),
