@@ -3562,10 +3562,25 @@ class Agent:
                     if name != "web_search":
                         yield done(result.strip(), 0)
                         return
+                    # Seed the search result so the model answers from it. Three
+                    # things matter for a small greedy model here. The assistant
+                    # turn is phrased as prose, not a JSON tool call: seeing its
+                    # own "previous" turn be a tool call is what makes it emit
+                    # the same call again instead of answering. The signature
+                    # goes into seen_calls so a repeat is caught on the very next
+                    # step rather than after a second real search. And the
+                    # directive tells it to answer, not search again.
+                    seen_calls.append(
+                        f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)}"
+                    )
+                    budget = self._tool_budget(reserve)
+                    seeded, _ = await self.compress_tool_result(name, result, budget)
                     scratch.append({"role": "assistant",
-                                    "content": json.dumps({"tool": name, "args": args})})
+                                    "content": f"I searched the web for {args.get('query', 'that')}."})
                     scratch.append({"role": "user",
-                                    "content": f"TOOL RESULT [{name}]:\n{result}"})
+                                    "content": f"TOOL RESULT [{name}]:\n{seeded}\n\n"
+                                               "Answer my original question using these results "
+                                               "and cite the URLs. Do not search again."})
                 else:
                     # A failed shortcut is not fatal; fall through to the model.
                     scratch.append({"role": "assistant", "content": f"I tried {name} and it failed."})
