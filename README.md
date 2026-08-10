@@ -1,4 +1,4 @@
-
+# Local LLM — self-hosted agent, trainer & feedback loop for Apple Silicon
 ---
 
 ## Table of contents
@@ -26,6 +26,8 @@
 
 ## What it does
 
+At a glance, the app combines several roles that usually live in separate tools:
+
 - **Model server manager.** Launches and supervises an `mlx-lm` server, with a watchdog that restarts it if it dies.
 - **Agent.** A reasoning-and-tools loop over the local model, driven by a model-as-router design rather than brittle keyword rules.
 - **Web chat UI.** A dark, single-page interface that renders the agent's work as a live "glass box" trace.
@@ -33,6 +35,7 @@
 - **Trainer.** LoRA fine-tuning on collected feedback, with adapter management and automatic backups.
 - **Scheduler.** Named tasks the agent can run on demand or on a timer.
 
+The defining constraint is memory. On 8 GB, a large prompt or a complex task will not fit in one pass, so the app is designed to **split work into bounded steps** — it slows down rather than crashing.
 
 ---
 
@@ -62,7 +65,7 @@ python3 deploy.py --agent --context-size 8192 --max-tokens 512
 MODEL_ID="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit" python3 deploy.py
 
 # Brand it
-APP_NAME="TestLab" APP_LOGO="🧪" python3 deploy.py
+APP_NAME="TESTLab" APP_LOGO="AI" python3 deploy.py
 ```
 
 On start the app prints the detected RAM, the chosen model, and the chosen context window, then serves the UI on a free local port (printed to the log). Open that URL in a browser.
@@ -194,22 +197,24 @@ When the agent's tool loop exhausts its ordinary step budget without finishing, 
 
 ### Retrieval pipeline (why there are few domain tools)
 
-Rather than a tool per domain (weather, stocks, scores, ...), one generic pipeline answers most lookups: **search, then automatically fetch the top result page and answer from its full text**, since the answer is usually on the page even when the snippet omits it. Adding a new kind of lookup needs no new code. The fetched page is hard-capped so a large document can never blow the context.
+Rather than a tool per domain (weather, stocks, scores, ...), one generic pipeline answers most lookups: **search, then read a couple of the top result pages and compare them before answering**, since the answer is usually on the page even when the snippet omits it. Adding a new kind of lookup needs no new code.
+
+Crucially, the sources are read **one at a time**: each fetched page is capped, then processed in its own bounded, streamed pass that extracts only the findings relevant to the question into short notes. The notes (not the raw pages) are then handed to the model with a directive to compare the sources, note any agreement or conflict, and answer with citations. This keeps memory flat — only one page is ever in context at once, so two heavy pages can never coincide and OOM an 8 GB machine — while giving a genuine "look up a few, compare, then answer" flow that streams visibly as steps. The number of sources is `AUTO_FETCH_RESULTS` (default 2; set 1 for single-source speed, 0 for snippets only).
 
 ---
 
 ## RAM-aware auto-configuration
 
-On import the app detects total RAM (via `sysctl hw.memsize`, with fallbacks) and uses it to choose a coding model and a context window. Everything downstream — the chunking threshold, chunk size, and how much history is kept — derives from the context window, so a single signal tunes the whole stack. Explicit `MODEL_ID` / `CONTEXT_SIZE` always override.
+On import the app detects total RAM (via `sysctl hw.memsize`, with fallbacks) and uses it to choose a coding model, a context window, a per-step reasoning budget, and a fetched-page cap. Everything else — the chunking threshold, chunk size, and how much history is kept — derives from the context window, so a single signal tunes the whole stack. Explicit overrides (`MODEL_ID`, `CONTEXT_SIZE`, `REASONING_TOKENS`, `AUTO_FETCH_CHAR_CAP`) always win.
 
-| RAM        | Default model (coding)                  | Context window | Large-prompt chunk trigger |
-|------------|-----------------------------------------|----------------|----------------------------|
-| < 14 GB    | `Qwen2.5-Coder-3B-Instruct-4bit`        | 4 096 tokens   | ~2 460 tokens              |
-| 14–23 GB   | `Qwen2.5-Coder-7B-Instruct-4bit`        | 8 192 tokens   | ~4 915 tokens              |
-| 24–47 GB   | `Qwen2.5-Coder-14B-Instruct-4bit`       | 16 384 tokens  | ~9 830 tokens              |
-| ≥ 48 GB    | `Qwen2.5-Coder-32B-Instruct-4bit`       | 32 768 tokens  | ~19 660 tokens             |
+| RAM        | Default model (coding)                  | Context window | Chunk trigger | Reasoning tokens/step | Fetched-page cap |
+|------------|-----------------------------------------|----------------|---------------|-----------------------|------------------|
+| < 14 GB    | `Qwen2.5-Coder-3B-Instruct-4bit`        | 4 096 tokens   | ~2 460 tokens | 256                   | 6 000 chars      |
+| 14–23 GB   | `Qwen2.5-Coder-7B-Instruct-4bit`        | 8 192 tokens   | ~4 915 tokens | 512                   | 10 000 chars     |
+| 24–47 GB   | `Qwen2.5-Coder-14B-Instruct-4bit`       | 16 384 tokens  | ~9 830 tokens | 768                   | 16 000 chars     |
+| ≥ 48 GB    | `Qwen2.5-Coder-32B-Instruct-4bit`       | 32 768 tokens  | ~19 660 tokens| 1 024                 | 24 000 chars     |
 
-Model sizes are estimates of resident weights at 4-bit; the tiers are deliberately conservative because unified memory is shared with the OS and the GPU wired limit. The startup log states which model and context were chosen and why.
+So a larger machine reads more of each source, thinks in more depth per step, keeps more history, and chunks later — all from the one RAM signal, and all overridable. Model sizes are estimates of resident weights at 4-bit; the tiers are deliberately conservative because unified memory is shared with the OS and the GPU wired limit. The startup log states which model, context, reasoning budget, and fetch cap were chosen.
 
 > Note: the 7B and larger models are best treated as inference-only on their minimum-RAM tier. Fine-tuning adds optimizer state on top of the weights and is happiest on the 3B.
 
@@ -217,11 +222,16 @@ Model sizes are estimates of resident weights at 4-bit; the tiers are deliberate
 
 ## Resilience: never stop, never hang
 
+
 Two mechanisms ensure a turn never ends in a raw error or an indefinite hang.
 
 **Stall timeout.** If the model server sends nothing for `STALL_TIMEOUT` seconds mid-generation (a wedged or OOM-killed server), the request fails fast and feeds into the retry path instead of blocking for minutes.
 
 **Resilient retries that shrink the right thing.** On failure the turn retries, and critically it shrinks the **input** (re-assembling the prompt with a larger reserve, trimming the trace) as well as the output token budget. On a small machine an out-of-memory is almost always prefill of an oversized prompt, so shrinking the reply alone does nothing — shrinking the input does. After all retries, the turn degrades to a calm message, never a broken stream.
+
+**Readiness-aware waiting.** When the model server is OOM-killed, the watchdog restarts it, but reloading a model takes far longer than a fixed sleep. Instead of retrying into a still-loading server (which wastes the attempt), a retry polls the server's `/v1/models` endpoint until it responds, up to `READY_WAIT_TIMEOUT` seconds, then retries into a live server.
+
+**Honest labels.** The retry notice names what actually failed — a stall, a dropped connection (server likely restarting), a true out-of-memory, or a generic error — rather than blaming memory for everything.
 
 ```mermaid
 flowchart TD
@@ -230,12 +240,19 @@ flowchart TD
     OK -->|"no / stalled"| Partial{"Usable text<br/>already streamed?"}
     Partial -->|yes| Keep["Keep partial, continue"]
     Partial -->|no| Retry{"Retries left?"}
-    Retry -->|yes| Shrink["Shrink prompt + reply,<br/>wait, retry"]
+    Retry -->|yes| Wait["Wait for server ready<br/>(poll /v1/models)"]
+    Wait --> Shrink["Shrink prompt + reply, retry"]
     Shrink --> Gen
     Retry -->|no| Degrade["Calm message<br/>(no raw error)"]
 ```
 
-All of this is visible in the UI as amber "notice" lines ("hit a memory limit; retrying with a smaller prompt and reply").
+All of this is visible in the UI as amber "notice" lines with the real cause (for example "the model server dropped, likely out of memory and restarting; waiting for the server, then retrying smaller").
+
+---
+
+## Configurable safeguards
+
+Every safeguard — memory caps, timeouts, retry counts, step limits, chunking thresholds, and the calculator's DoS bounds — is a named setting with an environment override and a valid range. Values are **clamped both at startup and on every live edit**, so a bad value (from an env var or the UI) is corrected rather than able to break the app; for example a chunk size can never exceed its own trigger. The most useful safeguards are editable **live from the Settings panel** with no restart. See the [configuration reference](#configuration-reference) for the full list.
 
 ---
 
@@ -288,8 +305,6 @@ flowchart TD
 
 ## Feedback and LoRA retraining
 
-The loop that gives the app its name: rate replies, export them, fine-tune, reload.
-
 ```mermaid
 flowchart LR
     Chat["Chat"] --> Rate["👍 / 👎 feedback"]
@@ -307,7 +322,6 @@ flowchart LR
 - **Applying.** The model server can be restarted with a chosen adapter attached.
 - **Automation.** An auto-retrain threshold can trigger training once enough new approved samples accumulate.
 
-Retraining is safest on the 3B default; larger models are inference-oriented on their minimum RAM tier.
 
 ---
 
@@ -329,14 +343,6 @@ Set two environment variables and restart:
 ```bash
 APP_NAME="Acme Assistant" APP_LOGO="https://example.com/logo.png" python3 deploy.py
 ```
-
-The name is HTML-escaped, so punctuation in it cannot break the header.
-
----
-
-## Configuration reference
-
-All settings have sensible defaults and can be set via environment variable; many are also editable live in the Settings panel. Explicit values always override the RAM-based auto-selection.
 
 ### Model and context
 
@@ -360,15 +366,19 @@ All settings have sensible defaults and can be set via environment variable; man
 | `AGENT_TOOLS` | Tool allow-list. |
 | `FAST_PATH` | Enable deterministic URL/arithmetic shortcuts. |
 | `KNOWLEDGE_TRIAGE` | Enable model routing for substantive questions. |
-| `INCREMENTAL_REASONING`, `REASONING_MAX_STEPS`, `REASONING_STEP_TIMEOUT` | Incremental reasoning behaviour and per-step cap. |
+| `INCREMENTAL_REASONING`, `REASONING_MAX_STEPS`, `REASONING_STEP_TIMEOUT` | Incremental reasoning behaviour and per-step wall-clock cap. |
+| `REASONING_TOKENS` | Token budget for each reasoning, chunk, and source-extraction pass. RAM-scaled default. |
 | `CHUNK_LARGE_PROMPTS` | Enable map-reduce chunking of oversized prompts. |
-| `AUTO_FETCH_RESULTS`, `AUTO_FETCH_CHAR_CAP` | Retrieval pipeline: pages fetched after a search, and the hard char cap per page. |
+| `CHUNK_TRIGGER_RATIO`, `CHUNK_SIZE_RATIO` | Fraction of context above which a prompt is chunked, and the fraction each chunk targets. |
+| `AUTO_FETCH_RESULTS` | Sources read and compared after a search (default 2; 1 = single source, 0 = snippets only). |
+| `AUTO_FETCH_CHAR_CAP` | Hard char cap on a fetched page entering the prompt. RAM-scaled default. |
 
 ### Resilience and memory
 
 | Variable | Meaning |
 |----------|---------|
 | `STALL_TIMEOUT` | Seconds of silence before a generation is treated as stalled. |
+| `READY_WAIT_TIMEOUT` | Seconds a retry waits for a restarting model server to become ready before giving up on that attempt. |
 | `RESILIENT_RETRIES` | Retry attempts on generation failure. |
 | `MIN_MAX_TOKENS` | Floor the reply budget shrinks to on retry. |
 | `HARD_STEP_CAP` | Ceiling for summarize-and-continue on big tasks. |
@@ -399,6 +409,7 @@ All settings have sensible defaults and can be set via environment variable; man
 | Variable | Meaning |
 |----------|---------|
 | `ALLOW_SHELL`, `ALLOW_PYTHON`, `ALLOW_LOCAL_FETCH` | Opt-in flags for the powerful tools. |
+| `CALC_MAX_RESULT_BITS`, `CALC_MAX_FACTORIAL` | Calculator DoS bounds (largest result width and factorial input). Raising them re-opens the memory-exhaustion surface they exist to close. |
 
 ### Ports, cache, branding
 
