@@ -165,6 +165,26 @@ def _default_model_for_ram(ram_gb: float) -> str:
     return "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit"        # ~1.9GB
 
 
+def _default_context_for_ram(ram_gb: float) -> int:
+    """Pick a context window sized to the machine.
+
+    Context sits in the KV cache, which shares unified memory with the model
+    weights, the web process, and the OS. Because bigger machines also run bigger
+    models (see _default_model_for_ram), these tiers account for the heavier
+    weights and still leave headroom: an 8GB Mac stays at a safe 4k, roomier
+    machines get proportionally more so they chunk less and keep more history.
+    The chunking thresholds derive from this value, so making context RAM-aware
+    makes chunk sizing RAM-aware too. Override with CONTEXT_SIZE.
+    """
+    if ram_gb >= 48:
+        return 32768
+    if ram_gb >= 24:
+        return 16384
+    if ram_gb >= 14:
+        return 8192
+    return 4096
+
+
 # Total RAM is detected once at import. MODEL_ID overrides the RAM-based choice.
 TOTAL_RAM_GB = _detect_total_ram_gb()
 DEFAULT_MODEL = os.environ.get("MODEL_ID") or _default_model_for_ram(TOTAL_RAM_GB)
@@ -199,7 +219,12 @@ CONTEXT_SAFETY_MARGIN = 256
 
 # Bump when HTML_PAGE changes. Shown in the header and returned by /api/health so
 # a stale browser cache is immediately visible rather than silently misleading.
-UI_BUILD = "2026-08-07.8-curve"
+UI_BUILD = "2026-08-07.9-glass"
+# Branding. Set APP_NAME to change the title shown in the header and browser tab.
+# Set APP_LOGO to a URL or a local path (rendered as an image) or to an emoji or
+# short text (rendered as-is). Both are safe to leave unset.
+APP_NAME = os.environ.get("APP_NAME", "Local LLM")
+APP_LOGO = os.environ.get("APP_LOGO", "")
 
 # Setup logging
 logging.basicConfig(
@@ -1189,7 +1214,22 @@ def render_ui() -> str:
     parse. The page then renders but nothing works: the status panel sits on its
     hardcoded "Starting..." text and the Send button does nothing.
     """
-    return HTML_PAGE.replace("{{UI_BUILD}}", UI_BUILD)
+    # Render the logo as an <img> when it looks like a URL/path, otherwise inline
+    # it as text or an emoji. Escape the name so a stray < in APP_NAME cannot
+    # break the header markup.
+    import html as _html
+    name = _html.escape(APP_NAME)
+    logo = APP_LOGO.strip()
+    if logo.startswith(("http://", "https://", "/")):
+        logo_html = f'<img src="{_html.escape(logo)}" alt="{name} logo" class="brand-logo">'
+    elif logo:
+        logo_html = f'<span class="brand-mark">{_html.escape(logo)}</span>'
+    else:
+        logo_html = '<span class="brand-mark">◆</span>'
+    return (HTML_PAGE
+            .replace("{{UI_BUILD}}", UI_BUILD)
+            .replace("{{APP_NAME}}", name)
+            .replace("{{APP_LOGO}}", logo_html))
 
 
 def check_ui_syntax() -> list[str]:
@@ -1464,7 +1504,8 @@ class Config:
     # assembles a request; max_kv_size is what the model server is told to
     # allocate. They are separate because the server flag is optional and
     # changing it needs a restart, while context_size takes effect immediately.
-    context_size: int = field(default_factory=lambda: int(os.environ.get("CONTEXT_SIZE", "4096")))
+    context_size: int = field(default_factory=lambda: int(
+        os.environ.get("CONTEXT_SIZE") or _default_context_for_ram(TOTAL_RAM_GB)))
     max_kv_size: int = field(default_factory=lambda: int(os.environ.get("MAX_KV_SIZE", "0")))
     temperature: float = field(default_factory=lambda: float(os.environ.get("TEMPERATURE", "0.7")))
     history_turns: int = field(default_factory=lambda: int(os.environ.get("HISTORY_TURNS", "20")))
@@ -1486,6 +1527,10 @@ class Config:
     # on the page even when the snippet omits it. 0 disables auto-fetch and falls
     # back to snippet-only plus the model choosing to call fetch_url itself.
     auto_fetch_results: int = field(default_factory=lambda: int(os.environ.get("AUTO_FETCH_RESULTS", "1")))
+    # Hardest ceiling on characters of a fetched page that may enter the prompt.
+    # A large docs page would otherwise dominate context and OOM prefill on an
+    # 8GB machine. Roughly char_cap/4 tokens.
+    auto_fetch_char_cap: int = field(default_factory=lambda: int(os.environ.get("AUTO_FETCH_CHAR_CAP", "6000")))
     agent_max_steps: int = field(default_factory=lambda: int(os.environ.get("AGENT_MAX_STEPS", "6")))
     # Resilience under memory pressure. When a generation errors (a model-server
     # OOM kill and watchdog restart look like a dropped connection from here), the
@@ -1510,7 +1555,17 @@ class Config:
     # small model reason better than one shot. It is slower (several small calls)
     # by design: it takes its time instead of failing or answering shallowly.
     incremental_reasoning: bool = field(default_factory=lambda: os.environ.get("INCREMENTAL_REASONING", "1") == "1")
+    # Chunk an oversized prompt (a pasted file or long document) and process it
+    # part by part, so a single input larger than the context never has to be
+    # prefilled in one pass. This is what lets an 8GB machine handle a large
+    # prompt: split it, extract findings per chunk into bounded notes, then
+    # synthesise. Chunk size and trigger are derived from context_size.
+    chunk_large_prompts: bool = field(default_factory=lambda: os.environ.get("CHUNK_LARGE_PROMPTS", "1") == "1")
     reasoning_max_steps: int = field(default_factory=lambda: int(os.environ.get("REASONING_MAX_STEPS", "6")))
+    # Hard wall-clock cap per reasoning step. Distinct from stall_timeout (which
+    # only fires on zero output): this bounds a step that streams slowly but
+    # never finishes, so a single step can never wedge the whole chain.
+    reasoning_step_timeout: int = field(default_factory=lambda: int(os.environ.get("REASONING_STEP_TIMEOUT", "45")))
     allow_python: bool = field(default_factory=lambda: os.environ.get("ALLOW_PYTHON", "0") == "1")
     allow_shell: bool = field(default_factory=lambda: os.environ.get("ALLOW_SHELL", "0") == "1")
     # Comma-separated allowlist. Empty means every registered tool is offered.
@@ -1637,7 +1692,7 @@ class Config:
                   ("context_size", "max_tokens", "temperature", "agent_max_steps",
                    "history_turns", "search_results", "tool_result_chars",
                    "tool_temperature", "summarise_over_chars")}
-        self.context_size = max(512, self.context_size)
+        self.context_size = min(131072, max(512, self.context_size))
         self.max_tokens = max(16, self.max_tokens)
         if self.max_tokens >= self.context_size:
             self.max_tokens = max(16, self.context_size // 2)
@@ -1648,9 +1703,11 @@ class Config:
         self.resilient_retries = min(6, max(0, self.resilient_retries))
         self.min_max_tokens = min(512, max(32, self.min_max_tokens))
         self.stall_timeout = min(600, max(10, self.stall_timeout))
+        self.auto_fetch_char_cap = min(20000, max(1000, self.auto_fetch_char_cap))
         # The cap can never be below the ordinary step budget.
         self.hard_step_cap = min(60, max(self.agent_max_steps, self.hard_step_cap))
         self.reasoning_max_steps = min(10, max(2, self.reasoning_max_steps))
+        self.reasoning_step_timeout = min(300, max(10, self.reasoning_step_timeout))
         self.history_turns = min(200, max(0, self.history_turns))
         self.search_results = min(10, max(1, self.search_results))
         self.tool_result_chars = min(40000, max(200, self.tool_result_chars))
@@ -3627,6 +3684,35 @@ def top_result_urls(search_text: str, limit: int) -> list[str]:
     return seen
 
 
+def chunk_text(text: str, size: int, overlap: int) -> list[str]:
+    """Split text into ~size-character chunks with a little overlap.
+
+    Overlap keeps a sentence that straddles a boundary from being lost to both
+    chunks. Prefers to break on a newline or space near the boundary so chunks
+    fall on natural seams rather than mid-word.
+    """
+    text = text or ""
+    if len(text) <= size:
+        return [text]
+    chunks: list[str] = []
+    start = 0
+    n = len(text)
+    while start < n:
+        end = min(start + size, n)
+        if end < n:
+            # Back off to the nearest newline or space within the last 15%.
+            window = text.rfind("\n", start + int(size * 0.85), end)
+            if window == -1:
+                window = text.rfind(" ", start + int(size * 0.85), end)
+            if window != -1:
+                end = window
+        chunks.append(text[start:end])
+        if end >= n:
+            break
+        start = max(end - overlap, start + 1)
+    return chunks
+
+
 def quick_tool(message: str) -> tuple[str, dict] | None:
     """Deterministic shortcuts that need no model call at all.
 
@@ -4060,7 +4146,13 @@ class Agent:
                         continue  # a dead link is not fatal; the snippets remain
                     trace.append({"name": "fetch_url", "args": {"url": url},
                                   "result": page[:1000], "error": None})
-                    page_text, _ = await self.compress_tool_result("fetch_url", page, budget)
+                    # Hard cap on how much of a fetched page enters the prompt.
+                    # A large docs page can otherwise dominate the context and
+                    # OOM prefill on 8GB. Cap first, then summarise to budget, so
+                    # the seed can never be the thing that blows memory.
+                    page_budget = min(budget, self.config.auto_fetch_char_cap)
+                    page_text, _ = await self.compress_tool_result(
+                        "fetch_url", page[:self.config.auto_fetch_char_cap * 4], page_budget)
                     scratch.append({"role": "assistant",
                                     "content": f"I opened {url} to read the details."})
                     scratch.append({"role": "user",
@@ -4068,6 +4160,93 @@ class Agent:
                                                "Use this page to answer; it has the specific "
                                                "detail the snippets lacked."})
             yield {"__seeded__": True}
+
+        # Step 0: oversized prompt. If the user's input alone is too large to
+        # prefill in one pass on this machine, process it in parts: extract
+        # findings from each chunk into bounded notes, then synthesise. Each pass
+        # sees one chunk plus short notes, so memory stays flat regardless of how
+        # big the input is. Done before routing, because a prompt this large
+        # cannot survive a single generation to be routed normally.
+        est_tokens = len(user_message) // CHARS_PER_TOKEN
+        trigger_tokens = int(self.config.context_size * 0.6)
+        if (self.config.chunk_large_prompts and est_tokens > trigger_tokens
+                and len(user_message) > 2000):
+            chunk_tokens = max(256, int(self.config.context_size * 0.4))
+            chunk_chars = chunk_tokens * CHARS_PER_TOKEN
+            parts = chunk_text(user_message, chunk_chars, overlap=chunk_chars // 10)
+            # The instruction usually sits at the very start or end of a big
+            # paste; keep both ends visible to every pass and the synthesis.
+            hint = user_message[:400]
+            if len(user_message) > 900:
+                hint = user_message[:400] + " [...] " + user_message[-300:]
+            yield {"type": "phase", "label": f"input is large; reading it in {len(parts)} parts"}
+            yield {"type": "notice",
+                   "message": f"prompt is ~{est_tokens} tokens; processing in "
+                              f"{len(parts)} parts to fit memory", "info": True}
+            notes: list[str] = []
+            for i, part in enumerate(parts, 1):
+                if cancel is not None and cancel.is_set():
+                    yield {"type": "cancelled", "step": i, "trace": trace}
+                    return
+                yield {"type": "reason_step", "step": i, "total": len(parts),
+                       "label": f"reading part {i}/{len(parts)}"}
+                notes_text = "\n".join(notes[-6:]) if notes else "(nothing yet)"
+                map_messages = [
+                    {"role": "system", "content":
+                        "You are reading one part of a long input to help answer the "
+                        "user's request. Note only what is relevant to the request "
+                        "from this part, concisely. If nothing here is relevant, say so."},
+                    {"role": "user", "content":
+                        f"Request: {hint}\n\nNotes so far:\n{notes_text}\n\n"
+                        f"Part {i} of {len(parts)}:\n{part}\n\nRelevant notes from this part:"},
+                ]
+                finding = ""
+                mstats = GenerationStats()
+                mstream = self.client.stream(map_messages, 256, 0.0, mstats)
+                started_part = time.time()
+                try:
+                    async for tok in mstream:
+                        if cancel is not None and cancel.is_set():
+                            break
+                        finding += tok
+                        yield {"type": "reason_token", "step": i, "token": tok}
+                        if time.time() - started_part > self.config.reasoning_step_timeout:
+                            break
+                except Exception:
+                    if not strip_reasoning(finding).strip():
+                        finding = await self.resilient_complete(map_messages, 256, 0.0)
+                finally:
+                    await mstream.aclose()
+                finding = strip_reasoning(finding).strip()
+                yield {"type": "reason_done", "step": i, "conclusion": finding[:200]}
+                if finding:
+                    notes.append(f"part {i}: {finding[:400]}")
+
+            # Reduce: answer the request from the gathered notes, streamed.
+            yield {"type": "phase", "label": "writing the answer"}
+            joined = "\n".join(notes) or "(no relevant content found)"
+            reduce_messages = [
+                {"role": "system", "content": self.config.system_prompt},
+                {"role": "user", "content":
+                    f"Request: {hint}\n\nNotes gathered from the full input, in order:\n"
+                    f"{joined}\n\nNow give the complete answer to the request in plain text."},
+            ]
+            answer_buf = ""
+            rstats = GenerationStats()
+            rstream = self.client.stream(reduce_messages, reserve, temperature, rstats)
+            try:
+                async for tok in rstream:
+                    if cancel is not None and cancel.is_set():
+                        break
+                    answer_buf += tok
+                    yield {"type": "token", "token": tok, "step": len(parts)}
+            except Exception:
+                answer_buf = await self.resilient_complete(reduce_messages, reserve, temperature)
+            finally:
+                await rstream.aclose()
+            answer = strip_reasoning(answer_buf).strip() or ("Notes from the input:\n" + joined)
+            yield done(answer, len(parts))
+            return
 
         # Step 1: deterministic shortcuts. A bare URL or a pure arithmetic
         # expression needs no model call at all. calculator and fetch_url produce
@@ -4178,14 +4357,46 @@ class Agent:
                         if cancel is not None and cancel.is_set():
                             yield {"type": "cancelled", "step": i, "trace": trace}
                             return
-                        yield {"type": "phase", "label": f"reasoning step {i}/{len(steps)}: {sub[:60]}"}
-                        conclusion = await self.reason_step(user_message, notes, sub)
+                        yield {"type": "phase", "label": f"reasoning step {i}/{len(steps)}"}
+                        # Stream each step live so thinking is never a frozen
+                        # label: the user sees tokens appear as the model works.
+                        yield {"type": "reason_step", "step": i, "total": len(steps), "label": sub[:120]}
+                        notes_text = "\n".join(notes[-6:]) if notes else "(nothing yet)"
+                        step_messages = [
+                            {"role": "system", "content":
+                                "You are working through a hard question one step at a time. "
+                                "Use the findings so far, address only the current step, and "
+                                "reply with a short concrete conclusion in at most 4 sentences."},
+                            {"role": "user", "content":
+                                f"Question: {user_message[:600]}\n\nFindings so far:\n{notes_text}"
+                                f"\n\nCurrent step: {sub}\n\nYour conclusion:"},
+                        ]
+                        conclusion = ""
+                        rstats = GenerationStats()
+                        rstream = self.client.stream(step_messages, 256, 0.0, rstats)
+                        started_step = time.time()
+                        try:
+                            async for tok in rstream:
+                                if cancel is not None and cancel.is_set():
+                                    break
+                                conclusion += tok
+                                yield {"type": "reason_token", "step": i, "token": tok}
+                                # Per-step wall-clock cap: keep what streamed and
+                                # move on rather than letting one step wedge.
+                                if time.time() - started_step > self.config.reasoning_step_timeout:
+                                    yield {"type": "notice", "message":
+                                           f"step {i} taking long; moving on with partial", "info": False}
+                                    break
+                        except Exception:
+                            # Streaming failed; fall back to a resilient non-stream.
+                            if not strip_reasoning(conclusion).strip():
+                                conclusion = await self.reason_step(user_message, notes, sub)
+                        finally:
+                            await rstream.aclose()
+                        conclusion = strip_reasoning(conclusion).strip()
+                        yield {"type": "reason_done", "step": i, "conclusion": conclusion[:200]}
                         if conclusion:
                             notes.append(f"{i}. {sub}: {conclusion[:300]}")
-                            # Surface each conclusion so the chain of thought is
-                            # visible as it builds, not hidden.
-                            yield {"type": "notice",
-                                   "message": f"step {i}: {conclusion[:200]}", "info": True}
                     # Synthesise the final answer from the conclusions, streamed.
                     yield {"type": "phase", "label": "writing the answer"}
                     joined = "\n".join(notes)
@@ -4241,10 +4452,20 @@ class Agent:
             # look like a dropped stream from here, so a shrink-and-retry both
             # rides out the restart and asks for a reply small enough to fit.
             gen_reserve = reserve
+            ctx_reserve = reserve
             step_failed = False
             for attempt in range(self.config.resilient_retries + 1):
                 buffer = ""
                 stats = GenerationStats()
+                # On a retry, re-assemble with a larger reserve, which shrinks the
+                # *prompt* budget and trims more of the trace. This is the fix
+                # that matters on 8GB: an OOM is almost always prefill of an
+                # oversized prompt (e.g. a big fetched page), and shrinking the
+                # reply tokens alone does nothing for that. Shrinking the input
+                # does.
+                if attempt > 0:
+                    ctx_reserve = min(self.config.context_size - 256, int(ctx_reserve * 1.6))
+                    messages, _ = self.assemble(base, scratch, ctx_reserve)
                 stream = self.client.stream(messages, gen_reserve, step_temperature, stats)
                 try:
                     async for token in stream:
@@ -4272,8 +4493,8 @@ class Agent:
                         break
                     gen_reserve = max(self.config.min_max_tokens, gen_reserve // 2)
                     yield {"type": "notice", "step": step,
-                           "message": f"hit a limit; retrying with a smaller budget "
-                                      f"({gen_reserve} tokens)"}
+                           "message": f"hit a memory limit; retrying with a smaller "
+                                      f"prompt and reply ({gen_reserve} tokens)"}
                     await asyncio.sleep(min(2.0 + attempt, 5.0))
                     continue
                 finally:
@@ -4862,7 +5083,7 @@ HTML_PAGE = r"""
 <head>
  <meta charset="utf-8">
  <meta name="viewport" content="width=device-width, initial-scale=1">
- <title>Local LLM</title>
+ <title>{{APP_NAME}}</title>
  <style>
    :root {
      --bg: #111;
@@ -5013,6 +5234,9 @@ HTML_PAGE = r"""
    .gactivity.stalled { color: var(--warn); }
    .gactivity.stalled .gspin { border-top-color: var(--warn); }
    .gnode.tool.running .gpill { background: #1f2a33; color: var(--accent); }
+   .gnode.reason::before { border-color: var(--accent); }
+   .gnode.reason .gbody { color: #b9c2cc; max-height: 160px; }
+   .gnode.reason.done::before { border-color: var(--success); background: var(--success); }
    .feedback {
      align-self: flex-start;
      display: flex;
@@ -5061,6 +5285,39 @@ HTML_PAGE = r"""
    button:hover { background: #3a3a3a; }
    button:disabled { opacity: 0.5; cursor: not-allowed; }
    button.primary { background: var(--accent); border-color: var(--accent); color: white; }
+   /* Branding in the header. */
+   .brand { display: flex; align-items: center; gap: 8px; }
+   .brand-slot { display: inline-flex; align-items: center; }
+   .brand-logo { height: 22px; width: auto; border-radius: 5px; display: block; }
+   .brand-mark { font-size: 18px; line-height: 1; color: var(--accent); }
+   .brand .build { color: #666; font-size: 11px; }
+   /* Hover tooltips. Any element with data-tip shows a styled bubble on hover
+      and on keyboard focus, so every control can explain itself. */
+   [data-tip] { position: relative; }
+   [data-tip]:hover::after, [data-tip]:focus-visible::after {
+     content: attr(data-tip);
+     position: absolute; left: 50%; bottom: calc(100% + 8px);
+     transform: translateX(-50%);
+     background: #000; color: #eee; border: 1px solid #444;
+     padding: 6px 9px; border-radius: 7px; font-size: 12px; font-weight: 400;
+     line-height: 1.35; white-space: normal; width: max-content; max-width: 240px;
+     text-align: left; z-index: 50; pointer-events: none;
+     box-shadow: 0 6px 20px rgba(0,0,0,0.45);
+   }
+   [data-tip]:hover::before, [data-tip]:focus-visible::before {
+     content: ""; position: absolute; left: 50%; bottom: calc(100% + 3px);
+     transform: translateX(-50%);
+     border: 5px solid transparent; border-top-color: #444; z-index: 50;
+     pointer-events: none;
+   }
+   /* Tooltips that would clip at the top of the screen flip below the element. */
+   [data-tip-below]:hover::after, [data-tip-below]:focus-visible::after {
+     bottom: auto; top: calc(100% + 8px);
+   }
+   [data-tip-below]:hover::before, [data-tip-below]:focus-visible::before {
+     bottom: auto; top: calc(100% + 3px); border-top-color: transparent; border-bottom-color: #444;
+   }
+   header { overflow: visible; }
    .system-msg { align-self: center; color: #888; font-size: 12px; margin: 4px 0; }
    .agent-toggle {
      display: flex;
@@ -5167,17 +5424,17 @@ HTML_PAGE = r"""
 </head>
 <body>
  <header>
-   <div><strong>Local LLM</strong> <span style="color:#666;font-size:11px">build {{UI_BUILD}}</span></div>
+   <div class="brand"><span class="brand-slot">{{APP_LOGO}}</span><strong>{{APP_NAME}}</strong> <span class="build" title="UI build version">build {{UI_BUILD}}</span></div>
    <div id="status">Starting...</div>
    <nav class="views">
-     <button id="navChat" class="active" onclick="showView('chat')">Chat</button>
-     <button id="navTasks" onclick="showView('tasks')">Tasks</button>
-     <button id="navModels" onclick="showView('models')">Models</button>
+     <button id="navChat" class="active" onclick="showView('chat')" data-tip-below data-tip="Talk to the model. Ask questions, paste code or documents, run tools." title="Chat view">Chat</button>
+     <button id="navTasks" onclick="showView('tasks')" data-tip-below data-tip="Scheduled or saved jobs the agent runs on demand or on a timer." title="Tasks view">Tasks</button>
+     <button id="navModels" onclick="showView('models')" data-tip-below data-tip="Pick or download a model, and attach a fine-tuned adapter." title="Models view">Models</button>
    </nav>
    <div class="actions">
-     <button onclick="newChat()">New chat</button>
-     <button onclick="retrain()">Retrain</button>
-     <button onclick="toggleSettings()">Settings</button>
+     <button onclick="newChat()" data-tip-below data-tip="Start a fresh conversation. Clears the current thread from view." title="New chat">New chat</button>
+     <button onclick="retrain()" data-tip-below data-tip="Fine-tune the model on your thumbs-up/down feedback so far (LoRA)." title="Retrain on feedback">Retrain</button>
+     <button onclick="toggleSettings()" data-tip-below data-tip="Model, tools, generation and memory settings you can change live." title="Open settings">Settings</button>
    </div>
  </header>
 
@@ -5202,7 +5459,7 @@ HTML_PAGE = r"""
              <input id="tfInterval" type="number" min="0" step="60" value="0">
            </div>
            <div>
-             <label>Max steps</label>
+             <label data-tip="Tool/reasoning steps per turn before the agent must answer. Big tasks continue past this from a summary.">Max steps</label>
              <input id="tfSteps" type="number" min="1" max="20" value="6">
            </div>
          </div>
@@ -5265,7 +5522,7 @@ HTML_PAGE = r"""
        </label>
        <div class="row">
          <div><input id="modelCustom" type="text" placeholder="mlx-community/Qwen2.5-7B-Instruct-4bit"></div>
-         <div style="flex:0 0 auto"><button onclick="useModel(document.getElementById('modelCustom').value.trim())">Use</button></div>
+         <div style="flex:0 0 auto"><button onclick="useModel(document.getElementById('modelCustom').value.trim())" data-tip="Queue this model id (Hugging Face / mlx-community) to load." title="Use this model">Use</button></div>
        </div>
 
        <h3>Adapter and cache</h3>
@@ -5280,8 +5537,8 @@ HTML_PAGE = r"""
          </div>
        </div>
        <div class="row" style="margin-top:12px">
-         <button class="primary" onclick="applyModel()">Apply and restart</button>
-         <button onclick="loadModels()">Refresh</button>
+         <button class="primary" onclick="applyModel()" data-tip="Load the selected model and adapter. Restarts the model server." title="Apply and restart">Apply and restart</button>
+         <button onclick="loadModels()" data-tip="Reload the list of available and cached models." title="Refresh model list">Refresh</button>
        </div>
        <div class="hint">
          Switching to a model that is not cached downloads it on first use, which
@@ -5300,21 +5557,21 @@ HTML_PAGE = r"""
      <textarea id="cfgSystem"></textarea>
      <div class="row">
        <div>
-         <label>Max tokens</label>
+         <label data-tip="Longest reply the model may generate, in tokens. Higher = longer answers but more memory and time.">Max tokens</label>
          <input id="cfgMaxTokens" type="number" min="16" max="32768" step="16">
        </div>
        <div>
-         <label>Temperature</label>
+         <label data-tip="Randomness of replies. 0 = deterministic and focused; higher = more varied and creative.">Temperature</label>
          <input id="cfgTemperature" type="number" min="0" max="2" step="0.05">
        </div>
      </div>
      <div class="row">
        <div>
-         <label>Context size (tokens)</label>
+         <label data-tip="Total working window (prompt + reply). Auto-sized to your RAM; larger holds more history but uses more memory. Above ~60% of this, large prompts are chunked.">Context size (tokens)</label>
          <input id="cfgContext" type="number" min="512" max="131072" step="512">
        </div>
        <div>
-         <label>History turns</label>
+         <label data-tip="How many past messages to carry into each request. Fewer = less memory, less continuity.">History turns</label>
          <input id="cfgHistory" type="number" min="0" max="200" step="1">
        </div>
      </div>
@@ -5324,7 +5581,7 @@ HTML_PAGE = r"""
      <h3 style="margin-top:18px">Agent</h3>
      <div class="row">
        <div>
-         <label>Enabled by default</label>
+         <label data-tip="Whether new chats start in agent mode (tools + step reasoning) or as plain single replies.">Enabled by default</label>
          <select id="cfgAgent">
            <option value="false">off</option>
            <option value="true">on</option>
@@ -5337,7 +5594,7 @@ HTML_PAGE = r"""
      </div>
      <div class="row">
        <div>
-         <label>Search backend</label>
+         <label data-tip="Which web search provider the search tool uses. ddg needs no key; brave/tavily/searxng may need one.">Search backend</label>
          <select id="cfgSearchBackend">
            <option value="ddg">ddg</option>
            <option value="brave">brave</option>
@@ -5346,16 +5603,16 @@ HTML_PAGE = r"""
          </select>
        </div>
        <div>
-         <label>Search results</label>
+         <label data-tip="How many results the search tool returns per query.">Search results</label>
          <input id="cfgSearchResults" type="number" min="1" max="10" step="1">
        </div>
      </div>
-     <label>Tool result limit (chars)</label>
+     <label data-tip="Max characters a tool result may contribute before it is summarised or truncated.">Tool result limit (chars)</label>
      <input id="cfgToolChars" type="number" min="200" max="40000" step="200">
 
      <div style="margin-top:14px" class="row">
-       <button class="primary" onclick="saveConfig()">Apply</button>
-       <button onclick="restartModel()">Restart model</button>
+       <button class="primary" onclick="saveConfig()" data-tip="Save these settings. Most apply immediately, no restart needed." title="Apply settings">Apply</button>
+       <button onclick="restartModel()" data-tip="Restart the local model server. Use if it becomes unresponsive." title="Restart model server">Restart model</button>
      </div>
      <div class="hint">
        Context size takes effect on the next message. The KV cache size passed to
@@ -5365,24 +5622,24 @@ HTML_PAGE = r"""
      <h3 style="margin-top:18px">Performance</h3>
      <div class="row">
        <div>
-         <label>Tool result into context (chars)</label>
+         <label data-tip="How much of a tool result is fed back to the model as context.">Tool result into context (chars)</label>
          <input id="cfgToolChars2" type="number" min="200" max="40000" step="100">
        </div>
        <div>
-         <label>Tool step temperature</label>
+         <label data-tip="Temperature used only when the model is choosing a tool. 0 keeps tool-calls deterministic.">Tool step temperature</label>
          <input id="cfgToolTemp" type="number" min="0" max="2" step="0.05">
        </div>
      </div>
-     <label class="agent-toggle" style="margin-top:8px">
+     <label class="agent-toggle" style="margin-top:8px" data-tip="Skip the model's hidden &lt;think&gt; phase. Faster replies; may reduce reasoning quality on hard questions.">
        <input id="cfgThinking" type="checkbox"> disable thinking mode
      </label>
-     <label class="agent-toggle">
+     <label class="agent-toggle" data-tip="Route obvious requests (a URL, arithmetic) directly to a tool without a model call. Faster and cheaper.">
        <input id="cfgFastPath" type="checkbox"> deterministic fast path
      </label>
-     <label class="agent-toggle">
+     <label class="agent-toggle" data-tip="Keep the prompt prefix stable between steps so the model server can reuse its cache. Faster, uses a bit more memory.">
        <input id="cfgStablePrefix" type="checkbox"> stable prefix (cache friendly)
      </label>
-     <label class="agent-toggle">
+     <label class="agent-toggle" data-tip="Condense oversized tool results before feeding them back, to save context on smaller machines.">
        <input id="cfgSummarise" type="checkbox"> summarise long tool results
      </label>
      <div class="row" style="margin-top:10px">
@@ -5418,10 +5675,10 @@ HTML_PAGE = r"""
  </div>
 
  <footer id="composer">
-   <textarea id="input" placeholder="Send a message. Shift+Enter for a new line." rows="1"></textarea>
-   <label class="agent-toggle"><input id="agentToggle" type="checkbox"> agent</label>
-   <button id="stopBtn" onclick="stopStream()" disabled>Stop</button>
-   <button id="sendBtn" class="primary" onclick="send()">Send</button>
+   <textarea id="input" placeholder="Send a message. Shift+Enter for a new line." rows="1" data-tip="Type here. Enter sends, Shift+Enter adds a line. Paste large files freely; they are processed in chunks." title="Message input"></textarea>
+   <label class="agent-toggle" data-tip="Agent mode lets the model call tools (search, fetch, weather, calculator) and reason in steps. Off = a plain single reply." title="Toggle agent mode"><input id="agentToggle" type="checkbox"> agent</label>
+   <button id="stopBtn" onclick="stopStream()" disabled data-tip="Stop the current response. Keeps whatever streamed so far." title="Stop generating">Stop</button>
+   <button id="sendBtn" class="primary" onclick="send()" data-tip="Send your message (or press Enter)." title="Send message">Send</button>
  </footer>
 
  <script>
@@ -5597,6 +5854,27 @@ HTML_PAGE = r"""
      return { node: node, pill: pill, body: body };
    }
 
+   function traceReasonStep(t, step, total, label) {
+     var node = document.createElement("div");
+     node.className = "gnode reason";
+     var head = document.createElement("div");
+     head.className = "ghead";
+     var tag = document.createElement("span");
+     tag.className = "gtool";
+     tag.textContent = "reasoning " + step + "/" + total;
+     var lab = document.createElement("span");
+     lab.style.color = "#9aa0a6";
+     lab.textContent = label || "";
+     head.appendChild(tag); head.appendChild(lab);
+     var body = document.createElement("pre");
+     body.className = "gbody";
+     body.textContent = "";
+     node.appendChild(head); node.appendChild(body);
+     t.trace.appendChild(node);
+     scrollDown();
+     return { node: node, body: body };
+   }
+
    function traceNotice(t, message, info) {
      var node = document.createElement("div");
      node.className = "gnode notice" + (info ? " info" : "");
@@ -5742,6 +6020,18 @@ HTML_PAGE = r"""
          } else if (event.type === "phase") {
            setActivity(trace, event.label || "working\u2026");
            bumpActivity(trace);
+         } else if (event.type === "reason_step") {
+           trace.reason = traceReasonStep(trace, event.step, event.total, event.label);
+           bumpActivity(trace);
+           setActivity(trace, "reasoning " + event.step + "/" + event.total + "\u2026");
+         } else if (event.type === "reason_token") {
+           if (trace.reason) { trace.reason.body.textContent += event.token; scrollDown(); }
+         } else if (event.type === "reason_done") {
+           if (trace.reason) {
+             trace.reason.node.classList.add("done");
+             if (event.conclusion) trace.reason.body.textContent = event.conclusion;
+             trace.reason = null;
+           }
          } else if (event.type === "context") {
            traceNotice(trace, "trimmed " + event.dropped + " old messages to fit the context window", true);
            bumpActivity(trace);
@@ -5824,7 +6114,14 @@ HTML_PAGE = r"""
        if (err.name === "AbortError") {
          traceNotice(trace, "stopped", false);
        } else {
-         a2.text.textContent = "Error: " + err.message;
+         // A broken stream on a local single-box setup almost always means the
+         // model server ran out of memory and dropped the connection. Say that
+         // plainly instead of showing a raw stream error.
+         if (!a2.text.textContent) {
+           a2.text.textContent = "The connection dropped, most likely the local "
+             + "model server ran low on memory. Try a shorter request, or lower "
+             + "AUTO_FETCH_RESULTS / the context size.";
+         }
          a2.node.classList.add("failed");
        }
        stopActivity(trace);
@@ -6068,6 +6365,11 @@ HTML_PAGE = r"""
        }
        statusEl.textContent = msg;
        statusEl.className = "";
+       statusEl.setAttribute("data-tip-below", "");
+       statusEl.setAttribute("data-tip",
+         "Live server status. Model: " + (data.model || "?")
+         + " \u00b7 context " + (data.context_size || contextSize) + " tokens"
+         + (data.ram_gb ? " \u00b7 " + data.ram_gb + "GB RAM" : ""));
        if (data.model_status && data.model_status.indexOf("error") === 0) statusEl.className = "error";
        else if (data.model_status === "starting" || data.model_status === "loading") statusEl.className = "warn";
      } catch (err) {
@@ -6839,6 +7141,8 @@ def create_app(
             "stats": db.get_stats(),
             "agent_enabled": config.agent_enabled,
             "agent_max_steps": config.agent_max_steps,
+            "model": config.model,
+            "ram_gb": round(TOTAL_RAM_GB),
             "context_size": config.context_size,
             "max_tokens": config.max_tokens,
             "temperature": config.temperature,
@@ -7738,6 +8042,14 @@ def selftest() -> int:
         if is_substantive(msg) != want_substantive:
             failures.append(f"is_substantive({msg!r}) != {want_substantive}")
 
+    # chunk_text splits an oversized prompt into bounded, overlapping parts.
+    _big = "para " * 4000  # ~20k chars
+    _parts = chunk_text(_big, 6000, 600)
+    if not _parts or any(len(pt) > 6000 for pt in _parts):
+        failures.append("chunk_text produced an oversized chunk")
+    if chunk_text("short", 6000, 600) != ["short"]:
+        failures.append("chunk_text split a short string")
+
     # The retrieval pipeline extracts the top result URLs from a search block.
     _sample = "1. A\n   https://a.com/x\n   s\n2. B\n   https://b.com/y\n   s"
     if top_result_urls(_sample, 1) != ["https://a.com/x"]:
@@ -8197,6 +8509,12 @@ def main() -> None:
             f"set MODEL_ID to override)")
     else:
         log(f"Model: {config.model}")
+    if os.environ.get("CONTEXT_SIZE"):
+        log(f"Context: {config.context_size} tokens (from CONTEXT_SIZE)")
+    else:
+        log(f"Context: {config.context_size} tokens "
+            f"(auto-sized for {TOTAL_RAM_GB:.0f}GB RAM; large prompts chunk above "
+            f"~{int(config.context_size * 0.6)} tokens)")
 
     db = Database(DB_PATH)
     registry = ToolRegistry(config, db)
