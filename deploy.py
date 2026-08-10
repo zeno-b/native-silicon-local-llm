@@ -1503,6 +1503,14 @@ class Config:
     # OOM-killed server.
     stall_timeout: int = field(default_factory=lambda: int(os.environ.get("STALL_TIMEOUT", "60")))
     hard_step_cap: int = field(default_factory=lambda: int(os.environ.get("HARD_STEP_CAP", "24")))
+    # Incremental reasoning: for a hard analytical question with no tool to call,
+    # decompose it into sub-steps and solve them one at a time, carrying only
+    # short conclusions forward. Each pass is small, so the working set stays
+    # inside 8GB no matter how deep the reasoning goes, and decomposition makes a
+    # small model reason better than one shot. It is slower (several small calls)
+    # by design: it takes its time instead of failing or answering shallowly.
+    incremental_reasoning: bool = field(default_factory=lambda: os.environ.get("INCREMENTAL_REASONING", "1") == "1")
+    reasoning_max_steps: int = field(default_factory=lambda: int(os.environ.get("REASONING_MAX_STEPS", "6")))
     allow_python: bool = field(default_factory=lambda: os.environ.get("ALLOW_PYTHON", "0") == "1")
     allow_shell: bool = field(default_factory=lambda: os.environ.get("ALLOW_SHELL", "0") == "1")
     # Comma-separated allowlist. Empty means every registered tool is offered.
@@ -1642,6 +1650,7 @@ class Config:
         self.stall_timeout = min(600, max(10, self.stall_timeout))
         # The cap can never be below the ordinary step budget.
         self.hard_step_cap = min(60, max(self.agent_max_steps, self.hard_step_cap))
+        self.reasoning_max_steps = min(10, max(2, self.reasoning_max_steps))
         self.history_turns = min(200, max(0, self.history_turns))
         self.search_results = min(10, max(1, self.search_results))
         self.tool_result_chars = min(40000, max(200, self.tool_result_chars))
@@ -3546,6 +3555,41 @@ def code_search_topic(message: str) -> str:
     return topic or (message or "").strip()[:200]
 
 
+# A hard analytical question that benefits from being broken into steps. Requires
+# an analytical signal (compare, why, how would, evaluate, design, tradeoffs...)
+# AND some heft (length, several clauses, or an explicit "step by step"), so it
+# does not fire on simple factual or definitional questions that answer in one
+# shot. Lookups and code are excluded upstream, so this only sees "answer"-class
+# questions.
+REASONING_SIGNAL = re.compile(
+    r"\b(compare|contrast|versus|vs\.?|trade[- ]?offs?|pros and cons|"
+    r"why (?:is|are|does|do|would|should|did)|how would|how do i|how should|"
+    r"analy[sz]e|evaluate|assess|weigh|design|architect|derive|prove|"
+    r"implications|consequences|reason through|think through|step by step|"
+    r"walk me through|work out|figure out|explain why|justify|"
+    r"what (?:would|if) )\b",
+    re.I,
+)
+
+
+def is_reasoning_question(message: str) -> bool:
+    """True if a question is worth decomposing into incremental reasoning steps."""
+    text = (message or "").strip()
+    signals = REASONING_SIGNAL.findall(text)
+    if not signals:
+        return False
+    # Two or more analytical cues (e.g. "compare ... tradeoffs ... vs") means a
+    # genuinely multi-faceted question regardless of length.
+    if len(signals) >= 2:
+        return True
+    # A single cue plus an explicit step-by-step request, length, or several
+    # clauses. A lone short cue ("why is the sky blue") stays one-shot.
+    if re.search(r"step by step|think through|walk me through", text, re.I):
+        return True
+    clauses = text.count(" and ") + text.count(", ") + text.count("?")
+    return len(text) >= 80 or clauses >= 2
+
+
 def is_code_request(message: str) -> bool:
     """True if the message asks to write, fix, or modify code.
 
@@ -3873,6 +3917,54 @@ class Agent:
                 lines.append("note: " + " ".join(content[:300].split()))
         return "\n".join(lines[-12:])
 
+    async def plan_steps(self, question: str) -> list[str]:
+        """Break a hard question into a short ordered list of sub-questions.
+
+        One small model call. Returns 2..reasoning_max_steps concise steps. On any
+        failure it returns a single step (answer the question directly), so the
+        caller degrades to a normal answer rather than erroring.
+        """
+        prompt = [
+            {"role": "system", "content":
+                "Break the user's question into a short ordered list of sub-questions "
+                "to work through, each on its own line, numbered. Between 2 and "
+                f"{self.config.reasoning_max_steps} steps. Each step is one concrete "
+                "thing to figure out. No preamble, just the numbered list."},
+            {"role": "user", "content": question[:1000]},
+        ]
+        text = await self.resilient_complete(prompt, max_tokens=200, temperature=0.0)
+        steps: list[str] = []
+        for line in strip_reasoning(text).splitlines():
+            line = line.strip()
+            # Accept "1. x", "1) x", "- x", or a bare line.
+            m = re.match(r"^(?:\d+[.)]|[-*])\s*(.+)$", line)
+            step = (m.group(1) if m else line).strip()
+            if step and len(step) > 3:
+                steps.append(step[:200])
+        steps = steps[:self.config.reasoning_max_steps]
+        return steps or [question[:200]]
+
+    async def reason_step(self, question: str, notes: list[str], step: str) -> str:
+        """Answer one sub-question given only the compact notes so far.
+
+        The working set is [question, a few prior conclusions, this step], which
+        is small and constant regardless of how many steps have run. Returns a
+        short conclusion to carry forward.
+        """
+        notes_text = "\n".join(notes[-6:]) if notes else "(nothing yet)"
+        prompt = [
+            {"role": "system", "content":
+                "You are working through a hard question one step at a time. Use the "
+                "findings so far, address only the current step, and reply with a "
+                "short concrete conclusion in at most 4 sentences. Do not restate the "
+                "whole problem."},
+            {"role": "user", "content":
+                f"Question: {question[:600]}\n\nFindings so far:\n{notes_text}\n\n"
+                f"Current step: {step}\n\nYour conclusion for this step:"},
+        ]
+        text = await self.resilient_complete(prompt, max_tokens=256, temperature=0.0)
+        return strip_reasoning(text).strip()
+
     async def run(
         self,
         user_message: str,
@@ -4066,6 +4158,64 @@ class Agent:
                             yield event
             # action == "answer" (or an unavailable/unknown tool): nothing seeded,
             # the loop below answers directly from the model's own knowledge.
+
+            # Incremental reasoning: if the question is a hard analytical one and
+            # nothing was seeded (a pure "answer" that isn't code), decompose it
+            # and work through it step by step from a bounded, growing set of
+            # conclusions, then stream the synthesis. This keeps the working set
+            # small on 8GB and lets a 3B reason in depth by taking its time.
+            if (not scratch and action == "answer"
+                    and self.config.incremental_reasoning
+                    and not is_code_request(user_message)
+                    and is_reasoning_question(user_message)):
+                yield {"type": "phase", "label": "planning the approach"}
+                steps = await self.plan_steps(user_message)
+                if len(steps) >= 2:
+                    yield {"type": "notice", "message": f"working through this in "
+                           f"{len(steps)} steps", "info": True}
+                    notes: list[str] = []
+                    for i, sub in enumerate(steps, 1):
+                        if cancel is not None and cancel.is_set():
+                            yield {"type": "cancelled", "step": i, "trace": trace}
+                            return
+                        yield {"type": "phase", "label": f"reasoning step {i}/{len(steps)}: {sub[:60]}"}
+                        conclusion = await self.reason_step(user_message, notes, sub)
+                        if conclusion:
+                            notes.append(f"{i}. {sub}: {conclusion[:300]}")
+                            # Surface each conclusion so the chain of thought is
+                            # visible as it builds, not hidden.
+                            yield {"type": "notice",
+                                   "message": f"step {i}: {conclusion[:200]}", "info": True}
+                    # Synthesise the final answer from the conclusions, streamed.
+                    yield {"type": "phase", "label": "writing the answer"}
+                    joined = "\n".join(notes)
+                    final_messages = [
+                        {"role": "system", "content": self.config.system_prompt},
+                        {"role": "user", "content":
+                            f"{user_message}\n\nYou worked through this and reached these "
+                            f"conclusions:\n{joined}\n\nNow give the complete final answer "
+                            "in plain text, drawing them together. Do not number the steps."},
+                    ]
+                    answer_buf = ""
+                    fstats = GenerationStats()
+                    fstream = self.client.stream(final_messages, reserve, temperature, fstats)
+                    try:
+                        async for tok in fstream:
+                            if cancel is not None and cancel.is_set():
+                                break
+                            answer_buf += tok
+                            yield {"type": "token", "token": tok, "step": len(steps)}
+                    except Exception:
+                        # Fall back to a non-streaming resilient synthesis.
+                        answer_buf = await self.resilient_complete(
+                            final_messages, reserve, temperature)
+                    finally:
+                        await fstream.aclose()
+                    answer = strip_reasoning(answer_buf).strip()
+                    if not answer:
+                        answer = "Here is what I worked out:\n" + joined
+                    yield done(answer, len(steps))
+                    return
 
         for step in range(1, self.config.agent_max_steps + 1):
             if cancel is not None and cancel.is_set():
@@ -5629,7 +5779,7 @@ HTML_PAGE = r"""
            trace.answer = null;
            setActivity(trace, "thinking\u2026");
          } else if (event.type === "notice") {
-           traceNotice(trace, event.message || "", false);
+           traceNotice(trace, event.message || "", !!event.info);
            bumpActivity(trace);
            setActivity(trace, event.message || "working\u2026");
          } else if (event.type === "final") {
