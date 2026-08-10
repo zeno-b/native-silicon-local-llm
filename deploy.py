@@ -185,6 +185,36 @@ def _default_context_for_ram(ram_gb: float) -> int:
     return 4096
 
 
+def _default_reasoning_tokens(ram_gb: float) -> int:
+    """Per-step token budget for reasoning, chunk and source-extraction passes.
+
+    Small on 8GB to keep each pass cheap and memory-light; larger on roomy
+    machines so they can think in more depth per step. Override REASONING_TOKENS.
+    """
+    if ram_gb >= 48:
+        return 1024
+    if ram_gb >= 24:
+        return 768
+    if ram_gb >= 14:
+        return 512
+    return 256
+
+
+def _default_fetch_cap(ram_gb: float) -> int:
+    """Hard character cap on a fetched page entering the prompt.
+
+    Scales with RAM so bigger machines read more of a source per pass while an
+    8GB machine stays safe. Override AUTO_FETCH_CHAR_CAP.
+    """
+    if ram_gb >= 48:
+        return 24000
+    if ram_gb >= 24:
+        return 16000
+    if ram_gb >= 14:
+        return 10000
+    return 6000
+
+
 # Total RAM is detected once at import. MODEL_ID overrides the RAM-based choice.
 TOTAL_RAM_GB = _detect_total_ram_gb()
 DEFAULT_MODEL = os.environ.get("MODEL_ID") or _default_model_for_ram(TOTAL_RAM_GB)
@@ -1526,11 +1556,12 @@ class Config:
     # stock price, a score, a forecast, a version number): the answer is usually
     # on the page even when the snippet omits it. 0 disables auto-fetch and falls
     # back to snippet-only plus the model choosing to call fetch_url itself.
-    auto_fetch_results: int = field(default_factory=lambda: int(os.environ.get("AUTO_FETCH_RESULTS", "1")))
+    auto_fetch_results: int = field(default_factory=lambda: int(os.environ.get("AUTO_FETCH_RESULTS", "2")))
     # Hardest ceiling on characters of a fetched page that may enter the prompt.
     # A large docs page would otherwise dominate context and OOM prefill on an
     # 8GB machine. Roughly char_cap/4 tokens.
-    auto_fetch_char_cap: int = field(default_factory=lambda: int(os.environ.get("AUTO_FETCH_CHAR_CAP", "6000")))
+    auto_fetch_char_cap: int = field(default_factory=lambda: int(
+        os.environ.get("AUTO_FETCH_CHAR_CAP") or _default_fetch_cap(TOTAL_RAM_GB)))
     agent_max_steps: int = field(default_factory=lambda: int(os.environ.get("AGENT_MAX_STEPS", "6")))
     # Resilience under memory pressure. When a generation errors (a model-server
     # OOM kill and watchdog restart look like a dropped connection from here), the
@@ -1547,6 +1578,9 @@ class Config:
     # visible "retrying" rather than minutes of dead air waiting on a wedged or
     # OOM-killed server.
     stall_timeout: int = field(default_factory=lambda: int(os.environ.get("STALL_TIMEOUT", "60")))
+    # How long a retry waits for a restarting model server to become ready again
+    # before giving up on that attempt. Longer helps slow cold-start reloads.
+    ready_wait_timeout: float = field(default_factory=lambda: float(os.environ.get("READY_WAIT_TIMEOUT", "40")))
     hard_step_cap: int = field(default_factory=lambda: int(os.environ.get("HARD_STEP_CAP", "24")))
     # Incremental reasoning: for a hard analytical question with no tool to call,
     # decompose it into sub-steps and solve them one at a time, carrying only
@@ -1561,11 +1595,20 @@ class Config:
     # prompt: split it, extract findings per chunk into bounded notes, then
     # synthesise. Chunk size and trigger are derived from context_size.
     chunk_large_prompts: bool = field(default_factory=lambda: os.environ.get("CHUNK_LARGE_PROMPTS", "1") == "1")
+    # Fraction of the context above which a prompt is chunked, and the fraction
+    # of the context each chunk targets. Derived from context_size so they scale
+    # with RAM; exposed so the thresholds themselves can be tuned per machine.
+    chunk_trigger_ratio: float = field(default_factory=lambda: float(os.environ.get("CHUNK_TRIGGER_RATIO", "0.6")))
+    chunk_size_ratio: float = field(default_factory=lambda: float(os.environ.get("CHUNK_SIZE_RATIO", "0.4")))
     reasoning_max_steps: int = field(default_factory=lambda: int(os.environ.get("REASONING_MAX_STEPS", "6")))
     # Hard wall-clock cap per reasoning step. Distinct from stall_timeout (which
     # only fires on zero output): this bounds a step that streams slowly but
     # never finishes, so a single step can never wedge the whole chain.
     reasoning_step_timeout: int = field(default_factory=lambda: int(os.environ.get("REASONING_STEP_TIMEOUT", "45")))
+    # Per-step generation budget for reasoning, chunk and source-extraction
+    # passes. RAM-scaled default; small on 8GB, larger on roomy machines.
+    reasoning_tokens: int = field(default_factory=lambda: int(
+        os.environ.get("REASONING_TOKENS") or _default_reasoning_tokens(TOTAL_RAM_GB)))
     allow_python: bool = field(default_factory=lambda: os.environ.get("ALLOW_PYTHON", "0") == "1")
     allow_shell: bool = field(default_factory=lambda: os.environ.get("ALLOW_SHELL", "0") == "1")
     # Comma-separated allowlist. Empty means every registered tool is offered.
@@ -1650,9 +1693,21 @@ class Config:
         "search_backend", "search_results", "tool_result_chars", "tool_raw_chars", "auto_fetch_results",
         "disable_thinking", "tool_temperature", "fast_path", "stable_prefix", "knowledge_triage",
         "summarise_tool_results", "summarise_over_chars",
+        # Safeguards, all tunable live so a machine can be dialled in without a
+        # restart or an env edit.
+        "incremental_reasoning", "reasoning_max_steps", "reasoning_step_timeout",
+        "reasoning_tokens", "chunk_large_prompts", "chunk_trigger_ratio",
+        "chunk_size_ratio", "auto_fetch_char_cap", "stall_timeout", "ready_wait_timeout",
+        "resilient_retries", "min_max_tokens", "hard_step_cap",
     )
 
     SEARCH_BACKENDS = ("ddg", "brave", "tavily", "searxng")
+
+    def __post_init__(self) -> None:
+        # Clamp at construction too, not only on live edits, so a bad value from
+        # an environment variable at startup is corrected the same way the UI's
+        # live edits are. apply({}) runs every guardrail with no other effect.
+        self.apply({})
 
     def public(self) -> dict:
         data = {k: v for k, v in asdict(self).items()}
@@ -1703,11 +1758,18 @@ class Config:
         self.resilient_retries = min(6, max(0, self.resilient_retries))
         self.min_max_tokens = min(512, max(32, self.min_max_tokens))
         self.stall_timeout = min(600, max(10, self.stall_timeout))
-        self.auto_fetch_char_cap = min(20000, max(1000, self.auto_fetch_char_cap))
+        self.auto_fetch_char_cap = min(60000, max(1000, self.auto_fetch_char_cap))
         # The cap can never be below the ordinary step budget.
         self.hard_step_cap = min(60, max(self.agent_max_steps, self.hard_step_cap))
         self.reasoning_max_steps = min(10, max(2, self.reasoning_max_steps))
         self.reasoning_step_timeout = min(300, max(10, self.reasoning_step_timeout))
+        self.reasoning_tokens = min(2048, max(64, self.reasoning_tokens))
+        self.ready_wait_timeout = min(300.0, max(2.0, self.ready_wait_timeout))
+        # Ratios kept in sane bands so a bad value cannot break chunking: the
+        # trigger must leave room for a reply, and a chunk must be smaller than
+        # the trigger or it could never fit.
+        self.chunk_trigger_ratio = min(0.9, max(0.2, self.chunk_trigger_ratio))
+        self.chunk_size_ratio = min(self.chunk_trigger_ratio, max(0.1, self.chunk_size_ratio))
         self.history_turns = min(200, max(0, self.history_turns))
         self.search_results = min(10, max(1, self.search_results))
         self.tool_result_chars = min(40000, max(200, self.tool_result_chars))
@@ -2447,8 +2509,12 @@ class SearchBackend:
 # no subprocess timeout around it the way run_python and run_shell have, so an
 # unbounded intermediate takes the whole app down rather than one tool call.
 # 65536 bits is a 19,728-digit number, past any real calculator use.
-MAX_RESULT_BITS = 1 << 16
-MAX_FACTORIAL_INPUT = 1000
+# Calculator safety bounds. These cap the only two whitelisted operations whose
+# cost is not bounded by expression length (exponentiation and factorial), so a
+# seven-character expression cannot allocate until the process dies. Configurable
+# for anyone who needs bigger numbers on a bigger machine.
+MAX_RESULT_BITS = int(os.environ.get("CALC_MAX_RESULT_BITS", str(1 << 16)))
+MAX_FACTORIAL_INPUT = int(os.environ.get("CALC_MAX_FACTORIAL", "1000"))
 
 
 def _guarded_pow(base: Any, exponent: Any) -> Any:
@@ -3351,6 +3417,55 @@ class ModelClient:
     def url(self) -> str:
         return f"http://127.0.0.1:{self.config.model_port}/v1/chat/completions"
 
+    @property
+    def models_url(self) -> str:
+        return f"http://127.0.0.1:{self.config.model_port}/v1/models"
+
+    async def wait_until_ready(self, timeout: float = 40.0) -> bool:
+        """Poll the model server until it answers, or until timeout.
+
+        After an out-of-memory kill the watchdog restarts the server, but
+        reloading a model takes far longer than a fixed sleep. A retry that fires
+        into a still-loading server fails instantly and wastes the attempt. This
+        polls the lightweight /v1/models endpoint so a retry waits for a live
+        server to shrink its prompt into, rather than sleeping a guessed few
+        seconds. Returns True once the server responds.
+        """
+        import httpx
+        deadline = time.time() + timeout
+        delay = 0.5
+        while time.time() < deadline:
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.get(self.models_url)
+                if resp.status_code < 500:
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.5, 3.0)
+        return False
+
+    @staticmethod
+    def classify_error(exc: Exception) -> str:
+        """A short, honest label for a generation failure.
+
+        The retry notice used to say "memory limit" for every exception, which
+        hid stalls, resets and Cloudflare-style pages behind a wrong cause. This
+        names what actually happened so the UI and logs are truthful.
+        """
+        import httpx
+        name = type(exc).__name__
+        text = str(exc).lower()
+        if isinstance(exc, httpx.ReadTimeout) or "readtimeout" in name.lower() or "timed out" in text:
+            return "the model stalled (no output in time)"
+        if isinstance(exc, (httpx.ConnectError, httpx.RemoteProtocolError)) or \
+                "connection" in text or "reset" in text or "refused" in text:
+            return "the model server dropped, likely out of memory and restarting"
+        if "memory" in text or "oom" in text or "alloc" in text:
+            return "the model server ran out of memory"
+        return f"a generation error ({name})"
+
     def payload(
         self,
         messages: list[dict],
@@ -3974,10 +4089,10 @@ class Agent:
                     log(f"resilient_complete gave up after {attempt + 1} tries: {exc}",
                         logging.WARNING)
                     return ""
-                # Give a crashed server time to be restarted by the watchdog, then
+                # Wait for the (possibly restarting) server to be ready, then
                 # retry with roughly half the tokens (floored), which also halves
                 # the KV cache the reply needs.
-                await asyncio.sleep(min(2.0 + attempt, 5.0))
+                await self.client.wait_until_ready(timeout=self.config.ready_wait_timeout)
                 tokens = max(self.config.min_max_tokens, tokens // 2)
 
     def running_summary(self, scratch: list[dict]) -> str:
@@ -4048,7 +4163,7 @@ class Agent:
                 f"Question: {question[:600]}\n\nFindings so far:\n{notes_text}\n\n"
                 f"Current step: {step}\n\nYour conclusion for this step:"},
         ]
-        text = await self.resilient_complete(prompt, max_tokens=256, temperature=0.0)
+        text = await self.resilient_complete(prompt, max_tokens=self.config.reasoning_tokens, temperature=0.0)
         return strip_reasoning(text).strip()
 
     async def run(
@@ -4129,7 +4244,17 @@ class Agent:
             # forecast, a version), so the app never needs a per-domain tool.
             if name == "web_search" and self.config.auto_fetch_results > 0 \
                     and self.registry.get("fetch_url") is not None:
-                for url in top_result_urls(result, self.config.auto_fetch_results):
+                # Step-by-step multi-source read. Rather than dumping whole pages
+                # into the prompt (which OOMs on 8GB with two sources), fetch each
+                # of the top results, extract just the findings relevant to the
+                # question in its own bounded, streamed pass, and accumulate short
+                # notes. Then seed the notes plus a directive to compare the
+                # sources and answer. Memory stays flat (one page at a time), the
+                # work is visible as steps, and the model compares before it
+                # answers.
+                urls = top_result_urls(result, self.config.auto_fetch_results)
+                source_notes: list[str] = []
+                for idx, url in enumerate(urls, 1):
                     signature = "fetch_url:" + json.dumps({"url": url}, sort_keys=True,
                                                           ensure_ascii=False, default=str)
                     if signature in seen_calls:
@@ -4146,19 +4271,52 @@ class Agent:
                         continue  # a dead link is not fatal; the snippets remain
                     trace.append({"name": "fetch_url", "args": {"url": url},
                                   "result": page[:1000], "error": None})
-                    # Hard cap on how much of a fetched page enters the prompt.
-                    # A large docs page can otherwise dominate the context and
-                    # OOM prefill on 8GB. Cap first, then summarise to budget, so
-                    # the seed can never be the thing that blows memory.
                     page_budget = min(budget, self.config.auto_fetch_char_cap)
                     page_text, _ = await self.compress_tool_result(
                         "fetch_url", page[:self.config.auto_fetch_char_cap * 4], page_budget)
+                    # Extraction pass, streamed and time-capped like a reasoning
+                    # step so it never wedges and is visible as it works.
+                    yield {"type": "reason_step", "step": idx, "total": len(urls),
+                           "label": f"reading source {idx}: {url[:70]}"}
+                    extract_messages = [
+                        {"role": "system", "content":
+                            "Read this one source and note only what is relevant to "
+                            "answering the question, concisely. If the source does not "
+                            "address it, say so in a few words."},
+                        {"role": "user", "content":
+                            f"Question: {user_message[:500]}\n\nSource {idx} "
+                            f"({url}):\n{page_text}\n\nRelevant findings from this source:"},
+                    ]
+                    finding = ""
+                    estats = GenerationStats()
+                    estream = self.client.stream(extract_messages, self.config.reasoning_tokens, 0.0, estats)
+                    started_src = time.time()
+                    try:
+                        async for tok in estream:
+                            if cancel is not None and cancel.is_set():
+                                break
+                            finding += tok
+                            yield {"type": "reason_token", "step": idx, "token": tok}
+                            if time.time() - started_src > self.config.reasoning_step_timeout:
+                                break
+                    except Exception:
+                        if not strip_reasoning(finding).strip():
+                            finding = await self.resilient_complete(extract_messages, self.config.reasoning_tokens, 0.0)
+                    finally:
+                        await estream.aclose()
+                    finding = strip_reasoning(finding).strip()
+                    yield {"type": "reason_done", "step": idx, "conclusion": finding[:200]}
+                    if finding:
+                        source_notes.append(f"[{idx}] {url}: {finding[:400]}")
+
+                if source_notes:
+                    joined = "\n".join(source_notes)
                     scratch.append({"role": "assistant",
-                                    "content": f"I opened {url} to read the details."})
+                                    "content": f"I read {len(source_notes)} source(s) and noted the key points."})
                     scratch.append({"role": "user",
-                                    "content": f"PAGE TEXT [{url}]:\n{page_text}\n\n"
-                                               "Use this page to answer; it has the specific "
-                                               "detail the snippets lacked."})
+                                    "content": f"SOURCES:\n{joined}\n\nCompare these sources, "
+                                               "note any agreement or conflict, then answer the "
+                                               "original question. Cite the source URLs."})
             yield {"__seeded__": True}
 
         # Step 0: oversized prompt. If the user's input alone is too large to
@@ -4168,10 +4326,10 @@ class Agent:
         # big the input is. Done before routing, because a prompt this large
         # cannot survive a single generation to be routed normally.
         est_tokens = len(user_message) // CHARS_PER_TOKEN
-        trigger_tokens = int(self.config.context_size * 0.6)
+        trigger_tokens = int(self.config.context_size * self.config.chunk_trigger_ratio)
         if (self.config.chunk_large_prompts and est_tokens > trigger_tokens
                 and len(user_message) > 2000):
-            chunk_tokens = max(256, int(self.config.context_size * 0.4))
+            chunk_tokens = max(256, int(self.config.context_size * self.config.chunk_size_ratio))
             chunk_chars = chunk_tokens * CHARS_PER_TOKEN
             parts = chunk_text(user_message, chunk_chars, overlap=chunk_chars // 10)
             # The instruction usually sits at the very start or end of a big
@@ -4202,7 +4360,7 @@ class Agent:
                 ]
                 finding = ""
                 mstats = GenerationStats()
-                mstream = self.client.stream(map_messages, 256, 0.0, mstats)
+                mstream = self.client.stream(map_messages, self.config.reasoning_tokens, 0.0, mstats)
                 started_part = time.time()
                 try:
                     async for tok in mstream:
@@ -4214,7 +4372,7 @@ class Agent:
                             break
                 except Exception:
                     if not strip_reasoning(finding).strip():
-                        finding = await self.resilient_complete(map_messages, 256, 0.0)
+                        finding = await self.resilient_complete(map_messages, self.config.reasoning_tokens, 0.0)
                 finally:
                     await mstream.aclose()
                 finding = strip_reasoning(finding).strip()
@@ -4373,7 +4531,7 @@ class Agent:
                         ]
                         conclusion = ""
                         rstats = GenerationStats()
-                        rstream = self.client.stream(step_messages, 256, 0.0, rstats)
+                        rstream = self.client.stream(step_messages, self.config.reasoning_tokens, 0.0, rstats)
                         started_step = time.time()
                         try:
                             async for tok in rstream:
@@ -4492,10 +4650,13 @@ class Agent:
                         step_failed = True
                         break
                     gen_reserve = max(self.config.min_max_tokens, gen_reserve // 2)
+                    reason = self.client.classify_error(exc)
                     yield {"type": "notice", "step": step,
-                           "message": f"hit a memory limit; retrying with a smaller "
-                                      f"prompt and reply ({gen_reserve} tokens)"}
-                    await asyncio.sleep(min(2.0 + attempt, 5.0))
+                           "message": f"{reason}; waiting for the server, then "
+                                      f"retrying smaller ({gen_reserve} tokens)"}
+                    # Wait for the (possibly restarting) server to be ready rather
+                    # than sleeping a fixed few seconds into a dead socket.
+                    await self.client.wait_until_ready(timeout=self.config.ready_wait_timeout)
                     continue
                 finally:
                     # Breaking out early leaves the HTTP response open until the
@@ -8315,6 +8476,24 @@ def selftest() -> int:
     if "context_size" not in changed:
         failures.append("config.apply did not report context_size as changed")
 
+    # Safeguards clamp at construction and on live edit, and stay in valid bands.
+    bad = Config(chunk_size_ratio=0.99, chunk_trigger_ratio=0.3,
+                 ready_wait_timeout=99999, reasoning_tokens=10 ** 9)
+    if bad.chunk_size_ratio > bad.chunk_trigger_ratio:
+        failures.append("chunk_size_ratio not clamped below the trigger at construction")
+    if not (2.0 <= bad.ready_wait_timeout <= 300.0):
+        failures.append("ready_wait_timeout not clamped at construction")
+    if not (64 <= bad.reasoning_tokens <= 2048):
+        failures.append("reasoning_tokens not clamped at construction")
+    edited = Config()
+    edited.apply({"reasoning_tokens": 10 ** 9, "ready_wait_timeout": -5})
+    if not (64 <= edited.reasoning_tokens <= 2048 and edited.ready_wait_timeout >= 2.0):
+        failures.append("safeguards not clamped on live edit")
+    for safeguard in ("reasoning_tokens", "chunk_trigger_ratio", "stall_timeout",
+                      "ready_wait_timeout", "auto_fetch_char_cap"):
+        if safeguard not in Config.MUTABLE:
+            failures.append(f"safeguard {safeguard} is not live-editable")
+
     if failures:
         for failure in failures:
             print(f"FAIL  {failure}")
@@ -8514,7 +8693,7 @@ def main() -> None:
     else:
         log(f"Context: {config.context_size} tokens "
             f"(auto-sized for {TOTAL_RAM_GB:.0f}GB RAM; large prompts chunk above "
-            f"~{int(config.context_size * 0.6)} tokens)")
+            f"~{int(config.context_size * config.chunk_trigger_ratio)} tokens)")
 
     db = Database(DB_PATH)
     registry = ToolRegistry(config, db)
