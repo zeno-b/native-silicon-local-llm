@@ -125,13 +125,49 @@ ADAPTER_BACKUP_DIR = ROOT / "adapters" / "backups"
 WORKSPACE_DIR = ROOT / "workspace"
 DB_PATH = DATA_DIR / "feedback.db"
 
-DEFAULT_MODEL = os.environ.get(
-    "MODEL_ID",
-    # Coding-focused default. ~1.9GB resident at 4-bit, which leaves enough
-    # headroom on an 8GB M1 for the KV cache, the web process and a LoRA run.
-    # Override with MODEL_ID for anything else in DEFAULT_MODEL_CATALOG.
-    "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit",
-)
+def _detect_total_ram_gb() -> float:
+    """Physical RAM in GB, so the default model can scale to the machine.
+
+    Uses sysctl hw.memsize on macOS (the target platform), falls back to
+    os.sysconf where available, and returns 8.0 if neither works. Any failure is
+    non-fatal: a wrong guess only affects which default model is chosen, and an
+    explicit MODEL_ID always overrides it.
+    """
+    try:
+        import subprocess
+        out = subprocess.run(["sysctl", "-n", "hw.memsize"],
+                             capture_output=True, text=True, timeout=2)
+        if out.returncode == 0 and out.stdout.strip().isdigit():
+            return int(out.stdout.strip()) / (1024 ** 3)
+    except Exception:
+        pass
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1024 ** 3)
+    except Exception:
+        return 8.0
+
+
+def _default_model_for_ram(ram_gb: float) -> str:
+    """Pick a coding model that fits comfortably alongside the KV cache, the web
+    process and headroom for training, given the machine's RAM.
+
+    The thresholds are deliberately conservative because unified memory is shared
+    with the OS and the GPU wired limit. Bigger machines get a bigger, stronger
+    model; 8GB Macs stay on the 3B that has carried this setup. Override any of
+    this with MODEL_ID.
+    """
+    if ram_gb >= 48:
+        return "mlx-community/Qwen2.5-Coder-32B-Instruct-4bit"   # ~18GB
+    if ram_gb >= 24:
+        return "mlx-community/Qwen2.5-Coder-14B-Instruct-4bit"   # ~8GB
+    if ram_gb >= 14:
+        return "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"    # ~4.3GB
+    return "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit"        # ~1.9GB
+
+
+# Total RAM is detected once at import. MODEL_ID overrides the RAM-based choice.
+TOTAL_RAM_GB = _detect_total_ram_gb()
+DEFAULT_MODEL = os.environ.get("MODEL_ID") or _default_model_for_ram(TOTAL_RAM_GB)
 DEFAULT_SYSTEM_PROMPT = os.environ.get(
     "SYSTEM_PROMPT",
     "You are a local coding and research assistant. Prefer complete, runnable "
@@ -1443,7 +1479,24 @@ class Config:
     # emitting tool-call JSON. Biased toward SEARCH when unsure, since a needless
     # search is cheaper than a confident wrong answer or a refusal.
     knowledge_triage: bool = field(default_factory=lambda: os.environ.get("KNOWLEDGE_TRIAGE", "1") == "1")
+    # After a lookup search, automatically fetch this many of the top result
+    # pages and give the model their full text, not just the snippet. This is
+    # what makes one generic search path answer domain-specific questions (a
+    # stock price, a score, a forecast, a version number): the answer is usually
+    # on the page even when the snippet omits it. 0 disables auto-fetch and falls
+    # back to snippet-only plus the model choosing to call fetch_url itself.
+    auto_fetch_results: int = field(default_factory=lambda: int(os.environ.get("AUTO_FETCH_RESULTS", "1")))
     agent_max_steps: int = field(default_factory=lambda: int(os.environ.get("AGENT_MAX_STEPS", "6")))
+    # Resilience under memory pressure. When a generation errors (a model-server
+    # OOM kill and watchdog restart look like a dropped connection from here), the
+    # turn retries with a smaller token budget rather than surfacing an error.
+    # resilient_retries is how many times; min_max_tokens is the floor it shrinks
+    # to. hard_step_cap lets a big task keep going past agent_max_steps by
+    # compacting progress into a running summary, so it slows down but does not
+    # stop. These exist to satisfy "never error or stop; step down and continue".
+    resilient_retries: int = field(default_factory=lambda: int(os.environ.get("RESILIENT_RETRIES", "3")))
+    min_max_tokens: int = field(default_factory=lambda: int(os.environ.get("MIN_MAX_TOKENS", "128")))
+    hard_step_cap: int = field(default_factory=lambda: int(os.environ.get("HARD_STEP_CAP", "24")))
     allow_python: bool = field(default_factory=lambda: os.environ.get("ALLOW_PYTHON", "0") == "1")
     allow_shell: bool = field(default_factory=lambda: os.environ.get("ALLOW_SHELL", "0") == "1")
     # Comma-separated allowlist. Empty means every registered tool is offered.
@@ -1525,7 +1578,7 @@ class Config:
         "system_prompt", "max_tokens", "temperature", "repetition_penalty",
         "repetition_context_size", "context_size",
         "history_turns", "agent_enabled", "agent_max_steps",
-        "search_backend", "search_results", "tool_result_chars", "tool_raw_chars",
+        "search_backend", "search_results", "tool_result_chars", "tool_raw_chars", "auto_fetch_results",
         "disable_thinking", "tool_temperature", "fast_path", "stable_prefix", "knowledge_triage",
         "summarise_tool_results", "summarise_over_chars",
     )
@@ -1578,6 +1631,10 @@ class Config:
         self.tool_temperature = min(2.0, max(0.0, self.tool_temperature))
         self.summarise_over_chars = max(500, self.summarise_over_chars)
         self.agent_max_steps = min(20, max(1, self.agent_max_steps))
+        self.resilient_retries = min(6, max(0, self.resilient_retries))
+        self.min_max_tokens = min(512, max(32, self.min_max_tokens))
+        # The cap can never be below the ordinary step budget.
+        self.hard_step_cap = min(60, max(self.agent_max_steps, self.hard_step_cap))
         self.history_turns = min(200, max(0, self.history_turns))
         self.search_results = min(10, max(1, self.search_results))
         self.tool_result_chars = min(40000, max(200, self.tool_result_chars))
@@ -2426,6 +2483,21 @@ class Tool:
     parameters: dict[str, str]
     required: list[str]
     handler: Callable[..., str]
+    # --- Routing metadata (all optional, so old Tool(...) calls still work) ---
+    # When routable is True, the model router may choose this tool by name and
+    # supply its arguments. route_hint is the one-line menu entry shown to the
+    # router; without it the tool is callable in the agent loop but not offered
+    # as a routing action. This is what makes new capabilities future-proof: add
+    # a tool with these two fields and it is routable with no new routing code.
+    routable: bool = False
+    route_hint: str | None = None
+    # terminal tools produce the answer themselves (a number, a page), so their
+    # result is returned directly. Non-terminal tools return reference material
+    # the model must read, so the result is seeded and the model then answers.
+    terminal: bool = False
+    # Directive appended after a non-terminal tool's result, telling the model
+    # what to do with it. A sensible default is used when this is None.
+    seed_directive: str | None = None
 
     def spec(self) -> dict:
         return {
@@ -2495,6 +2567,10 @@ class ToolRegistry:
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
 
+    def routable(self) -> list[Tool]:
+        """Tools the model router is allowed to choose, in registration order."""
+        return [t for t in self._tools.values() if t.routable and t.route_hint]
+
     def _register_defaults(self) -> None:
         self._add(Tool(
             name="web_search",
@@ -2502,6 +2578,13 @@ class ToolRegistry:
             parameters={"query": "search terms", "num_results": "how many results, 1-10, default 5"},
             required=["query"],
             handler=self._web_search,
+            routable=True,
+            route_hint=('{"action":"web_search","query":"<good search terms>"} if it '
+                        "needs current events, real-time data, recent releases or "
+                        "versions, prices, scores, or facts that may have changed."),
+            seed_directive=("Answer my original question using these results and cite "
+                            "the URLs. If the snippets lack the detail needed, call "
+                            "fetch_url on the most relevant URL. Do not repeat the search."),
         ))
         self._add(Tool(
             name="fetch_url",
@@ -2521,6 +2604,10 @@ class ToolRegistry:
                         "when": "today, tomorrow, or a weekday; default today"},
             required=["location"],
             handler=self._weather,
+            routable=True,
+            route_hint=('{"action":"weather","location":"<place>","when":"today|'
+                        'tomorrow|<weekday>"} for any weather or forecast request.'),
+            seed_directive="Answer my original question from this forecast.",
         ))
         self._add(Tool(
             name="calculator",
@@ -3470,6 +3557,23 @@ def is_code_request(message: str) -> bool:
     return (has_verb and (has_object or has_language)) or (has_language and has_object)
 
 
+# Result lines from _web_search look like "N. Title\n   URL\n   snippet". Pull
+# the result URLs in order so the retrieval pipeline can fetch the top ones.
+_RESULT_URL = re.compile(r"^\s*(https?://\S+)\s*$", re.M)
+
+
+def top_result_urls(search_text: str, limit: int) -> list[str]:
+    """The first `limit` result URLs from a web_search result block, de-duped."""
+    seen: list[str] = []
+    for match in _RESULT_URL.finditer(search_text or ""):
+        url = match.group(1)
+        if url not in seen:
+            seen.append(url)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
 def quick_tool(message: str) -> tuple[str, dict] | None:
     """Deterministic shortcuts that need no model call at all.
 
@@ -3518,57 +3622,37 @@ class Agent:
     async def route(self, message: str, history: list[dict] | None = None) -> dict:
         """Ask the model how to handle a message, as one structured decision.
 
-        This is the general replacement for the intent regexes. Instead of the
-        code guessing whether a message is a search, a weather request, or
-        answerable from memory, the model reads the message (with a little recent
-        history so follow-ups like "look it up" resolve) and returns one JSON
-        object describing the action and its parameters. Deterministic code then
-        runs the chosen tool.
+        The router menu is generated from the registry: every tool that declares
+        route_hint becomes a selectable action. Adding a routable tool therefore
+        needs no change here and no new regex lane, which is what keeps routing
+        maintainable as the toolset grows over the years.
 
-        Returns a dict with an "action" of:
-          - "answer":  the model can answer from its own knowledge.
-          - "search":  needs a web lookup; carries a "query".
-          - "weather": a weather request; carries "location" and "when".
-
-        The design leans on what a small model does reliably: reading intent and
-        extracting a couple of fields when asked directly, rather than deciding
-        on its own to emit tool-call JSON mid-conversation. On any parse failure
-        it falls back to a safe default (search if a web tool exists, else
-        answer), so a malformed reply never dead-ends the turn.
+        Returns {"action": "answer"} or {"action": "<tool name>", ...tool args}.
+        The model reads the message (with a little history so follow-ups resolve)
+        and picks. On any parse failure it biases to a web search when one exists,
+        so a genuine lookup is never silently answered from stale weights.
         """
-        has_search = self.registry.get("web_search") is not None
-        has_weather = self.registry.get("weather") is not None
-
-        # Build the menu of actions from the tools that actually exist, so we
-        # never offer the model an action we cannot execute.
-        options = ['{"action":"answer"} if you can answer from your own '
-                   'knowledge. This includes writing, fixing, or explaining code '
-                   'and scripts, math, reasoning, and definitions. Writing a '
-                   'program is always answer, never search.']
-        if has_search:
-            options.append('{"action":"search","query":"<good search terms>"} if '
-                           'it needs current events, real-time data, recent '
-                           'releases or versions, prices, scores, named entities '
-                           'you are unsure about, or anything after your training.')
-        if has_weather:
-            options.append('{"action":"weather","location":"<place>","when":"today'
-                           '|tomorrow|<weekday>"} for any weather or forecast '
-                           'request.')
-        if not has_search and not has_weather:
-            # No lookup tools available; nothing to route to.
+        routable = self.registry.routable()
+        if not routable:
+            # Nothing to route to; the model answers everything itself.
             return {"action": "answer"}
 
+        # The menu: an answer option plus one line per routable tool, taken
+        # straight from each tool's route_hint.
+        answer_option = ('{"action":"answer"} if you can answer from your own '
+                         "knowledge: writing, fixing, or explaining code, math, "
+                         "reasoning, and definitions. Writing a program is answer.")
+        options = [answer_option] + [t.route_hint for t in routable]
         system = (
             "You are a router. Read the user's latest message and reply with "
             "exactly ONE JSON object and nothing else. Choose from:\n"
             + "\n".join(f"- {opt}" for opt in options)
-            + "\nExtract the search query, or the place and day, from the user's "
-            "own words. If you are unsure whether you know something accurately, "
-            "prefer search over answer. Reply with only the JSON object."
+            + "\nFill the fields from the user's own words. If unsure whether you "
+            "know something accurately, prefer a lookup over answering. Reply with "
+            "only the JSON object."
         )
 
-        # Give the model the last few turns so "look it up" or "and tomorrow?"
-        # resolve against what was being discussed. Kept short to stay cheap.
+        # A few recent turns so "look it up" / "and tomorrow?" resolve in context.
         context: list[dict] = [{"role": "system", "content": system}]
         for turn in (history or [])[-4:]:
             role = turn.get("role")
@@ -3576,36 +3660,39 @@ class Agent:
                 context.append({"role": role, "content": str(turn["content"])[:500]})
         context.append({"role": "user", "content": message[:1000]})
 
+        # The safe fallback used whenever the reply is unusable: search if we can.
+        search_tool = self.registry.get("web_search")
+        fallback = ({"action": "web_search", "query": message[:200]}
+                    if search_tool is not None else {"action": "answer"})
+
         try:
             text, _ = await self.client.complete_with_stats(
                 context, max_tokens=64, temperature=0.0
             )
         except Exception as exc:
             log(f"Router call failed ({exc}); falling back.", logging.WARNING)
-            return {"action": "search"} if has_search else {"action": "answer"}
+            return fallback
 
         decision = extract_json_object(text) or {}
         action = str(decision.get("action", "")).lower().strip()
 
-        # Validate and normalise each action, falling back safely on anything odd.
-        if action == "weather" and has_weather:
-            location = str(decision.get("location", "")).strip()
-            when = str(decision.get("when", "today")).strip().lower() or "today"
-            if location:
-                return {"action": "weather", "location": location[:60], "when": when}
-            # Weather with no place is useless; treat as a search instead.
-            return {"action": "search", "query": message[:200]} if has_search else {"action": "answer"}
-        if action == "search" and has_search:
-            query = str(decision.get("query", "")).strip() or message[:200]
-            return {"action": "search", "query": query[:200]}
         if action == "answer":
             return {"action": "answer"}
-        # Unparseable or an action we cannot run: bias to search when we can, so a
-        # genuine lookup is never silently answered from stale weights.
-        return {"action": "search", "query": message[:200]} if has_search else {"action": "answer"}
+
+        # A tool action: it must name a routable tool, and after alias-mapping its
+        # required arguments must be present. Anything missing falls back safely.
+        tool = self.registry.get(action)
+        if tool is not None and tool.routable:
+            args = {k: v for k, v in decision.items() if k != "action"}
+            args = self.registry.normalise_args(tool, args)
+            if all(r in args and str(args[r]).strip() for r in tool.required):
+                # Trim over-long string args defensively.
+                args = {k: (v[:200] if isinstance(v, str) else v) for k, v in args.items()}
+                return {"action": action, **args}
+
+        return fallback
 
     def build_base(
-
         self,
         history: list[dict],
         user_message: str,
@@ -3720,17 +3807,62 @@ class Agent:
             {"role": "user", "content":
                 f"Tool: {name}\nCompress this output:\n\n{result[:12000]}"},
         ]
-        try:
-            summary, _ = await self.client.complete_with_stats(
-                prompt, max_tokens=min(400, budget // CHARS_PER_TOKEN), temperature=0.0
-            )
-        except Exception as exc:
-            log(f"Tool result summarisation failed ({exc}); truncating instead.", logging.WARNING)
-            return result[:budget] + "\n[truncated]", False
+        summary = await self.resilient_complete(
+            prompt, max_tokens=min(400, budget // CHARS_PER_TOKEN), temperature=0.0
+        )
         summary = strip_reasoning(summary).strip()
         if not summary:
             return result[:budget] + "\n[truncated]", False
         return f"[condensed from {len(result)} chars]\n{summary[:budget]}", True
+
+    async def resilient_complete(self, messages: list[dict], max_tokens: int,
+                                 temperature: float | None) -> str:
+        """A non-streaming completion that never raises.
+
+        On failure (a server OOM kill and watchdog restart present as a dropped
+        connection here), it waits briefly for the server to come back and
+        retries with a smaller token budget. If every attempt fails it returns an
+        empty string, so callers degrade instead of erroring. Used for the router,
+        the tool-result summariser, and the forced final answer.
+        """
+        tokens = max_tokens
+        for attempt in range(self.config.resilient_retries + 1):
+            try:
+                text, _ = await self.client.complete_with_stats(messages, tokens, temperature)
+                return text
+            except Exception as exc:
+                if attempt >= self.config.resilient_retries:
+                    log(f"resilient_complete gave up after {attempt + 1} tries: {exc}",
+                        logging.WARNING)
+                    return ""
+                # Give a crashed server time to be restarted by the watchdog, then
+                # retry with roughly half the tokens (floored), which also halves
+                # the KV cache the reply needs.
+                await asyncio.sleep(min(2.0 + attempt, 5.0))
+                tokens = max(self.config.min_max_tokens, tokens // 2)
+
+    def running_summary(self, scratch: list[dict]) -> str:
+        """A compact plain-text digest of the work so far.
+
+        Used to keep memory flat on a big task: instead of carrying the whole
+        transcript into every step (which grows the prompt and the KV cache until
+        an 8GB machine OOMs), the transcript is periodically collapsed to this
+        summary so each step's working set stays bounded. Slower, but it does not
+        stop.
+        """
+        lines: list[str] = []
+        for turn in scratch:
+            content = str(turn.get("content", "")).strip()
+            if not content:
+                continue
+            role = turn.get("role")
+            # Keep tool results (they carry the facts) and the model's own notes,
+            # trimmed hard; drop the boilerplate directives.
+            if content.startswith("TOOL RESULT") or content.startswith("PAGE TEXT"):
+                lines.append(" ".join(content[:600].split()))
+            elif role == "assistant":
+                lines.append("note: " + " ".join(content[:300].split()))
+        return "\n".join(lines[-12:])
 
     async def run(
         self,
@@ -3801,6 +3933,38 @@ class Agent:
             scratch.append({"role": "assistant", "content": note})
             scratch.append({"role": "user",
                             "content": f"TOOL RESULT [{name}]:\n{seeded}\n\n{directive}"})
+
+            # Retrieval pipeline: for a web search, automatically fetch the top
+            # result page(s) and give the model their full text. This is what
+            # lets one generic search answer domain-specific questions whose
+            # answer is on the page but not in the snippet (a price, a score, a
+            # forecast, a version), so the app never needs a per-domain tool.
+            if name == "web_search" and self.config.auto_fetch_results > 0 \
+                    and self.registry.get("fetch_url") is not None:
+                for url in top_result_urls(result, self.config.auto_fetch_results):
+                    signature = "fetch_url:" + json.dumps({"url": url}, sort_keys=True,
+                                                          ensure_ascii=False, default=str)
+                    if signature in seen_calls:
+                        continue
+                    yield {"type": "tool_call", "name": "fetch_url",
+                           "args": {"url": url}, "step": 0, "auto": True}
+                    page, page_err = await asyncio.to_thread(
+                        self.registry.call, "fetch_url", {"url": url}, conversation_id
+                    )
+                    yield {"type": "tool_result", "name": "fetch_url", "result": page,
+                           "error": page_err, "step": 0, "auto": True}
+                    seen_calls.append(signature)
+                    if page_err:
+                        continue  # a dead link is not fatal; the snippets remain
+                    trace.append({"name": "fetch_url", "args": {"url": url},
+                                  "result": page[:1000], "error": None})
+                    page_text, _ = await self.compress_tool_result("fetch_url", page, budget)
+                    scratch.append({"role": "assistant",
+                                    "content": f"I opened {url} to read the details."})
+                    scratch.append({"role": "user",
+                                    "content": f"PAGE TEXT [{url}]:\n{page_text}\n\n"
+                                               "Use this page to answer; it has the specific "
+                                               "detail the snippets lacked."})
             yield {"__seeded__": True}
 
         # Step 1: deterministic shortcuts. A bare URL or a pure arithmetic
@@ -3828,59 +3992,68 @@ class Agent:
         # replaces all the intent regexes: it decides answer vs search vs
         # weather, and extracts the query or the place and day from free text.
         elif self.config.knowledge_triage and is_substantive(user_message):
-            # Code handling. A self-contained code request is answered from the
-            # model's own knowledge (no router call, no misrouted search). A code
-            # request that depends on external or current information (a recent
-            # API, "latest" anything, security-research topics like recon or
-            # CVEs) searches first, then writes the code from what it finds.
+            # Decide how to handle a substantive message, then execute the
+            # decision generically. The decision is either {"action":"answer"}
+            # or {"action":"<tool name>", ...tool args}.
+            #
+            # Code requests are handled without a router call: a self-contained
+            # one answers directly, and one that depends on current or external
+            # information (a recent API, "latest" anything, security-research
+            # topics like recon or CVEs) searches first and then writes the code.
+            # Everything else goes to the registry-driven router.
+            for_code = False
             if is_code_request(user_message):
                 if (CODE_NEEDS_LOOKUP.search(user_message)
                         and self.registry.get("web_search") is not None):
-                    decision = {"action": "search",
-                                "query": code_search_topic(user_message),
-                                "for_code": True}
+                    decision = {"action": "web_search",
+                                "query": code_search_topic(user_message)}
+                    for_code = True
                 else:
                     decision = {"action": "answer"}
             else:
                 decision = await self.route(user_message, history)
+
             action = decision.get("action")
+            tool = None if action == "answer" else self.registry.get(action or "")
 
-            if action == "weather" and self.registry.get("weather") is not None:
-                # The weather tool returns the actual forecast, which is the
-                # answer; the model just needs to phrase it.
-                async for event in run_and_seed(
-                    "weather",
-                    {"location": decision["location"], "when": decision.get("when", "today")},
-                    f"I looked up the weather for {decision['location']}.",
-                    "Answer my original question from this forecast.",
-                ):
-                    if "__seeded__" not in event:
-                        yield event
-
-            elif action == "search" and self.registry.get("web_search") is not None:
-                # web_search returns snippets the model must read and answer from,
-                # fetching a page if the snippet lacks the detail. For a code
-                # lookup the directive asks for the code itself, informed by the
-                # results, rather than a prose answer with citations.
-                if decision.get("for_code"):
-                    directive = ("Use these results as reference, then write the "
-                                 "code the user asked for. Prefer standard-library "
-                                 "approaches, and note briefly if anything may be "
-                                 "version-dependent. If a result page is needed, "
-                                 "call fetch_url on it; do not repeat the search.")
-                    note = "I looked up current references before writing this."
+            if tool is not None and tool.routable:
+                # Generic execution for any routable tool. Terminal tools (a
+                # calculator, a page fetch) return their result as the answer;
+                # non-terminal tools (search, weather) seed the result and let
+                # the model answer from it.
+                args = {k: v for k, v in decision.items() if k != "action"}
+                if tool.terminal:
+                    yield {"type": "tool_call", "name": action, "args": args, "step": 0}
+                    result, error = await asyncio.to_thread(
+                        self.registry.call, action, args, conversation_id
+                    )
+                    yield {"type": "tool_result", "name": action, "result": result,
+                           "error": error, "step": 0}
+                    if not error:
+                        trace.append({"name": action, "args": args,
+                                      "result": result[:1000], "error": None})
+                        yield done(result.strip(), 0)
+                        return
+                    scratch.append({"role": "assistant", "content": f"I tried {action} and it failed."})
+                    scratch.append({"role": "user", "content": f"TOOL RESULT [{action}]:\n{result}"})
                 else:
-                    directive = ("Answer my original question using these results "
-                                 "and cite the URLs. If the snippets lack the detail "
-                                 "needed, call fetch_url on the most relevant URL. "
-                                 "Do not repeat the same search.")
-                    note = "I searched the web to make sure this is current."
-                async for event in run_and_seed(
-                    "web_search", {"query": decision["query"]}, note, directive,
-                ):
-                    if "__seeded__" not in event:
-                        yield event
-            # action == "answer" (or a tool that is unavailable): nothing seeded,
+                    # Directive: the code path overrides it to ask for code; every
+                    # other tool uses its own seed_directive (or a sane default).
+                    if for_code:
+                        directive = ("Use these results as reference, then write the "
+                                     "code the user asked for. Prefer standard-library "
+                                     "approaches and note briefly if anything may be "
+                                     "version-dependent. If a page is needed call "
+                                     "fetch_url; do not repeat the search.")
+                        note = "I looked up current references before writing this."
+                    else:
+                        directive = (tool.seed_directive
+                                     or "Answer my original question using this result.")
+                        note = f"I used {action} to get this."
+                    async for event in run_and_seed(action, args, note, directive):
+                        if "__seeded__" not in event:
+                            yield event
+            # action == "answer" (or an unavailable/unknown tool): nothing seeded,
             # the loop below answers directly from the model's own knowledge.
 
         for step in range(1, self.config.agent_max_steps + 1):
@@ -3902,30 +4075,61 @@ class Agent:
             step_temperature = (
                 self.config.tool_temperature if temperature is None else temperature
             )
-            stream = self.client.stream(messages, reserve, step_temperature, stats)
-            try:
-                async for token in stream:
-                    if cancel is not None and cancel.is_set():
-                        cancelled = True
+            # Generate this step, retrying with a smaller budget on failure rather
+            # than surfacing an error. A model-server OOM kill and watchdog restart
+            # look like a dropped stream from here, so a shrink-and-retry both
+            # rides out the restart and asks for a reply small enough to fit.
+            gen_reserve = reserve
+            step_failed = False
+            for attempt in range(self.config.resilient_retries + 1):
+                buffer = ""
+                stats = GenerationStats()
+                stream = self.client.stream(messages, gen_reserve, step_temperature, stats)
+                try:
+                    async for token in stream:
+                        if cancel is not None and cancel.is_set():
+                            cancelled = True
+                            break
+                        buffer += token
+                        yield {"type": "token", "token": token, "step": step}
+                        visible = strip_reasoning(buffer).lstrip()
+                        if visible.startswith(("{", "```")) and parse_tool_call(buffer, known):
+                            break
+                    step_failed = False
+                    break
+                except Exception as exc:
+                    await stream.aclose()
+                    log(f"generation step {step} attempt {attempt + 1} failed: {exc}",
+                        logging.DEBUG)
+                    # If usable text already streamed, keep it rather than redoing
+                    # work; the loop below can act on a partial answer or call.
+                    if strip_reasoning(buffer).strip():
+                        step_failed = False
                         break
-                    buffer += token
-                    yield {"type": "token", "token": token, "step": step}
-                    # A tool call is complete as soon as the JSON object closes;
-                    # letting the model ramble past it wastes seconds per step.
-                    # strip_reasoning first: with a thinking model the buffer
-                    # starts with <think>, so the raw prefix test never fires and
-                    # the step pays for the whole generation.
-                    visible = strip_reasoning(buffer).lstrip()
-                    if visible.startswith(("{", "```")) and parse_tool_call(buffer, known):
+                    if attempt >= self.config.resilient_retries:
+                        step_failed = True
                         break
-            except Exception as exc:
-                yield {"type": "error", "error": str(exc)}
+                    gen_reserve = max(self.config.min_max_tokens, gen_reserve // 2)
+                    yield {"type": "notice", "step": step,
+                           "message": f"hit a limit; retrying with a smaller budget "
+                                      f"({gen_reserve} tokens)"}
+                    await asyncio.sleep(min(2.0 + attempt, 5.0))
+                    continue
+                finally:
+                    # Breaking out early leaves the HTTP response open until the
+                    # generator is collected, which on a local server means a
+                    # socket per abandoned step.
+                    await stream.aclose()
+
+            if step_failed:
+                # Every retry failed. Degrade to a calm message instead of an
+                # error event, so the chat never shows a broken turn.
+                yield done(
+                    "I couldn't complete that within this machine's memory limits. "
+                    "Try a smaller or more specific request, or raise the RAM headroom.",
+                    step, truncated=True,
+                )
                 return
-            finally:
-                # Breaking out early leaves the HTTP response open until the
-                # generator is collected, which on a local server means a socket
-                # per abandoned step.
-                await stream.aclose()
 
             prompt_tokens_total += stats.prompt_tokens
             completion_tokens_total += stats.completion_tokens
@@ -4003,25 +4207,83 @@ class Agent:
                            "if you genuinely still need it.",
             })
 
-        # Step budget exhausted. Force a plain answer with the tool protocol withheld.
-        messages, _ = self.assemble(base, scratch, reserve)
+        # Ordinary step budget exhausted without a final answer. Rather than
+        # stopping, keep going in bounded batches: collapse the work so far into a
+        # compact running summary (so memory stays flat and an 8GB machine does
+        # not OOM), then grant another batch of steps, up to hard_step_cap. This
+        # is the "slow down but do not stop" path for a task too big for one pass.
+        extra_batches = 0
+        while (self.config.agent_max_steps * (extra_batches + 1) < self.config.hard_step_cap
+               and (cancel is None or not cancel.is_set())):
+            extra_batches += 1
+            summary = self.running_summary(scratch)
+            # Reset the working set to just the summary: constant memory regardless
+            # of how much has already happened.
+            scratch = [{
+                "role": "user",
+                "content": f"PROGRESS SO FAR (continue the task, do not restart):\n{summary}\n\n"
+                           "Keep going one step at a time. Answer in plain text when done, "
+                           "or call one tool as JSON to make progress.",
+            }]
+            yield {"type": "notice", "step": self.config.agent_max_steps * extra_batches,
+                   "message": "task is large; continuing step by step from a summary"}
+
+            for extra in range(1, self.config.agent_max_steps + 1):
+                step = self.config.agent_max_steps * extra_batches + extra
+                if cancel is not None and cancel.is_set():
+                    yield {"type": "cancelled", "step": step, "trace": trace}
+                    return
+                messages, _ = self.assemble(base, scratch, reserve)
+                yield {"type": "step", "step": step, "max_steps": self.config.hard_step_cap,
+                       "prompt_tokens": messages_tokens(messages)}
+                buffer = await self.resilient_complete(messages, reserve, temperature) or ""
+                call = parse_tool_call(buffer, known)
+                if call is None:
+                    answer = strip_reasoning(buffer).strip()
+                    if answer:
+                        yield done(answer, step, truncated=True)
+                        return
+                    continue
+                name, args = call
+                if name == "final_answer":
+                    answer = str(args.get("answer") or "").strip()
+                    if answer:
+                        yield done(answer, step, truncated=True)
+                        return
+                    continue
+                signature = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)}"
+                yield {"type": "tool_call", "name": name, "args": args, "step": step}
+                if signature in seen_calls:
+                    result, error = ("Already ran that; use the result you have or try "
+                                     "another tool.", None)
+                else:
+                    seen_calls.append(signature)
+                    result, error = await asyncio.to_thread(
+                        self.registry.call, name, args, conversation_id
+                    )
+                budget = self._tool_budget(reserve)
+                result_for_model, _ = await self.compress_tool_result(name, result, budget)
+                trace.append({"name": name, "args": args, "result": result[:1000], "error": error})
+                yield {"type": "tool_result", "name": name, "result": result,
+                       "error": error, "step": step}
+                scratch.append({"role": "assistant", "content": strip_reasoning(buffer).strip()})
+                scratch.append({"role": "user",
+                                "content": f"TOOL RESULT [{name}]:\n{result_for_model}"})
+
+        # Reached the hard cap (or was cancelled). Force one plain answer, never
+        # an error, from the compact summary so the reply always closes cleanly.
+        summary = self.running_summary(scratch)
         final_messages = [
             {"role": "system", "content": self.config.system_prompt},
-            *messages[1:],
-            {"role": "user", "content": "Give your best final answer now, in plain text. "
-                                        "Do not call any tool and do not output JSON."},
+            {"role": "user", "content":
+                f"{user_message}\n\nWork so far:\n{summary}\n\n"
+                "Give your best final answer now in plain text. Do not call any tool."},
         ]
-        try:
-            answer, final_stats = await self.client.complete_with_stats(
-                final_messages, reserve, temperature
-            )
-        except Exception as exc:
-            yield {"type": "error", "error": str(exc)}
-            return
-        prompt_tokens_total += final_stats.prompt_tokens
-        completion_tokens_total += final_stats.completion_tokens
-        yield {"type": "usage", "step": self.config.agent_max_steps, **final_stats.as_event()}
-        yield done(strip_reasoning(answer).strip(), self.config.agent_max_steps, truncated=True)
+        answer = await self.resilient_complete(final_messages, reserve, temperature)
+        answer = strip_reasoning(answer).strip() or (
+            "Here is as far as I got before reaching the step limit:\n" + summary
+        )
+        yield done(answer, self.config.hard_step_cap, truncated=True)
 
 
 class TaskRun:
@@ -4523,6 +4785,59 @@ HTML_PAGE = r"""
      color: #ccc;
    }
    .tool-card.failed { border-color: var(--error); }
+   /* Glass box: the agent's work as a live vertical trace. */
+   .turn { align-self: stretch; display: flex; flex-direction: column; gap: 8px; }
+   .trace {
+     align-self: flex-start;
+     max-width: 88%;
+     margin-left: 6px;
+     padding-left: 14px;
+     border-left: 2px solid var(--border);
+     display: flex;
+     flex-direction: column;
+     gap: 10px;
+   }
+   .trace:empty { display: none; }
+   .gnode { position: relative; font-size: 13px; }
+   .gnode::before {
+     content: ""; position: absolute; left: -19px; top: 5px;
+     width: 8px; height: 8px; border-radius: 50%;
+     background: var(--surface); border: 1.5px solid var(--border);
+   }
+   .gnode.router::before { border-color: var(--accent); }
+   .gnode.ok::before { border-color: var(--success); background: var(--success); }
+   .gnode.failed::before { border-color: var(--error); background: var(--error); }
+   .gnode.notice::before { border-color: var(--warn); background: var(--warn); }
+   .gnode .ghead {
+     display: flex; align-items: center; gap: 8px;
+     color: #9aa0a6; font-family: ui-monospace, monospace; font-size: 12px;
+   }
+   .gnode.tool .ghead { cursor: pointer; user-select: none; }
+   .gnode .gtool { color: var(--tool); font-weight: 600; }
+   .gnode .gpill {
+     font-size: 11px; padding: 1px 7px; border-radius: 999px;
+     background: #22331f; color: var(--success);
+   }
+   .gnode.failed .gpill { background: #331f1f; color: var(--error); }
+   .gnode .gcaret { margin-left: auto; transition: transform 0.15s; color: #666; }
+   .gnode.open .gcaret { transform: rotate(90deg); }
+   .gnode .gargs { color: #8a8f94; font-family: ui-monospace, monospace; font-size: 12px; margin-top: 3px; }
+   .gnode .gbody {
+     margin-top: 6px; white-space: pre-wrap; font-family: ui-monospace, monospace;
+     font-size: 12px; color: #cfcfcf; max-height: 240px; overflow: auto;
+     background: #16121a; border-radius: 8px; padding: 8px 10px;
+   }
+   .gnode.tool:not(.open) .gbody { display: none; }
+   .gnode.notice .gmsg { color: var(--warn); }
+   .gnode.notice.info::before { border-color: var(--tool); background: var(--tool); }
+   .gnode.notice.info .gmsg { color: var(--tool); }
+   .gnode.answer { border-left: 0; }
+   .gnode.answer .gtext {
+     background: var(--surface); border: 1px solid #444; border-radius: 12px;
+     padding: 10px 12px; white-space: pre-wrap; line-height: 1.4; font-size: 14px; color: var(--fg);
+   }
+   .gnode.answer.pending .gtext { opacity: 0.75; }
+   .gmeta { color: #777; font-size: 11px; font-family: ui-monospace, monospace; margin: 2px 0 0 6px; }
    .feedback {
      align-self: flex-start;
      display: flex;
@@ -5015,6 +5330,86 @@ HTML_PAGE = r"""
      return { card: card, body: body };
    }
 
+   // --- Glass box: build one trace timeline per assistant turn. ---
+   function startTrace() {
+     var turn = document.createElement("div");
+     turn.className = "turn";
+     var trace = document.createElement("div");
+     trace.className = "trace";
+     turn.appendChild(trace);
+     chat.appendChild(turn);
+     scrollDown();
+     return { turn: turn, trace: trace, answer: null, tool: null };
+   }
+
+   function traceRouter(t, name, args) {
+     var node = document.createElement("div");
+     node.className = "gnode router";
+     var head = document.createElement("div");
+     head.className = "ghead";
+     var loc = args && (args.location || args.query);
+     head.textContent = "router \u2192 " + name + (loc ? " (" + String(loc).slice(0, 60) + ")" : "");
+     node.appendChild(head);
+     t.trace.appendChild(node);
+     scrollDown();
+   }
+
+   function traceTool(t, name, args) {
+     var node = document.createElement("div");
+     node.className = "gnode tool";
+     var head = document.createElement("div");
+     head.className = "ghead";
+     var label = document.createElement("span");
+     label.className = "gtool";
+     label.textContent = name;
+     var pill = document.createElement("span");
+     pill.className = "gpill";
+     pill.textContent = "running";
+     var caret = document.createElement("span");
+     caret.className = "gcaret";
+     caret.textContent = "\u25b8";
+     head.appendChild(label);
+     head.appendChild(pill);
+     head.appendChild(caret);
+     var argsEl = document.createElement("div");
+     argsEl.className = "gargs";
+     argsEl.textContent = JSON.stringify(args || {});
+     var body = document.createElement("pre");
+     body.className = "gbody";
+     body.textContent = "";
+     node.appendChild(head);
+     node.appendChild(argsEl);
+     node.appendChild(body);
+     head.onclick = function() { node.classList.toggle("open"); };
+     t.trace.appendChild(node);
+     scrollDown();
+     return { node: node, pill: pill, body: body };
+   }
+
+   function traceNotice(t, message, info) {
+     var node = document.createElement("div");
+     node.className = "gnode notice" + (info ? " info" : "");
+     var msg = document.createElement("div");
+     msg.className = "gmsg";
+     msg.textContent = message;
+     node.appendChild(msg);
+     t.trace.appendChild(node);
+     scrollDown();
+   }
+
+   function traceAnswer(t) {
+     if (t.answer) return t.answer;
+     var node = document.createElement("div");
+     node.className = "gnode answer pending";
+     var text = document.createElement("div");
+     text.className = "gtext";
+     node.appendChild(text);
+     t.turn.appendChild(node);
+     t.answer = { node: node, text: text };
+     scrollDown();
+     return t.answer;
+   }
+
    function addFeedbackBar(userText, botText) {
      var bar = document.createElement("div");
      bar.className = "feedback";
@@ -5077,10 +5472,9 @@ HTML_PAGE = r"""
      addMessage("user", message);
      updateContextMeter(estimateTokens(message));
 
-     var bubble = addMessage("assistant", "");
-     bubble.classList.add("pending");
+     var trace = startTrace();
      var answered = false;
-     var currentTool = null;
+     var firstTool = true;
 
      try {
        var res = await fetch("/api/chat/stream", {
@@ -5096,8 +5490,10 @@ HTML_PAGE = r"""
 
        if (!res.ok || !res.body) {
          var text = await res.text();
-         bubble.textContent = "Error: " + text.slice(0, 400);
-         bubble.classList.remove("pending");
+         var a0 = traceAnswer(trace);
+         a0.text.textContent = "Error: " + text.slice(0, 400);
+         a0.node.classList.remove("pending");
+         a0.node.classList.add("failed");
          return;
        }
 
@@ -5132,58 +5528,81 @@ HTML_PAGE = r"""
            conversationId = event.conversation_id || conversationId;
            localStorage.setItem("llm_conversation", conversationId);
          } else if (event.type === "context") {
-           addSystem("Trimmed " + event.dropped + " old messages to fit the context window.");
+           traceNotice(trace, "trimmed " + event.dropped + " old messages to fit the context window", true);
          } else if (event.type === "step") {
-           if (event.step > 1) bubble.textContent = "";
+           // Pre-tool tokens are usually the model deciding; keep the answer
+           // node clean until it actually answers.
+           if (trace.answer && trace.answer.node.classList.contains("pending")) {
+             trace.answer.text.textContent = "";
+           }
          } else if (event.type === "token") {
-           bubble.textContent += event.token;
+           traceAnswer(trace).text.textContent += event.token;
            scrollDown();
          } else if (event.type === "tool_call") {
-           bubble.textContent = "";
-           currentTool = addToolCard(event.name, event.args);
+           // The first tool of a turn is the router's choice; label it as such.
+           if (firstTool) { traceRouter(trace, event.name, event.args); firstTool = false; }
+           trace.tool = traceTool(trace, event.name, event.args);
          } else if (event.type === "tool_result") {
-           if (currentTool) {
-             currentTool.body.textContent = event.result;
-             if (event.error) currentTool.card.classList.add("failed");
-             currentTool = null;
+           if (trace.tool) {
+             trace.tool.body.textContent = event.result || "";
+             if (event.error) {
+               trace.tool.node.classList.add("failed");
+               trace.tool.pill.textContent = "failed";
+             } else {
+               trace.tool.node.classList.add("ok");
+               trace.tool.pill.textContent = "ok";
+             }
+             trace.tool = null;
            }
-           bubble = addMessage("assistant", "");
-           bubble.classList.add("pending");
+           // A fresh answer node collects whatever the model says next.
+           trace.answer = null;
+         } else if (event.type === "notice") {
+           // Resilience + step-by-step status: retries, and continuing from a
+           // summary on a large task. This is the payoff of the glass box.
+           traceNotice(trace, event.message || "", false);
          } else if (event.type === "final") {
-           bubble.textContent = event.answer;
-           bubble.classList.remove("pending");
+           var ans = traceAnswer(trace);
+           ans.text.textContent = event.answer || "(no answer)";
+           ans.node.classList.remove("pending");
            answered = true;
-           updateContextMeter(estimateTokens(event.answer));
-           addFeedbackBar(message, event.answer);
+           updateContextMeter(estimateTokens(event.answer || ""));
+           var meta = document.createElement("div");
+           meta.className = "gmeta";
+           var bits = [];
+           if (event.tools_used && event.tools_used.length) bits.push(event.tools_used.join(", "));
+           bits.push((event.steps || 1) + " step" + ((event.steps || 1) === 1 ? "" : "s"));
+           bits.push(Math.round((event.elapsed_ms || 0) / 100) / 10 + "s");
+           if (event.truncated) bits.push("continued from summary");
+           meta.textContent = bits.join(" \u00b7 ");
+           trace.turn.appendChild(meta);
+           addFeedbackBar(message, event.answer || "");
            loadRunCurve(conversationId);
            loadPerf();
-           if (event.tools_used && event.tools_used.length) {
-             addSystem("Used " + event.tools_used.join(", ") + " over " +
-                       event.steps + " step(s) in " +
-                       Math.round((event.elapsed_ms || 0) / 100) / 10 + "s.");
-           }
-           if (event.truncated) {
-             addSystem("Agent hit the step limit and answered with what it had.");
-           }
+         } else if (event.type === "cancelled") {
+           traceNotice(trace, "stopped", false);
+           answered = true;
          } else if (event.type === "error") {
-           bubble.textContent = "Error: " + event.error;
-           bubble.classList.remove("pending");
-           bubble.classList.add("failed");
+           // The resilient loop rarely emits this now, but render it as a failed
+           // node rather than replacing the whole turn with an error string.
+           traceNotice(trace, "error: " + event.error, false);
            answered = true;
          }
        }
 
        if (!answered) {
-         bubble.classList.remove("pending");
-         if (!bubble.textContent) bubble.textContent = "(no response)";
+         var a = traceAnswer(trace);
+         a.node.classList.remove("pending");
+         if (!a.text.textContent) a.text.textContent = "(no response)";
        }
      } catch (err) {
+       var a2 = traceAnswer(trace);
+       a2.node.classList.remove("pending");
        if (err.name === "AbortError") {
-         bubble.textContent = (bubble.textContent || "") + "\n(stopped)";
+         traceNotice(trace, "stopped", false);
        } else {
-         bubble.textContent = "Error: " + err.message;
+         a2.text.textContent = "Error: " + err.message;
+         a2.node.classList.add("failed");
        }
-       bubble.classList.remove("pending");
      } finally {
        busy = false;
        controller = null;
@@ -7094,6 +7513,13 @@ def selftest() -> int:
         if is_substantive(msg) != want_substantive:
             failures.append(f"is_substantive({msg!r}) != {want_substantive}")
 
+    # The retrieval pipeline extracts the top result URLs from a search block.
+    _sample = "1. A\n   https://a.com/x\n   s\n2. B\n   https://b.com/y\n   s"
+    if top_result_urls(_sample, 1) != ["https://a.com/x"]:
+        failures.append("top_result_urls did not return the first result URL")
+    if top_result_urls(_sample, 5) != ["https://a.com/x", "https://b.com/y"]:
+        failures.append("top_result_urls did not return URLs in order")
+
     # The router's JSON extractor must survive prose and code fences around the
     # object, and reject replies with no object.
     for raw, want in [
@@ -7536,6 +7962,16 @@ def main() -> None:
 
     config.model_port = get_free_port(config.model_port)
     config.web_port = get_free_port(config.web_port, exclude={config.model_port})
+
+    # Announce the model and where the RAM-based default came from, so it is
+    # obvious on a new machine why a particular model was chosen.
+    if os.environ.get("MODEL_ID"):
+        log(f"Model: {config.model} (from MODEL_ID)")
+    elif args.model == DEFAULT_MODEL:
+        log(f"Model: {config.model} (auto-selected for {TOTAL_RAM_GB:.0f}GB RAM; "
+            f"set MODEL_ID to override)")
+    else:
+        log(f"Model: {config.model}")
 
     db = Database(DB_PATH)
     registry = ToolRegistry(config, db)
