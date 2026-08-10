@@ -62,7 +62,7 @@ python3 deploy.py --agent --context-size 8192 --max-tokens 512
 MODEL_ID="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit" python3 deploy.py
 
 # Brand it
-APP_NAME="Zeno's Lab" APP_LOGO="🧪" python3 deploy.py
+APP_NAME="TestLab" APP_LOGO="🧪" python3 deploy.py
 ```
 
 On start the app prints the detected RAM, the chosen model, and the chosen context window, then serves the UI on a free local port (printed to the log). Open that URL in a browser.
