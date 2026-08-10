@@ -1496,6 +1496,12 @@ class Config:
     # stop. These exist to satisfy "never error or stop; step down and continue".
     resilient_retries: int = field(default_factory=lambda: int(os.environ.get("RESILIENT_RETRIES", "3")))
     min_max_tokens: int = field(default_factory=lambda: int(os.environ.get("MIN_MAX_TOKENS", "128")))
+    # If the model server sends nothing for this many seconds mid-generation, the
+    # request is treated as stalled: it raises, and the resilient loop retries
+    # with a smaller budget instead of hanging. This is what turns "stuck" into
+    # visible "retrying" rather than minutes of dead air waiting on a wedged or
+    # OOM-killed server.
+    stall_timeout: int = field(default_factory=lambda: int(os.environ.get("STALL_TIMEOUT", "60")))
     hard_step_cap: int = field(default_factory=lambda: int(os.environ.get("HARD_STEP_CAP", "24")))
     allow_python: bool = field(default_factory=lambda: os.environ.get("ALLOW_PYTHON", "0") == "1")
     allow_shell: bool = field(default_factory=lambda: os.environ.get("ALLOW_SHELL", "0") == "1")
@@ -1633,6 +1639,7 @@ class Config:
         self.agent_max_steps = min(20, max(1, self.agent_max_steps))
         self.resilient_retries = min(6, max(0, self.resilient_retries))
         self.min_max_tokens = min(512, max(32, self.min_max_tokens))
+        self.stall_timeout = min(600, max(10, self.stall_timeout))
         # The cap can never be below the ordinary step budget.
         self.hard_step_cap = min(60, max(self.agent_max_steps, self.hard_step_cap))
         self.history_turns = min(200, max(0, self.history_turns))
@@ -3343,7 +3350,8 @@ class ModelClient:
     ) -> tuple[str, GenerationStats]:
         import httpx
         started = time.time()
-        async with httpx.AsyncClient(timeout=600) as client:
+        timeout = httpx.Timeout(self.config.stall_timeout, connect=15.0, pool=15.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(self.url, json=self.payload(messages, False, max_tokens, temperature))
             if resp.status_code != 200:
                 fallback = self.payload(messages, False, max_tokens, temperature)
@@ -3374,7 +3382,8 @@ class ModelClient:
         usage: dict | None = None
         text_len = 0
         try:
-            async with httpx.AsyncClient(timeout=600) as client:
+            timeout = httpx.Timeout(self.config.stall_timeout, connect=15.0, pool=15.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 async with client.stream(
                     "POST", self.url, json=self.payload(messages, True, max_tokens, temperature)
                 ) as resp:
@@ -3887,6 +3896,7 @@ class Agent:
         trace: list[dict] = []
         nudges = 0
         prompt_tokens_total = 0
+        yield {"type": "phase", "label": "preparing"}
         completion_tokens_total = 0
 
         def done(answer: str, step: int, truncated: bool = False) -> dict:
@@ -4011,6 +4021,7 @@ class Agent:
                 else:
                     decision = {"action": "answer"}
             else:
+                yield {"type": "phase", "label": "deciding how to handle this"}
                 decision = await self.route(user_message, history)
 
             action = decision.get("action")
@@ -4838,6 +4849,20 @@ HTML_PAGE = r"""
    }
    .gnode.answer.pending .gtext { opacity: 0.75; }
    .gmeta { color: #777; font-size: 11px; font-family: ui-monospace, monospace; margin: 2px 0 0 6px; }
+   .gactivity {
+     display: flex; align-items: center; gap: 8px; margin: 2px 0 0 6px;
+     font-family: ui-monospace, monospace; font-size: 12px; color: var(--accent);
+   }
+   .gspin {
+     width: 11px; height: 11px; border-radius: 50%;
+     border: 2px solid #2a3b4d; border-top-color: var(--accent);
+     animation: gspin 0.7s linear infinite; flex: 0 0 auto;
+   }
+   @keyframes gspin { to { transform: rotate(360deg); } }
+   .gactivity .gelapsed { color: #888; }
+   .gactivity.stalled { color: var(--warn); }
+   .gactivity.stalled .gspin { border-top-color: var(--warn); }
+   .gnode.tool.running .gpill { background: #1f2a33; color: var(--accent); }
    .feedback {
      align-self: flex-start;
      display: flex;
@@ -5337,9 +5362,45 @@ HTML_PAGE = r"""
      var trace = document.createElement("div");
      trace.className = "trace";
      turn.appendChild(trace);
+     // Always-visible activity line: a spinner, the current state, and a clock
+     // that keeps ticking so a slow step never looks frozen.
+     var activity = document.createElement("div");
+     activity.className = "gactivity";
+     var spin = document.createElement("span"); spin.className = "gspin";
+     var label = document.createElement("span"); label.className = "glabel"; label.textContent = "starting\u2026";
+     var elapsed = document.createElement("span"); elapsed.className = "gelapsed";
+     activity.appendChild(spin); activity.appendChild(label); activity.appendChild(elapsed);
+     turn.appendChild(activity);
      chat.appendChild(turn);
      scrollDown();
-     return { turn: turn, trace: trace, answer: null, tool: null };
+     var t = { turn: turn, trace: trace, answer: null, tool: null,
+               activity: activity, label: label, elapsed: elapsed,
+               started: Date.now(), stepLabel: "", timer: null };
+     // Tick the clock four times a second. This is the liveness proof: as long
+     // as this number moves, the turn is not dead.
+     t.timer = setInterval(function() {
+       var secs = (Date.now() - t.started) / 1000;
+       t.elapsed.textContent = secs.toFixed(1) + "s";
+       // If a single step runs long, flag it visually so a real stall is obvious.
+       activity.classList.toggle("stalled", secs > 25 && !t.answered);
+     }, 250);
+     return t;
+   }
+
+   function setActivity(t, text) {
+     if (!t.activity) return;
+     t.label.textContent = t.stepLabel ? (t.stepLabel + " \u00b7 " + text) : text;
+   }
+
+   function stopActivity(t) {
+     if (t.timer) { clearInterval(t.timer); t.timer = null; }
+     t.answered = true;
+     if (t.activity && t.activity.parentNode) t.activity.parentNode.removeChild(t.activity);
+   }
+
+   function bumpActivity(t) {
+     // Keep the activity line as the last child of the turn as nodes are added.
+     if (t.activity) t.turn.appendChild(t.activity);
    }
 
    function traceRouter(t, name, args) {
@@ -5494,6 +5555,7 @@ HTML_PAGE = r"""
          a0.text.textContent = "Error: " + text.slice(0, 400);
          a0.node.classList.remove("pending");
          a0.node.classList.add("failed");
+         stopActivity(trace);
          return;
        }
 
@@ -5527,23 +5589,33 @@ HTML_PAGE = r"""
          if (event.type === "start") {
            conversationId = event.conversation_id || conversationId;
            localStorage.setItem("llm_conversation", conversationId);
+         } else if (event.type === "phase") {
+           setActivity(trace, event.label || "working\u2026");
+           bumpActivity(trace);
          } else if (event.type === "context") {
            traceNotice(trace, "trimmed " + event.dropped + " old messages to fit the context window", true);
+           bumpActivity(trace);
          } else if (event.type === "step") {
-           // Pre-tool tokens are usually the model deciding; keep the answer
-           // node clean until it actually answers.
+           // Show which step is active and out of how many, always.
+           trace.stepLabel = "step " + event.step + (event.max_steps ? "/" + event.max_steps : "");
+           setActivity(trace, "thinking\u2026");
            if (trace.answer && trace.answer.node.classList.contains("pending")) {
              trace.answer.text.textContent = "";
            }
          } else if (event.type === "token") {
            traceAnswer(trace).text.textContent += event.token;
+           bumpActivity(trace);
+           setActivity(trace, "generating\u2026");
            scrollDown();
          } else if (event.type === "tool_call") {
-           // The first tool of a turn is the router's choice; label it as such.
            if (firstTool) { traceRouter(trace, event.name, event.args); firstTool = false; }
            trace.tool = traceTool(trace, event.name, event.args);
+           trace.tool.node.classList.add("running");
+           bumpActivity(trace);
+           setActivity(trace, "running " + event.name + "\u2026");
          } else if (event.type === "tool_result") {
            if (trace.tool) {
+             trace.tool.node.classList.remove("running");
              trace.tool.body.textContent = event.result || "";
              if (event.error) {
                trace.tool.node.classList.add("failed");
@@ -5554,12 +5626,12 @@ HTML_PAGE = r"""
              }
              trace.tool = null;
            }
-           // A fresh answer node collects whatever the model says next.
            trace.answer = null;
+           setActivity(trace, "thinking\u2026");
          } else if (event.type === "notice") {
-           // Resilience + step-by-step status: retries, and continuing from a
-           // summary on a large task. This is the payoff of the glass box.
            traceNotice(trace, event.message || "", false);
+           bumpActivity(trace);
+           setActivity(trace, event.message || "working\u2026");
          } else if (event.type === "final") {
            var ans = traceAnswer(trace);
            ans.text.textContent = event.answer || "(no answer)";
@@ -5574,17 +5646,18 @@ HTML_PAGE = r"""
            bits.push(Math.round((event.elapsed_ms || 0) / 100) / 10 + "s");
            if (event.truncated) bits.push("continued from summary");
            meta.textContent = bits.join(" \u00b7 ");
+           stopActivity(trace);
            trace.turn.appendChild(meta);
            addFeedbackBar(message, event.answer || "");
            loadRunCurve(conversationId);
            loadPerf();
          } else if (event.type === "cancelled") {
            traceNotice(trace, "stopped", false);
+           stopActivity(trace);
            answered = true;
          } else if (event.type === "error") {
-           // The resilient loop rarely emits this now, but render it as a failed
-           // node rather than replacing the whole turn with an error string.
            traceNotice(trace, "error: " + event.error, false);
+           stopActivity(trace);
            answered = true;
          }
        }
@@ -5594,6 +5667,7 @@ HTML_PAGE = r"""
          a.node.classList.remove("pending");
          if (!a.text.textContent) a.text.textContent = "(no response)";
        }
+       stopActivity(trace);
      } catch (err) {
        var a2 = traceAnswer(trace);
        a2.node.classList.remove("pending");
@@ -5603,6 +5677,7 @@ HTML_PAGE = r"""
          a2.text.textContent = "Error: " + err.message;
          a2.node.classList.add("failed");
        }
+       stopActivity(trace);
      } finally {
        busy = false;
        controller = null;
