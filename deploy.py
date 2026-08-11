@@ -4214,6 +4214,64 @@ class Agent:
                 await self.client.wait_until_ready(timeout=self.config.ready_wait_timeout)
                 tokens = max(self.config.min_max_tokens, tokens // 2)
 
+    def _partial_path(self, conversation_id: str | None) -> Path:
+        """File where a turn's partial work is streamed as it is produced."""
+        safe = "".join(c for c in (conversation_id or "scratch") if c.isalnum() or c in "-_")[:60]
+        d = DATA_DIR / "partials"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"{safe or 'scratch'}.md"
+
+    def partial_begin(self, conversation_id: str | None, question: str) -> Path:
+        """Start (truncate) the partial-output file for this turn.
+
+        Every finding, conclusion and chunk note is appended here as it is
+        produced, so if RAM runs out before the model can synthesise a final
+        answer, the work is already saved on disk and can be handed back instead
+        of lost. This is the "save and add and continue" backstop: memory stays
+        bounded (in-context notes are trimmed) while the full accumulation lives
+        on disk.
+        """
+        path = self._partial_path(conversation_id)
+        try:
+            path.write_text(f"# Working notes\n\nRequest: {question[:500]}\n\n", encoding="utf-8")
+        except Exception as exc:
+            log(f"could not open partial file: {exc}", logging.WARNING)
+        return path
+
+    def partial_add(self, conversation_id: str | None, text: str) -> None:
+        """Append one piece of progress to the on-disk partial file."""
+        text = (text or "").strip()
+        if not text:
+            return
+        try:
+            with self._partial_path(conversation_id).open("a", encoding="utf-8") as fh:
+                fh.write(text + "\n\n")
+        except Exception as exc:
+            log(f"could not append partial: {exc}", logging.DEBUG)
+
+    def partial_read(self, conversation_id: str | None, max_chars: int = 8000) -> str:
+        """Read back the accumulated partial work, tail-biased and bounded."""
+        try:
+            data = self._partial_path(conversation_id).read_text(encoding="utf-8")
+        except Exception:
+            return ""
+        data = data.strip()
+        if len(data) > max_chars:
+            data = data[:600] + "\n\n[...]\n\n" + data[-(max_chars - 600):]
+        return data
+
+    def salvage(self, conversation_id: str | None, note: str) -> str:
+        """Build a useful answer from saved work when synthesis cannot run.
+
+        Rather than a bare "couldn't complete" message, hand back whatever was
+        gathered on disk so a long, hard request still returns something usable.
+        """
+        saved = self.partial_read(conversation_id)
+        if saved:
+            return (note + "\n\nHere is what I gathered before running low on "
+                    "memory (also saved to disk):\n\n" + saved)
+        return note
+
     def running_summary(self, scratch: list[dict]) -> str:
         """A compact plain-text digest of the work so far.
 
@@ -4309,6 +4367,9 @@ class Agent:
         nudges = 0
         prompt_tokens_total = 0
         yield {"type": "phase", "label": "preparing"}
+        # Open the on-disk partial file so any work produced this turn is saved
+        # as it goes and can be handed back if RAM runs out before synthesis.
+        self.partial_begin(conversation_id, user_message)
         completion_tokens_total = 0
 
         def done(answer: str, step: int, truncated: bool = False) -> dict:
@@ -4450,6 +4511,7 @@ class Agent:
                     yield {"type": "reason_done", "step": idx, "conclusion": finding[:200]}
                     if finding:
                         source_notes.append(f"[{idx}] {url}: {finding[:400]}")
+                        self.partial_add(conversation_id, f"## Source {idx}: {url}\n{finding}")
 
                 if source_notes:
                     joined = "\n".join(source_notes)
@@ -4521,6 +4583,7 @@ class Agent:
                 yield {"type": "reason_done", "step": i, "conclusion": finding[:200]}
                 if finding:
                     notes.append(f"part {i}: {finding[:400]}")
+                    self.partial_add(conversation_id, f"## Part {i}\n{finding}")
 
             # Reduce: answer the request from the gathered notes, streamed.
             yield {"type": "phase", "label": "writing the answer"}
@@ -4701,6 +4764,7 @@ class Agent:
                         yield {"type": "reason_done", "step": i, "conclusion": conclusion[:200]}
                         if conclusion:
                             notes.append(f"{i}. {sub}: {conclusion[:300]}")
+                            self.partial_add(conversation_id, f"## Step {i}: {sub}\n{conclusion}")
                     # Synthesise the final answer from the conclusions, streamed.
                     yield {"type": "phase", "label": "writing the answer"}
                     joined = "\n".join(notes)
@@ -4761,14 +4825,19 @@ class Agent:
             for attempt in range(self.config.resilient_retries + 1):
                 buffer = ""
                 stats = GenerationStats()
-                # On a retry, re-assemble with a larger reserve, which shrinks the
-                # *prompt* budget and trims more of the trace. This is the fix
-                # that matters on 8GB: an OOM is almost always prefill of an
-                # oversized prompt (e.g. a big fetched page), and shrinking the
-                # reply tokens alone does nothing for that. Shrinking the input
-                # does.
+                # On a retry, re-assemble with a much larger reserve, which
+                # collapses the *prompt* budget and trims the trace hard. The
+                # failure on 8GB is prefill of an oversized prompt (a stall, no
+                # first token), so the input is the lever, not the reply length.
+                # Each attempt cuts the prompt to roughly half of the previous,
+                # so the three attempts are genuinely distinct rather than
+                # bouncing off the reply-token floor.
                 if attempt > 0:
-                    ctx_reserve = min(self.config.context_size - 256, int(ctx_reserve * 1.6))
+                    # Leave only ~attempt/(attempt+1) of the window as reserve,
+                    # i.e. cut the prompt to about 1/2, 1/3, 1/4 ... of the
+                    # context on successive attempts. Monotonic and distinct.
+                    ctx_reserve = min(self.config.context_size - self.config.min_max_tokens,
+                                      int(self.config.context_size * (attempt / (attempt + 1))))
                     messages, _ = self.assemble(base, scratch, ctx_reserve)
                 stream = self.client.stream(messages, gen_reserve, step_temperature, stats)
                 # Split the model's <think> reasoning from its answer as it
@@ -4805,13 +4874,14 @@ class Agent:
                     if attempt >= self.config.resilient_retries:
                         step_failed = True
                         break
-                    gen_reserve = max(self.config.min_max_tokens, gen_reserve // 2)
+                    # Shrink the reply a little too, but the prompt cut above is
+                    # the real lever. Report the prompt shrink, which is what
+                    # actually changes between attempts.
+                    gen_reserve = max(self.config.min_max_tokens, int(gen_reserve * 0.75))
                     reason = self.client.classify_error(exc)
                     yield {"type": "notice", "step": step,
-                           "message": f"{reason}; waiting for the server, then "
-                                      f"retrying smaller ({gen_reserve} tokens)"}
-                    # Wait for the (possibly restarting) server to be ready rather
-                    # than sleeping a fixed few seconds into a dead socket.
+                           "message": f"{reason}; cutting the prompt hard and retrying "
+                                      f"(attempt {attempt + 2}). Work so far is saved."}
                     await self.client.wait_until_ready(timeout=self.config.ready_wait_timeout)
                     continue
                 finally:
@@ -4821,11 +4891,14 @@ class Agent:
                     await stream.aclose()
 
             if step_failed:
-                # Every retry failed. Degrade to a calm message instead of an
-                # error event, so the chat never shows a broken turn.
+                # Every retry failed. Hand back whatever was gathered on disk so a
+                # long, hard request still returns something useful, rather than a
+                # bare apology. If nothing was gathered, fall back to the note.
                 yield done(
-                    "I couldn't complete that within this machine's memory limits. "
-                    "Try a smaller or more specific request, or raise the RAM headroom.",
+                    self.salvage(
+                        conversation_id,
+                        "I ran low on memory before I could finish this in one pass. "
+                        "Try a smaller or more specific request, or raise the RAM headroom."),
                     step, truncated=True,
                 )
                 return
@@ -4927,6 +5000,7 @@ class Agent:
             yield {"type": "notice", "step": self.config.agent_max_steps * extra_batches,
                    "message": "task is large; continuing step by step from a summary"}
 
+            batch_progress = False
             for extra in range(1, self.config.agent_max_steps + 1):
                 step = self.config.agent_max_steps * extra_batches + extra
                 if cancel is not None and cancel.is_set():
@@ -4943,6 +5017,7 @@ class Agent:
                         yield done(answer, step, truncated=True)
                         return
                     continue
+                batch_progress = True  # a tool call is forward motion
                 name, args = call
                 if name == "final_answer":
                     answer = str(args.get("answer") or "").strip()
@@ -4968,9 +5043,19 @@ class Agent:
                 scratch.append({"role": "assistant", "content": strip_reasoning(buffer).strip()})
                 scratch.append({"role": "user",
                                 "content": f"TOOL RESULT [{name}]:\n{result_for_model}"})
+                self.partial_add(conversation_id, f"Tool {name}: {str(result)[:500]}")
 
-        # Reached the hard cap (or was cancelled). Force one plain answer, never
-        # an error, from the compact summary so the reply always closes cleanly.
+            if not batch_progress:
+                # A whole batch produced no answer and no tool call — almost
+                # always repeated stalls. Continuing would only stretch a stall
+                # into minutes (the 789-second grind). Stop and salvage instead.
+                yield {"type": "notice", "info": True,
+                       "message": "no progress in the last batch; wrapping up with what I have"}
+                break
+
+        # Reached the hard cap, or was cancelled, or a batch stalled out. Force one
+        # plain answer, never an error, from the compact summary so the reply
+        # always closes cleanly.
         summary = self.running_summary(scratch)
         final_messages = [
             {"role": "system", "content": self.config.system_prompt},
@@ -4979,9 +5064,15 @@ class Agent:
                 "Give your best final answer now in plain text. Do not call any tool."},
         ]
         answer = await self.resilient_complete(final_messages, reserve, temperature)
-        answer = strip_reasoning(answer).strip() or (
-            "Here is as far as I got before reaching the step limit:\n" + summary
-        )
+        answer = strip_reasoning(answer).strip()
+        if not answer:
+            # Synthesis itself could not run — hand back the saved work from disk
+            # (falling back to the in-memory summary) so the turn still delivers.
+            answer = self.salvage(
+                conversation_id,
+                "I reached the step limit before finishing in one pass.")
+            if answer.strip() == "I reached the step limit before finishing in one pass.":
+                answer += "\n\nHere is as far as I got:\n" + summary
         yield done(answer, self.config.hard_step_cap, truncated=True)
 
 
