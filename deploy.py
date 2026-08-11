@@ -1595,6 +1595,12 @@ class Config:
     # prompt: split it, extract findings per chunk into bounded notes, then
     # synthesise. Chunk size and trigger are derived from context_size.
     chunk_large_prompts: bool = field(default_factory=lambda: os.environ.get("CHUNK_LARGE_PROMPTS", "1") == "1")
+    # Emit verbose "under the hood" detail events (prompt sizes, per-step timing,
+    # extracted lengths, fallback reasons) so the whole pipeline is visible.
+    show_internals: bool = field(default_factory=lambda: os.environ.get("SHOW_INTERNALS", "1") == "1")
+    # Hard wall-clock ceiling for the whole multi-source retrieval phase (fetch +
+    # read all sources). Prevents a stalling extraction from grinding for minutes.
+    retrieval_deadline: float = field(default_factory=lambda: float(os.environ.get("RETRIEVAL_DEADLINE", "90")))
     # Fraction of the context above which a prompt is chunked, and the fraction
     # of the context each chunk targets. Derived from context_size so they scale
     # with RAM; exposed so the thresholds themselves can be tuned per machine.
@@ -1699,6 +1705,7 @@ class Config:
         "reasoning_tokens", "chunk_large_prompts", "chunk_trigger_ratio",
         "chunk_size_ratio", "auto_fetch_char_cap", "stall_timeout", "ready_wait_timeout",
         "resilient_retries", "min_max_tokens", "hard_step_cap",
+        "show_internals", "retrieval_deadline",
     )
 
     SEARCH_BACKENDS = ("ddg", "brave", "tavily", "searxng")
@@ -1763,6 +1770,7 @@ class Config:
         self.hard_step_cap = min(60, max(self.agent_max_steps, self.hard_step_cap))
         self.reasoning_max_steps = min(10, max(2, self.reasoning_max_steps))
         self.reasoning_step_timeout = min(300, max(10, self.reasoning_step_timeout))
+        self.retrieval_deadline = min(600.0, max(15.0, self.retrieval_deadline))
         self.reasoning_tokens = min(2048, max(64, self.reasoning_tokens))
         self.ready_wait_timeout = min(300.0, max(2.0, self.ready_wait_timeout))
         # Ratios kept in sane bands so a bad value cannot break chunking: the
@@ -3474,6 +3482,39 @@ class GenerationStats:
         }
 
 
+_CONNECTIVITY: dict = {"online": True, "checked_at": 0.0}
+
+
+async def has_internet(recheck_after: float = 30.0) -> bool:
+    """Best-effort connectivity check, cached briefly.
+
+    Used to decide whether lookups are even possible. When offline the agent
+    answers from its own knowledge instead of attempting a search that would
+    fail slowly. The result is cached for recheck_after seconds so it costs at
+    most one tiny request per window. Any failure is read as offline.
+    """
+    now = time.time()
+    if now - _CONNECTIVITY["checked_at"] < recheck_after:
+        return _CONNECTIVITY["online"]
+    online = False
+    try:
+        import httpx
+        # A couple of reliable, lightweight endpoints; success on either is enough.
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            for url in ("https://1.1.1.1", "https://dns.google"):
+                try:
+                    resp = await client.head(url)
+                    if resp.status_code < 500:
+                        online = True
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        online = False
+    _CONNECTIVITY.update(online=online, checked_at=now)
+    return online
+
+
 class ModelClient:
     """Thin async client for the local OpenAI-compatible model server."""
 
@@ -3991,6 +4032,11 @@ class Agent:
         self.config = config
         self.registry = registry
         self.client = client
+        # Open partial-output file handles, keyed by conversation. Reused across a
+        # turn's many appends so we do not pay an open()/close() per write. An LRU
+        # cap keeps the fd count bounded on a long-running server.
+        self._partials: dict[str, dict] = {}
+        self._partials_dir = DATA_DIR / "partials"
 
     async def route(self, message: str, history: list[dict] | None = None) -> dict:
         """Ask the model how to handle a message, as one structured decision.
@@ -4012,17 +4058,22 @@ class Agent:
 
         # The menu: an answer option plus one line per routable tool, taken
         # straight from each tool's route_hint.
-        answer_option = ('{"action":"answer"} if you can answer from your own '
-                         "knowledge: writing, fixing, or explaining code, math, "
-                         "reasoning, and definitions. Writing a program is answer.")
+        answer_option = ('{"action":"answer"} — the DEFAULT. Use it whenever you '
+                         "can answer from your own knowledge: general facts, "
+                         "explanations, definitions, writing, math, reasoning, and "
+                         "all code. Most questions are answer.")
         options = [answer_option] + [t.route_hint for t in routable]
         system = (
             "You are a router. Read the user's latest message and reply with "
-            "exactly ONE JSON object and nothing else. Choose from:\n"
+            "exactly ONE JSON object and nothing else. Prefer answering from your "
+            "own knowledge; only choose a lookup tool when the question truly "
+            "needs current, real-time, or external facts you cannot be confident "
+            "about (today's events, prices, scores, the latest version of "
+            "something, or a specific named entity you do not know). If it is "
+            "general knowledge you already know, choose answer. Options:\n"
             + "\n".join(f"- {opt}" for opt in options)
-            + "\nFill the fields from the user's own words. If unsure whether you "
-            "know something accurately, prefer a lookup over answering. Reply with "
-            "only the JSON object."
+            + "\nFill the fields from the user's own words. Reply with only the "
+            "JSON object."
         )
 
         # A few recent turns so "look it up" / "and tomorrow?" resolve in context.
@@ -4033,10 +4084,10 @@ class Agent:
                 context.append({"role": role, "content": str(turn["content"])[:500]})
         context.append({"role": "user", "content": message[:1000]})
 
-        # The safe fallback used whenever the reply is unusable: search if we can.
-        search_tool = self.registry.get("web_search")
-        fallback = ({"action": "web_search", "query": message[:200]}
-                    if search_tool is not None else {"action": "answer"})
+        # If the reply is unusable, answer from own knowledge rather than
+        # defaulting to a search. Prefer the model's knowledge unless it clearly
+        # asked for a tool.
+        fallback = {"action": "answer"}
 
         try:
             text, _ = await self.client.complete_with_stats(
@@ -4214,58 +4265,122 @@ class Agent:
                 await self.client.wait_until_ready(timeout=self.config.ready_wait_timeout)
                 tokens = max(self.config.min_max_tokens, tokens // 2)
 
+    # Soft ceiling on a partial file. Past this we stop growing it (the reader is
+    # tail-biased anyway), so a runaway task cannot fill the disk.
+    PARTIAL_MAX_BYTES = 4_000_000
+    # Most open partial handles to keep at once before closing the least-recent.
+    PARTIAL_MAX_OPEN = 8
+
+    def _partial_key(self, conversation_id: str | None) -> str:
+        return "".join(c for c in (conversation_id or "scratch")
+                       if c.isalnum() or c in "-_")[:60] or "scratch"
+
     def _partial_path(self, conversation_id: str | None) -> Path:
-        """File where a turn's partial work is streamed as it is produced."""
-        safe = "".join(c for c in (conversation_id or "scratch") if c.isalnum() or c in "-_")[:60]
-        d = DATA_DIR / "partials"
-        d.mkdir(parents=True, exist_ok=True)
-        return d / f"{safe or 'scratch'}.md"
+        """Path to the partial file. Does not touch the filesystem."""
+        return self._partials_dir / f"{self._partial_key(conversation_id)}.md"
+
+    def _close_partial(self, key: str) -> None:
+        entry = self._partials.pop(key, None)
+        if entry:
+            try:
+                entry["fh"].close()
+            except Exception:
+                pass
 
     def partial_begin(self, conversation_id: str | None, question: str) -> Path:
-        """Start (truncate) the partial-output file for this turn.
+        """Open (truncate) the partial-output file for this turn and keep the
+        handle open for the whole turn.
 
-        Every finding, conclusion and chunk note is appended here as it is
-        produced, so if RAM runs out before the model can synthesise a final
-        answer, the work is already saved on disk and can be handed back instead
-        of lost. This is the "save and add and continue" backstop: memory stays
-        bounded (in-context notes are trimmed) while the full accumulation lives
-        on disk.
+        Every finding, conclusion and chunk note is appended to this one open
+        handle as it is produced, so if RAM runs out before the model can
+        synthesise, the work is already on disk and can be handed back. Keeping
+        the handle open avoids an open()/close() per append; a flush() after each
+        write pushes the data to the OS page cache, which survives an OOM-kill of
+        this process without the cost of an fsync.
         """
-        path = self._partial_path(conversation_id)
+        key = self._partial_key(conversation_id)
+        self._close_partial(key)  # a new turn for this conversation starts fresh
         try:
-            path.write_text(f"# Working notes\n\nRequest: {question[:500]}\n\n", encoding="utf-8")
+            self._partials_dir.mkdir(parents=True, exist_ok=True)  # once per turn
+            fh = self._partial_path(conversation_id).open(
+                "w", encoding="utf-8", buffering=1 << 16)
+            fh.write(f"# Working notes\n\nRequest: {question[:500]}\n\n")
+            fh.flush()
+            self._partials[key] = {"fh": fh, "bytes": 0, "capped": False}
+            # Bound open handles on a long-running server: close the oldest.
+            while len(self._partials) > self.PARTIAL_MAX_OPEN:
+                oldest = next(iter(self._partials))
+                self._close_partial(oldest)
         except Exception as exc:
             log(f"could not open partial file: {exc}", logging.WARNING)
-        return path
+        return self._partial_path(conversation_id)
 
     def partial_add(self, conversation_id: str | None, text: str) -> None:
-        """Append one piece of progress to the on-disk partial file."""
+        """Append one piece of progress to the already-open partial file.
+
+        One buffered write plus a cheap flush, no reopen. Stops growing the file
+        past PARTIAL_MAX_BYTES so a runaway task cannot fill the disk; the reader
+        keeps the head and tail regardless.
+        """
         text = (text or "").strip()
         if not text:
             return
+        key = self._partial_key(conversation_id)
+        entry = self._partials.get(key)
         try:
-            with self._partial_path(conversation_id).open("a", encoding="utf-8") as fh:
-                fh.write(text + "\n\n")
+            if entry is None:
+                # Defensive: add without begin. Open in append mode once.
+                self._partials_dir.mkdir(parents=True, exist_ok=True)
+                fh = self._partial_path(conversation_id).open(
+                    "a", encoding="utf-8", buffering=1 << 16)
+                entry = {"fh": fh, "bytes": fh.tell(), "capped": False}
+                self._partials[key] = entry
+            if entry["capped"]:
+                return
+            chunk = text + "\n\n"
+            entry["fh"].write(chunk)
+            entry["fh"].flush()  # to OS cache: cheap, survives an OOM-kill
+            entry["bytes"] += len(chunk.encode("utf-8", "ignore"))
+            if entry["bytes"] >= self.PARTIAL_MAX_BYTES:
+                entry["fh"].write("\n\n[partial truncated: size cap reached]\n")
+                entry["fh"].flush()
+                entry["capped"] = True
         except Exception as exc:
             log(f"could not append partial: {exc}", logging.DEBUG)
 
     def partial_read(self, conversation_id: str | None, max_chars: int = 8000) -> str:
-        """Read back the accumulated partial work, tail-biased and bounded."""
+        """Read back the accumulated partial work, tail-biased and bounded.
+
+        Flushes the open handle first so our own read sees buffered writes, and
+        seeks to read only the head and tail of a large file instead of loading
+        the whole thing into memory.
+        """
+        key = self._partial_key(conversation_id)
+        entry = self._partials.get(key)
+        path = self._partial_path(conversation_id)
         try:
-            data = self._partial_path(conversation_id).read_text(encoding="utf-8")
+            if entry is not None:
+                entry["fh"].flush()
+            size = path.stat().st_size
+            if size <= max_chars:
+                data = path.read_text(encoding="utf-8", errors="replace").strip()
+            else:
+                # Read a head slice and a tail slice, skip the middle.
+                head_n = 600
+                tail_n = max_chars - head_n
+                with path.open("rb") as fh:
+                    head = fh.read(head_n)
+                    fh.seek(-tail_n, 2)
+                    tail = fh.read()
+                data = (head.decode("utf-8", "replace").strip()
+                        + "\n\n[...]\n\n"
+                        + tail.decode("utf-8", "replace").strip())
+            return data
         except Exception:
             return ""
-        data = data.strip()
-        if len(data) > max_chars:
-            data = data[:600] + "\n\n[...]\n\n" + data[-(max_chars - 600):]
-        return data
 
     def salvage(self, conversation_id: str | None, note: str) -> str:
-        """Build a useful answer from saved work when synthesis cannot run.
-
-        Rather than a bare "couldn't complete" message, hand back whatever was
-        gathered on disk so a long, hard request still returns something usable.
-        """
+        """Build a useful answer from saved work when synthesis cannot run."""
         saved = self.partial_read(conversation_id)
         if saved:
             return (note + "\n\nHere is what I gathered before running low on "
@@ -4372,6 +4487,10 @@ class Agent:
         self.partial_begin(conversation_id, user_message)
         completion_tokens_total = 0
 
+        def detail(message: str) -> dict | None:
+            """A verbose under-the-hood line, only emitted when show_internals is on."""
+            return {"type": "detail", "message": message} if self.config.show_internals else None
+
         def done(answer: str, step: int, truncated: bool = False) -> dict:
             return {
                 "type": "final",
@@ -4437,6 +4556,7 @@ class Agent:
                 want = self.config.auto_fetch_results
                 candidates = top_result_urls(result, want + 4)
                 source_notes: list[str] = []
+                retrieval_started = time.time()
                 good = 0
                 idx = 0
                 for url in candidates:
@@ -4477,8 +4597,14 @@ class Agent:
                     page_budget = min(budget, self.config.auto_fetch_char_cap)
                     page_text, _ = await self.compress_tool_result(
                         "fetch_url", page[:self.config.auto_fetch_char_cap * 4], page_budget)
-                    # Extraction pass, streamed and time-capped like a reasoning
-                    # step so it never wedges and is visible as it works.
+                    ev = detail(f"source {idx}: fetched {len(page)} chars, reading "
+                                f"{len(page_text)} into a {self.config.reasoning_tokens}-token pass")
+                    if ev:
+                        yield ev
+                    # Extraction is best-effort and fast-fail: stream with a
+                    # per-source time cap, and on a stall keep whatever streamed
+                    # and MOVE ON. It must never fall into a retry-with-wait
+                    # (that compounding is what turned a stall into minutes).
                     yield {"type": "reason_step", "step": idx, "total": want,
                            "label": f"reading source {idx}: {url[:70]}"}
                     extract_messages = [
@@ -4501,17 +4627,30 @@ class Agent:
                             finding += tok
                             yield {"type": "reason_token", "step": idx, "token": tok}
                             if time.time() - started_src > self.config.reasoning_step_timeout:
+                                yield {"type": "notice", "info": True,
+                                       "message": f"source {idx} slow; keeping partial and moving on"}
                                 break
-                    except Exception:
-                        if not strip_reasoning(finding).strip():
-                            finding = await self.resilient_complete(extract_messages, self.config.reasoning_tokens, 0.0)
+                    except Exception as exc:
+                        # Best-effort: no retry. Whatever streamed is kept.
+                        yield {"type": "notice", "info": True,
+                               "message": f"source {idx} could not be read ({self.client.classify_error(exc)}); skipping"}
                     finally:
                         await estream.aclose()
                     finding = strip_reasoning(finding).strip()
+                    took = time.time() - started_src
                     yield {"type": "reason_done", "step": idx, "conclusion": finding[:200]}
+                    ev = detail(f"source {idx}: extracted {len(finding)} chars in {took:.1f}s")
+                    if ev:
+                        yield ev
                     if finding:
                         source_notes.append(f"[{idx}] {url}: {finding[:400]}")
                         self.partial_add(conversation_id, f"## Source {idx}: {url}\n{finding}")
+                    # Total retrieval budget: if we have spent too long across all
+                    # sources, stop fetching more and work with what we have.
+                    if time.time() - retrieval_started > self.config.retrieval_deadline:
+                        yield {"type": "notice", "info": True,
+                               "message": "retrieval time budget reached; answering with what I have"}
+                        break
 
                 if source_notes:
                     joined = "\n".join(source_notes)
@@ -4521,6 +4660,18 @@ class Agent:
                                     "content": f"SOURCES:\n{joined}\n\nCompare these sources, "
                                                "note any agreement or conflict, then answer the "
                                                "original question. Cite the source URLs."})
+                else:
+                    # No source yielded usable findings. Do NOT synthesise over the
+                    # empty notes plus big pages (that is what stalled). Answer
+                    # briefly from the search snippets already seeded, or say so.
+                    yield {"type": "notice", "info": True,
+                           "message": "no usable content extracted from the pages; "
+                                      "answering from the search snippets instead"}
+                    scratch.append({"role": "user",
+                                    "content": "The linked pages could not be read. Answer the "
+                                               "question briefly from the search snippets above. "
+                                               "If they do not contain the answer, say you could "
+                                               "not find it rather than guessing."})
             yield {"__seeded__": True}
 
         # Step 0: oversized prompt. If the user's input alone is too large to
@@ -4645,8 +4796,15 @@ class Agent:
             # information (a recent API, "latest" anything, security-research
             # topics like recon or CVEs) searches first and then writes the code.
             # Everything else goes to the registry-driven router.
+            # If there is no internet, lookups cannot succeed, so answer from own
+            # knowledge and say so once. This also makes the router moot offline.
+            online = await has_internet()
             for_code = False
-            if is_code_request(user_message):
+            if not online:
+                yield {"type": "notice", "info": True,
+                       "message": "working offline — answering from my own knowledge"}
+                decision = {"action": "answer"}
+            elif is_code_request(user_message):
                 if (CODE_NEEDS_LOOKUP.search(user_message)
                         and self.registry.get("web_search") is not None):
                     decision = {"action": "web_search",
@@ -4660,6 +4818,10 @@ class Agent:
 
             action = decision.get("action")
             tool = None if action == "answer" else self.registry.get(action or "")
+            ev = detail(f"router decision: {json.dumps(decision, ensure_ascii=False)[:200]}"
+                        + ("" if online else " (offline)"))
+            if ev:
+                yield ev
             if action == "answer" and not scratch:
                 yield {"type": "notice", "info": True,
                        "message": "decided to answer from my own knowledge"}
@@ -4804,6 +4966,11 @@ class Agent:
             messages, condensed = self.assemble(base, scratch, reserve)
             yield {"type": "step", "step": step, "max_steps": self.config.agent_max_steps,
                    "prompt_tokens": messages_tokens(messages), "condensed": condensed}
+            ev = detail(f"step {step}: prompt {messages_tokens(messages)} tokens, "
+                        f"reply budget {reserve}, {len(scratch)} scratch turns"
+                        + (f", condensed {condensed}" if condensed else ""))
+            if ev:
+                yield ev
 
             buffer = ""
             cancelled = False
@@ -4970,6 +5137,12 @@ class Agent:
             yield {"type": "tool_result", "name": name, "result": result, "error": error,
                    "step": step, "context_chars": len(result_for_model),
                    "summarised": was_summarised}
+            ev = detail(f"tool {name}: {len(result)} chars returned, "
+                        f"{len(result_for_model)} into context"
+                        + (" (summarised)" if was_summarised else "")
+                        + (f", error: {error}" if error else ""))
+            if ev:
+                yield ev
 
             scratch.append({"role": "assistant", "content": strip_reasoning(buffer).strip()})
             scratch.append({
@@ -5649,6 +5822,11 @@ HTML_PAGE = r"""
    .gnode.thinking .gtool { color: #9aa0a6; }
    .gnode.thinking .gbody { color: #9aa0a6; font-style: italic; max-height: 200px; }
    .gnode.thinking:not(.open) .gbody { display: none; }
+   .gdetail {
+     margin: 1px 0 1px 22px; font-family: ui-monospace, monospace;
+     font-size: 11px; color: #6b7075; white-space: pre-wrap;
+   }
+   .gdetail::before { content: "\2699 "; opacity: 0.6; }
    .feedback {
      align-self: flex-start;
      display: flex;
@@ -6313,6 +6491,14 @@ HTML_PAGE = r"""
      return { node: node, body: body };
    }
 
+   function traceDetail(t, message) {
+     var el = document.createElement("div");
+     el.className = "gdetail";
+     el.textContent = message;
+     t.turn.appendChild(el);
+     scrollDown();
+   }
+
    function traceNotice(t, message, info) {
      var node = document.createElement("div");
      node.className = "gnode notice" + (info ? " info" : "");
@@ -6455,6 +6641,9 @@ HTML_PAGE = r"""
          if (event.type === "start") {
            conversationId = event.conversation_id || conversationId;
            localStorage.setItem("llm_conversation", conversationId);
+         } else if (event.type === "detail") {
+           traceDetail(trace, event.message || "");
+           bumpActivity(trace);
          } else if (event.type === "phase") {
            setActivity(trace, event.label || "working\u2026");
            bumpActivity(trace);
@@ -8785,6 +8974,25 @@ def selftest() -> int:
     # The agent must keep the system prompt and the question no matter how long
     # the tool trace gets.
     agent = Agent(config, registry, ModelClient(config))
+
+    # Disk-backed partial sink: one reused handle, byte cap, tail-biased read.
+    agent.PARTIAL_MAX_BYTES = 1500
+    agent.partial_begin("selftest-conv", "a test request")
+    for _i in range(30):
+        agent.partial_add("selftest-conv", f"finding {_i}: " + "y" * 80)
+    _entry = agent._partials.get(agent._partial_key("selftest-conv"))
+    if not _entry or not _entry["capped"]:
+        failures.append("partial sink did not enforce its byte cap")
+    if len(agent._partials) != 1:
+        failures.append("partial sink reopened the handle per write")
+    _sal = agent.salvage("selftest-conv", "ran low")
+    if "finding 0" not in _sal or "[...]" not in agent.partial_read("selftest-conv", 400):
+        failures.append("partial sink read-back/salvage lost the saved work")
+    agent.partial_begin("selftest-conv", "second turn")
+    if "finding 0" in agent.partial_read("selftest-conv"):
+        failures.append("partial sink did not truncate on a new turn")
+    agent._close_partial("selftest-conv")
+
     base, _ = agent.build_base([], "what is the capital of France?", 256)
     long_scratch = [{"role": "user", "content": "t" * 8000} for _ in range(8)]
     assembled, cut = agent.assemble(base, long_scratch, 256)
