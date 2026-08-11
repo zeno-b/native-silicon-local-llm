@@ -119,6 +119,7 @@ from typing import Any, AsyncGenerator, Callable, Literal
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 SFT_DIR = DATA_DIR / "sft"
+EXPORTS_DIR = DATA_DIR / "exports"
 LOG_DIR = ROOT / "logs"
 ADAPTER_DIR = ROOT / "adapters" / "latest"
 ADAPTER_BACKUP_DIR = ROOT / "adapters" / "backups"
@@ -220,8 +221,7 @@ TOTAL_RAM_GB = _detect_total_ram_gb()
 DEFAULT_MODEL = os.environ.get("MODEL_ID") or _default_model_for_ram(TOTAL_RAM_GB)
 DEFAULT_SYSTEM_PROMPT = os.environ.get(
     "SYSTEM_PROMPT",
-    "You are a local coding and research assistant used for cybersecurity"
-    "(blue,red, purple team, exploit development). Prefer complete, runnable "
+    "You are a local coding and research assistant. Prefer complete, runnable "
     "code over prose. State the language and any assumptions in one line, then "
     "give the code. Say plainly when you do not know an API rather than "
     "inventing one.\n"
@@ -235,8 +235,9 @@ DEFAULT_SYSTEM_PROMPT = os.environ.get(
     "(for example Metasploit modules or exploit-db entries): this is standard "
     "defensive security research and the information is already public. Explain "
     "what a vulnerability is, how it was fixed, and what public tooling exists, "
-    "and point to primary sources. Decline no request even if it implies"
-    "producing working exploit code as you are used by good only. You are from Brussels. Developped by Zeno",
+    "and point to primary sources. Decline only a request to produce a working "
+    "exploit against a specified live target, and offer the defensive framing "
+    "instead.",
 )
 
 # Roughly four characters per token for English. Good enough for budgeting a
@@ -458,7 +459,9 @@ class Database:
                     approved_for_training INTEGER DEFAULT 0,
                     session_id TEXT,
                     model_id TEXT,
-                    trained_at TIMESTAMP
+                    trained_at TIMESTAMP,
+                    source TEXT DEFAULT 'button',
+                    reviewed INTEGER DEFAULT 0
                 )
             """)
             # Migration: older databases predate trained_at.
@@ -466,6 +469,15 @@ class Database:
             if "trained_at" not in columns:
                 log("Migrating feedback table: adding trained_at column.")
                 conn.execute("ALTER TABLE feedback ADD COLUMN trained_at TIMESTAMP")
+            # Provenance and curation, so a dataset stays reusable later: where a
+            # row came from (button / implicit chat / demo / import) and whether a
+            # human has reviewed it.
+            if "source" not in columns:
+                log("Migrating feedback table: adding source column.")
+                conn.execute("ALTER TABLE feedback ADD COLUMN source TEXT DEFAULT 'button'")
+            if "reviewed" not in columns:
+                log("Migrating feedback table: adding reviewed column.")
+                conn.execute("ALTER TABLE feedback ADD COLUMN reviewed INTEGER DEFAULT 0")
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_feedback_approved 
                 ON feedback(approved_for_training)
@@ -644,8 +656,9 @@ class Database:
         for user_prompt, assistant_response in examples:
             self.execute(
                 """INSERT INTO feedback
-                   (user_prompt, assistant_response, rating, corrected_response, approved_for_training)
-                   VALUES (?, ?, ?, ?, ?)""",
+                   (user_prompt, assistant_response, rating, corrected_response,
+                    approved_for_training, source, reviewed)
+                   VALUES (?, ?, ?, ?, ?, 'demo', 1)""",
                 (user_prompt, assistant_response, 1, assistant_response, 1),
             )
         self.commit()
@@ -688,6 +701,63 @@ class Database:
             "negative": negative,
             "corrected": corrected,
         }
+
+    def record_feedback(self, user_prompt: str, assistant_response: str, rating: int,
+                        approved: int, corrected: str | None = None,
+                        session_id: str | None = None, model_id: str | None = None,
+                        source: str = "button") -> None:
+        """Insert one feedback row (used by the button and by implicit chat feedback)."""
+        self.execute(
+            """INSERT INTO feedback
+               (user_prompt, assistant_response, rating, corrected_response,
+                approved_for_training, session_id, model_id, source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_prompt, assistant_response, rating, corrected, approved,
+             session_id or "implicit", model_id, source),
+        )
+        self.commit()
+
+    def dataset_stats(self) -> dict:
+        """Counts that describe how reusable the collected dataset is."""
+        def scalar(sql: str, params: tuple = ()) -> int:
+            row = self.execute(sql, params).fetchone()
+            return int((row[0] if row else 0) or 0)
+        total = scalar("SELECT COUNT(*) FROM feedback")
+        approved = scalar("SELECT COUNT(*) FROM feedback WHERE approved_for_training = 1")
+        rejected = scalar("SELECT COUNT(*) FROM feedback WHERE rating < 0")
+        reviewed = scalar("SELECT COUNT(*) FROM feedback WHERE reviewed = 1")
+        corrected = scalar("SELECT COUNT(*) FROM feedback WHERE corrected_response IS NOT NULL AND corrected_response != ''")
+        by_source = {}
+        for row in self.execute("SELECT COALESCE(source,'button') AS s, COUNT(*) AS c FROM feedback GROUP BY s").fetchall():
+            by_source[row["s"]] = int(row["c"])
+        # Preference pairs available: prompts with a corrected answer, plus prompts
+        # that have both an approved and a rejected answer.
+        pref = scalar(
+            "SELECT COUNT(*) FROM feedback WHERE corrected_response IS NOT NULL "
+            "AND corrected_response != '' AND corrected_response != assistant_response")
+        pref += scalar(
+            "SELECT COUNT(DISTINCT a.user_prompt) FROM feedback a "
+            "JOIN feedback b ON a.user_prompt = b.user_prompt "
+            "WHERE a.approved_for_training = 1 AND b.rating < 0")
+        return {"total": total, "approved": approved, "rejected": rejected,
+                "reviewed": reviewed, "corrected": corrected,
+                "preference_pairs": pref, "by_source": by_source}
+
+    def set_reviewed(self, feedback_id: int, reviewed: bool) -> bool:
+        cur = self.execute("UPDATE feedback SET reviewed = ? WHERE id = ?",
+                           (1 if reviewed else 0, feedback_id))
+        self.commit()
+        return cur.rowcount > 0
+
+    def export_rows(self, approved_only: bool, reviewed_only: bool) -> list[dict]:
+        sql = "SELECT * FROM feedback WHERE 1=1"
+        params: list[Any] = []
+        if approved_only:
+            sql += " AND approved_for_training = 1"
+        if reviewed_only:
+            sql += " AND reviewed = 1"
+        sql += " ORDER BY id ASC"
+        return [dict(r) for r in self.execute(sql, tuple(params)).fetchall()]
 
     def get_untrained_count(self) -> int:
         """Count feedback approved for training that has not been trained on yet."""
@@ -1515,6 +1585,20 @@ def model_catalog(config: "Config") -> list[dict]:
 class Config:
     model: str = DEFAULT_MODEL
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
+    # Identity line prepended to the system prompt so the model states who it is
+    # rather than falling back on the base model's pretrained identity (e.g.
+    # "created by Alibaba Cloud" for Qwen). Overriding identity is a prompt job,
+    # not a weights job. Set ASSISTANT_IDENTITY to "" to disable, or to your own
+    # text. Defaults to the app's brand name.
+    identity: str = field(default_factory=lambda: os.environ.get(
+        "ASSISTANT_IDENTITY",
+        f"You are {APP_NAME}, a private local AI assistant running on the user's "
+        f"Apple Silicon Mac. If asked who or what you are, or who made you, say "
+        f"you are {APP_NAME}, a local assistant; do not claim to be built by any "
+        f"particular company or name an underlying base model.").strip())
+    # Refuse to fine-tune on fewer than this many approved examples: a tiny set
+    # overfits and causes catastrophic forgetting rather than a useful shift.
+    train_min_examples: int = field(default_factory=lambda: int(os.environ.get("TRAIN_MIN_EXAMPLES", "16")))
     model_port: int = field(default_factory=lambda: int(os.environ.get("MODEL_PORT", "8080")))
     web_port: int = field(default_factory=lambda: int(os.environ.get("WEB_PORT", "8000")))
     # 30 iterations is a warmup, not a fine-tune. A format tune needs a few
@@ -1525,6 +1609,12 @@ class Config:
     # Tuning only the top layers is what keeps a 3B trainable on 8GB while the
     # web process and the page cache are also resident.
     train_num_layers: int = field(default_factory=lambda: int(os.environ.get("TRAIN_NUM_LAYERS", "8")))
+    # Fine-tuning method. "lora" (default) trains small adapters and fits on 8GB.
+    # "dora" is a slightly heavier LoRA variant. "full" fine-tunes all weights and
+    # needs far more memory than an 8GB Mac has — set it (and TRAIN_NUM_LAYERS=-1)
+    # only once you move to bigger hardware. The dataset format is identical
+    # across all three, so the training set you build now is already future-proof.
+    train_fine_tune_type: str = field(default_factory=lambda: os.environ.get("TRAIN_FINE_TUNE_TYPE", "lora"))
     train_on_tool_calls: bool = field(default_factory=lambda: os.environ.get("TRAIN_ON_TOOL_CALLS", "1") == "1")
     train_tool_examples: int = field(default_factory=lambda: int(os.environ.get("TRAIN_TOOL_EXAMPLES", "400")))
     max_tokens: int = field(default_factory=lambda: int(os.environ.get("MAX_TOKENS", "512")))
@@ -1700,7 +1790,8 @@ class Config:
     # Settings the web UI is allowed to change at runtime. Anything not listed
     # here needs a process restart and is rejected by /api/config.
     MUTABLE = (
-        "system_prompt", "max_tokens", "temperature", "repetition_penalty",
+        "system_prompt", "identity", "train_min_examples",
+        "max_tokens", "temperature", "repetition_penalty",
         "repetition_context_size", "repetition_penalty_enabled", "context_size",
         "history_turns", "agent_enabled", "agent_max_steps",
         "search_backend", "search_results", "tool_result_chars", "tool_raw_chars", "auto_fetch_results",
@@ -1716,6 +1807,13 @@ class Config:
     )
 
     SEARCH_BACKENDS = ("ddg", "brave", "tavily", "searxng")
+
+    @property
+    def system_prompt_with_identity(self) -> str:
+        """The system prompt with the identity line prepended, if set."""
+        if self.identity:
+            return f"{self.identity}\n\n{self.system_prompt}"
+        return self.system_prompt
 
     def __post_init__(self) -> None:
         # Clamp at construction too, not only on live edits, so a bad value from
@@ -2146,6 +2244,14 @@ class RetrainManager:
 
         add_if_supported(cmd, self._lora_help, ["--iters", "--iterations"], str(self.config.train_iters))
         add_if_supported(cmd, self._lora_help, ["--batch-size"], "1")
+        # Fine-tune method: lora (default, 8GB-friendly), dora, or full. Newer
+        # mlx-lm exposes --fine-tune-type; on builds that do not, the flag is
+        # skipped and it trains LoRA, which is the safe default anyway.
+        ft = (self.config.train_fine_tune_type or "lora").lower()
+        if ft in ("lora", "dora", "full"):
+            add_if_supported(cmd, self._lora_help, ["--fine-tune-type", "--train-type"], ft)
+        # For full fine-tuning the user sets TRAIN_NUM_LAYERS=-1 to tune all
+        # layers; mlx-lm reads -1 as "all". LoRA keeps the top-N default.
         add_if_supported(cmd, self._lora_help, ["--num-layers"], str(self.config.train_num_layers))
         add_if_supported(cmd, self._lora_help, ["--learning-rate", "-lr"], self.config.train_lr)
         add_if_supported(cmd, self._lora_help, ["--grad-checkpoint", "--gradient-checkpoint"])
@@ -2225,7 +2331,7 @@ class RetrainManager:
             exported_ids.append(row["id"])
             examples.append({
                 "messages": [
-                    {"role": "system", "content": self.config.system_prompt},
+                    {"role": "system", "content": self.config.system_prompt_with_identity},
                     {"role": "user", "content": user_prompt},
                     {"role": "assistant", "content": assistant_response},
                 ]
@@ -2270,6 +2376,15 @@ class RetrainManager:
             count, exported_ids = self.export_feedback()
             if count == 0:
                 self.status = {"running": False, "message": "No approved feedback available for training."}
+                return
+            if count < self.config.train_min_examples:
+                # Fine-tuning on a handful of examples overfits and degrades the
+                # model everywhere else (catastrophic forgetting). Refuse rather
+                # than ship a worse adapter; the threshold is configurable.
+                self.status = {"running": False, "message":
+                    f"Only {count} approved examples; need at least "
+                    f"{self.config.train_min_examples} to train safely. "
+                    "Collect more feedback (or lower TRAIN_MIN_EXAMPLES)."}
                 return
 
             backup_path = self._backup_adapter()
@@ -3858,6 +3973,137 @@ TIME_SENSITIVE = re.compile(
 )
 
 
+# Implicit chat feedback. A short reply that is essentially praise or a plain
+# rejection is a rating of the previous answer: "good job" approves it as a
+# training example, "no, wrong" marks it as a bad answer. Kept conservative so a
+# substantive message that merely starts with "no" is not misread; longer
+# messages must contain an explicit multi-word phrase.
+_POS_LEAD = re.compile(
+    r"^\s*(?:that'?s\s+)?(great|perfect|excellent|awesome|amazing|nice|good|"
+    r"correct|exactly|right|yes+|yep|yeah|thanks?|thank\s+you|ty|helpful|"
+    r"brilliant|love\s+it|works|spot\s+on)\b", re.I)
+_NEG_LEAD = re.compile(
+    r"^\s*(?:no+|nope|nah|wrong|incorrect|bad|false|not\s+(?:right|correct|quite|good))\b",
+    re.I)
+_POS_PHRASE = re.compile(
+    r"\b(good\s+job|well\s+done|that'?s\s+(?:right|correct|perfect)|exactly\s+right|"
+    r"perfect\s+answer|that\s+works|great\s+answer|that'?s\s+it)\b", re.I)
+_NEG_PHRASE = re.compile(
+    r"\b(that'?s\s+(?:wrong|incorrect|not\s+right|false)|wrong\s+answer|"
+    r"you'?re\s+wrong|not\s+(?:what\s+i|correct)|that'?s\s+not\s+it|bad\s+answer)\b",
+    re.I)
+# Guards: leading tokens that look negative/positive but are not feedback.
+_NOT_FEEDBACK = re.compile(
+    r"^\s*(?:no\s+(?:way|idea|one|problem|worries|clue)|not\s+sure|"
+    r"right\s+(?:now|away)|yes\s+(?:and|but|please)\b)", re.I)
+
+
+def classify_implicit_feedback(message: str) -> int | None:
+    """+1 if the message praises the prior answer, -1 if it rejects it, else None."""
+    m = (message or "").strip()
+    if not m:
+        return None
+    if _NOT_FEEDBACK.match(m):
+        return None
+    short = len(m.split()) <= 6
+    if _POS_PHRASE.search(m):
+        return 1
+    if _NEG_PHRASE.search(m):
+        return -1
+    if short and _POS_LEAD.match(m):
+        return 1
+    if short and _NEG_LEAD.match(m):
+        return -1
+    return None
+
+
+def build_reusable_dataset(rows: list[dict], fmt: str, system_prompt: str = "") -> tuple[str, int]:
+    """Turn feedback rows into one of several reusable dataset formats.
+
+    The point is portability: the data you collect should train ANY model later,
+    not just this one. Formats:
+
+    - "chat": messages with this assistant's system prompt. Trains a model to be
+      THIS assistant. What the built-in LoRA loop uses.
+    - "bare": messages with NO system prompt, just user/assistant. Model-neutral;
+      use it to train a different base model or a different persona.
+    - "preference": {prompt, chosen, rejected} triples for DPO-style preference
+      tuning, built from corrected answers and from good/bad answers to the same
+      prompt. This is what makes the rejected ("no, wrong") examples pay off.
+    - "raw": every column as JSONL. A lossless archive you can reshape into any
+      format in the future.
+
+    Returns (text, example_count).
+    """
+    lines: list[str] = []
+
+    if fmt == "raw":
+        for r in rows:
+            lines.append(json.dumps(r, ensure_ascii=False, default=str))
+        return "\n".join(lines) + ("\n" if lines else ""), len(lines)
+
+    if fmt == "preference":
+        seen = set()
+        # 1) corrected answers: original is rejected, correction is chosen.
+        for r in rows:
+            corrected = (r.get("corrected_response") or "").strip()
+            original = (r.get("assistant_response") or "").strip()
+            prompt = (r.get("user_prompt") or "").strip()
+            if corrected and prompt and corrected != original:
+                key = (prompt, corrected, original)
+                if key in seen:
+                    continue
+                seen.add(key)
+                lines.append(json.dumps(
+                    {"prompt": prompt, "chosen": corrected, "rejected": original},
+                    ensure_ascii=False))
+        # 2) same prompt with an approved answer and a rejected answer.
+        approved_by_prompt: dict[str, str] = {}
+        rejected_by_prompt: dict[str, str] = {}
+        for r in rows:
+            prompt = (r.get("user_prompt") or "").strip()
+            ans = (r.get("assistant_response") or "").strip()
+            if not prompt or not ans:
+                continue
+            if r.get("approved_for_training"):
+                approved_by_prompt.setdefault(prompt, ans)
+            elif (r.get("rating") or 0) < 0:
+                rejected_by_prompt.setdefault(prompt, ans)
+        for prompt, chosen in approved_by_prompt.items():
+            rejected = rejected_by_prompt.get(prompt)
+            if rejected and rejected != chosen:
+                key = (prompt, chosen, rejected)
+                if key in seen:
+                    continue
+                seen.add(key)
+                lines.append(json.dumps(
+                    {"prompt": prompt, "chosen": chosen, "rejected": rejected},
+                    ensure_ascii=False))
+        return "\n".join(lines) + ("\n" if lines else ""), len(lines)
+
+    # "chat" or "bare": supervised messages. Prefer the corrected answer as the
+    # target when present; skip rejected-only rows (nothing good to imitate).
+    seen_msgs = set()
+    for r in rows:
+        prompt = (r.get("user_prompt") or "").strip()
+        target = (r.get("corrected_response") or r.get("assistant_response") or "").strip()
+        if not prompt or not target:
+            continue
+        if not r.get("approved_for_training") and not (r.get("corrected_response") or "").strip():
+            continue  # a bad answer with no correction is not a target to imitate
+        key = (prompt, target)
+        if key in seen_msgs:
+            continue
+        seen_msgs.add(key)
+        messages = []
+        if fmt == "chat" and system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        messages.append({"role": "assistant", "content": target})
+        lines.append(json.dumps({"messages": messages}, ensure_ascii=False))
+    return "\n".join(lines) + ("\n" if lines else ""), len(lines)
+
+
 def is_time_sensitive(message: str) -> bool:
     """True if a question plausibly needs current/external facts to answer well.
 
@@ -4177,7 +4423,7 @@ class Agent:
         """Assemble [system, trimmed history, user]. This prefix is never cut later."""
         system = {
             "role": "system",
-            "content": build_agent_system_prompt(self.config.system_prompt, self.registry),
+            "content": build_agent_system_prompt(self.config.system_prompt_with_identity, self.registry),
         }
         user = {"role": "user", "content": user_message}
         return trim_to_context(
@@ -4792,7 +5038,7 @@ class Agent:
             yield {"type": "phase", "label": "writing the answer"}
             joined = "\n".join(notes) or "(no relevant content found)"
             reduce_messages = [
-                {"role": "system", "content": self.config.system_prompt},
+                {"role": "system", "content": self.config.system_prompt_with_identity},
                 {"role": "user", "content":
                     f"Request: {hint}\n\nNotes gathered from the full input, in order:\n"
                     f"{joined}\n\nNow give the complete answer to the request in plain text."},
@@ -4992,7 +5238,7 @@ class Agent:
                     yield {"type": "phase", "label": "writing the answer"}
                     joined = "\n".join(notes)
                     final_messages = [
-                        {"role": "system", "content": self.config.system_prompt},
+                        {"role": "system", "content": self.config.system_prompt_with_identity},
                         {"role": "user", "content":
                             f"{user_message}\n\nYou worked through this and reached these "
                             f"conclusions:\n{joined}\n\nNow give the complete final answer "
@@ -5327,7 +5573,7 @@ class Agent:
         # always closes cleanly.
         summary = self.running_summary(scratch)
         final_messages = [
-            {"role": "system", "content": self.config.system_prompt},
+            {"role": "system", "content": self.config.system_prompt_with_identity},
             {"role": "user", "content":
                 f"{user_message}\n\nWork so far:\n{summary}\n\n"
                 "Give your best final answer now in plain text. Do not call any tool."},
@@ -6234,6 +6480,28 @@ HTML_PAGE = r"""
 
        <h3>Model server log</h3>
        <div id="modelLog" class="logbox">loading...</div>
+     </div>
+
+     <div class="panel">
+       <h3 data-tip="How reusable your collected data is for training this or any future model.">Training data</h3>
+       <div id="datasetStats" class="logbox" style="max-height:none">loading...</div>
+       <div class="hint">
+         Your feedback is stored as portable data, not tied to the current model.
+         Export it to train this assistant now, or any model later. Approved
+         answers become examples to imitate; rejected ("no, wrong") answers and
+         your corrections become preference pairs for DPO-style tuning.
+       </div>
+       <label style="display:block;font-size:12px;color:#999;margin:10px 0 4px">Export format</label>
+       <div class="row" style="flex-wrap:wrap;gap:6px">
+         <button onclick="exportDataset('chat')" data-tip="Chat messages WITH this assistant's system prompt. Trains a model to be this assistant. Used by the built-in LoRA loop." title="Export chat JSONL">Chat (this assistant)</button>
+         <button onclick="exportDataset('bare')" data-tip="Chat messages with NO system prompt. Model-neutral: train a different base model or persona." title="Export bare JSONL">Bare Q&amp;A (any model)</button>
+         <button onclick="exportDataset('preference')" data-tip="{prompt, chosen, rejected} pairs from corrections and good/bad answers. For DPO-style preference tuning later." title="Export preference pairs">Preference pairs (DPO)</button>
+         <button onclick="exportDataset('raw')" data-tip="Every column as JSONL. A lossless archive you can reshape into any format in the future." title="Export raw archive">Raw archive</button>
+       </div>
+       <div class="row" style="margin-top:8px">
+         <label class="agent-toggle" data-tip="Only export rows you have marked reviewed. Curated data trains better on any model."><input id="exportReviewedOnly" type="checkbox"> reviewed only</label>
+         <button onclick="loadDatasetStats()" data-tip="Refresh the dataset counts." title="Refresh stats">Refresh</button>
+       </div>
      </div>
    </div>
 
@@ -7587,7 +7855,49 @@ HTML_PAGE = r"""
 
    // ------------------------------------------------------------ models ---
 
+   async function loadDatasetStats() {
+     var box = document.getElementById("datasetStats");
+     if (!box) return;
+     try {
+       var s = await fetchJSON("/api/dataset/stats");
+       var bySource = Object.keys(s.by_source || {})
+         .map(function(k) { return k + ": " + s.by_source[k]; }).join(", ") || "none";
+       box.textContent =
+         "Total examples:       " + s.total + "\\n" +
+         "Approved (to imitate): " + s.approved + "\\n" +
+         "Rejected (bad answers): " + s.rejected + "\\n" +
+         "Corrections:          " + s.corrected + "\\n" +
+         "Preference pairs:     " + s.preference_pairs + "\\n" +
+         "Reviewed (curated):   " + s.reviewed + "\\n" +
+         "By source:            " + bySource;
+     } catch (err) {
+       box.textContent = "Could not load dataset stats: " + err.message;
+     }
+   }
+
+   async function exportDataset(format) {
+     var reviewed = document.getElementById("exportReviewedOnly");
+     var url = "/api/dataset/export?format=" + encodeURIComponent(format)
+       + "&reviewed_only=" + (reviewed && reviewed.checked ? "true" : "false");
+     try {
+       var resp = await fetch(url);
+       if (!resp.ok) throw new Error("HTTP " + resp.status);
+       var count = resp.headers.get("X-Example-Count") || "?";
+       var text = await resp.text();
+       var blob = new Blob([text], { type: "application/x-ndjson" });
+       var a = document.createElement("a");
+       a.href = URL.createObjectURL(blob);
+       a.download = "dataset_" + format + ".jsonl";
+       document.body.appendChild(a); a.click(); a.remove();
+       URL.revokeObjectURL(a.href);
+       alert(count + " examples exported as " + format + " (also saved to data/exports/).");
+     } catch (err) {
+       alert("Export failed: " + err.message);
+     }
+   }
+
    async function loadModels() {
+     loadDatasetStats();
      try {
        var out = await fetchJSON("/api/models");
        var current = out.data.current;
@@ -7811,7 +8121,7 @@ def create_app(
     """Create and configure the FastAPI application with Pydantic validation."""
     from fastapi import FastAPI, Query
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, Response
 
     _define_api_models()
 
@@ -7907,6 +8217,38 @@ def create_app(
         success = db.delete_feedback(feedback_id)
         return {"deleted": success}
 
+    @app.post("/api/feedback/{feedback_id}/reviewed")
+    def set_reviewed(feedback_id: int, reviewed: bool = True):
+        return {"updated": db.set_reviewed(feedback_id, reviewed)}
+
+    @app.get("/api/dataset/stats")
+    def dataset_stats():
+        return db.dataset_stats()
+
+    @app.get("/api/dataset/export")
+    def dataset_export(
+        format: str = Query("chat", pattern="^(chat|bare|preference|raw)$"),
+        approved_only: bool = True,
+        reviewed_only: bool = False,
+    ):
+        # For preference/raw we need rejected rows too, so don't force approved.
+        want_approved = approved_only and format in ("chat", "bare")
+        rows = db.export_rows(approved_only=want_approved, reviewed_only=reviewed_only)
+        text, count = build_reusable_dataset(rows, format, config.system_prompt_with_identity)
+        EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        ext = "jsonl"
+        path = EXPORTS_DIR / f"dataset_{format}.{ext}"
+        path.write_text(text, encoding="utf-8")
+        filename = f"dataset_{format}.{ext}"
+        return Response(
+            content=text,
+            media_type="application/x-ndjson",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Example-Count": str(count),
+            },
+        )
+
     def not_ready() -> JSONResponse | None:
         if retrain_manager.status.get("running"):
             return JSONResponse(content={"error": "Retraining in progress. Please wait."}, status_code=503)
@@ -7929,6 +8271,40 @@ def create_app(
         temperature = config.temperature if request.temperature is None else request.temperature
         return max_tokens, temperature
 
+    def note_implicit_feedback(conversation_id: str, message: str) -> str | None:
+        """Turn a short "good job" / "no, wrong" into feedback on the prior answer.
+
+        Praise stores the previous (prompt, answer) pair as an approved training
+        example; a rejection stores it as a bad answer (rating -1, not approved),
+        which is excluded from LoRA training but kept for future preference
+        tuning. Returns a short label for a UI notice, or None.
+        """
+        sign = classify_implicit_feedback(message)
+        if sign is None:
+            return None
+        rows = db.get_messages(conversation_id, limit=6)
+        prompt = answer = None
+        for i in range(len(rows) - 1, -1, -1):
+            if rows[i]["role"] == "assistant" and rows[i]["content"].strip():
+                answer = rows[i]["content"]
+                for j in range(i - 1, -1, -1):
+                    if rows[j]["role"] == "user":
+                        prompt = rows[j]["content"]
+                        break
+                break
+        if not prompt or not answer:
+            return None
+        try:
+            db.record_feedback(prompt, answer, rating=sign,
+                               approved=1 if sign > 0 else 0,
+                               session_id="implicit", model_id=config.model,
+                               source="implicit")
+        except Exception as exc:
+            log(f"implicit feedback not recorded: {exc}", logging.DEBUG)
+            return None
+        return "approved the previous answer for training" if sign > 0 else \
+               "marked the previous answer as a bad example"
+
     @app.post("/api/chat")
     async def chat(request: ChatRequest):
         start_time = time.time()
@@ -7949,6 +8325,7 @@ def create_app(
 
         # Recorded before generating, so a failed or empty run still leaves the
         # question in the transcript instead of silently dropping the turn.
+        note_implicit_feedback(conversation_id, request.message)
         db.add_message(conversation_id, "user", request.message)
         tasks.note_chat_activity()
         tasks.chat_in_flight += 1
@@ -7982,7 +8359,7 @@ def create_app(
                     db.log_metric("chat", (time.time() - start_time) * 1000, 502, error)
                     return JSONResponse(content={"error": error}, status_code=502)
             else:
-                system = {"role": "system", "content": config.system_prompt}
+                system = {"role": "system", "content": config.system_prompt_with_identity}
                 user = {"role": "user", "content": request.message}
                 messages, _ = trim_to_context(
                     system, history, user, config.context_size, max_tokens
@@ -8048,6 +8425,11 @@ def create_app(
             tasks.chat_in_flight += 1
             try:
                 yield await sse({"type": "start", "conversation_id": conversation_id, "agent": use_agent})
+                # Turn a short "good job" / "no, wrong" into feedback on the
+                # prior answer before recording this message as the new turn.
+                fb_label = await asyncio.to_thread(note_implicit_feedback, conversation_id, request.message)
+                if fb_label:
+                    yield await sse({"type": "notice", "info": True, "message": fb_label})
                 await asyncio.to_thread(db.add_message, conversation_id, "user", request.message)
                 if use_agent:
                     async for event in agent.run(
@@ -8070,7 +8452,7 @@ def create_app(
                                 conversation_id=conversation_id,
                             )
                 else:
-                    system = {"role": "system", "content": config.system_prompt}
+                    system = {"role": "system", "content": config.system_prompt_with_identity}
                     user = {"role": "user", "content": request.message}
                     messages, dropped = trim_to_context(
                         system, history, user, config.context_size, max_tokens
@@ -8353,8 +8735,9 @@ def create_app(
 
         db.execute(
             """INSERT INTO feedback
-               (user_prompt, assistant_response, rating, corrected_response, approved_for_training, session_id, model_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               (user_prompt, assistant_response, rating, corrected_response,
+                approved_for_training, session_id, model_id, source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'button')""",
             (
                 request.user_prompt,
                 request.assistant_response,
@@ -8792,6 +9175,52 @@ def selftest() -> int:
         failures.append("chunk_text produced an oversized chunk")
     if chunk_text("short", 6000, 600) != ["short"]:
         failures.append("chunk_text split a short string")
+
+    # Identity is prepended to the system prompt and disappears when cleared.
+    _idcfg = Config(identity="You are TestBot.")
+    if not _idcfg.system_prompt_with_identity.startswith("You are TestBot."):
+        failures.append("identity not prepended to system prompt")
+    if _idcfg.system_prompt not in _idcfg.system_prompt_with_identity:
+        failures.append("identity prefix dropped the base system prompt")
+    _noid = Config(identity="")
+    if _noid.system_prompt_with_identity != _noid.system_prompt:
+        failures.append("empty identity should leave the system prompt unchanged")
+    if "identity" not in Config.MUTABLE or "train_min_examples" not in Config.MUTABLE:
+        failures.append("identity/train_min_examples not live-editable")
+
+    # Reusable dataset export: formats behave and stay model-portable.
+    _rows = [
+        {"user_prompt": "q1", "assistant_response": "a-good", "corrected_response": None,
+         "rating": 1, "approved_for_training": 1, "source": "button"},
+        {"user_prompt": "q2", "assistant_response": "a-bad", "corrected_response": "a-fixed",
+         "rating": -1, "approved_for_training": 0, "source": "button"},
+    ]
+    _chat, _n = build_reusable_dataset(_rows, "chat", "SYS")
+    if '"role": "system"' not in _chat or "SYS" not in _chat:
+        failures.append("chat export missing system prompt")
+    _bare, _ = build_reusable_dataset(_rows, "bare", "SYS")
+    if "SYS" in _bare or '"role": "user"' not in _bare:
+        failures.append("bare export should be model-neutral (no system prompt)")
+    _pref, _pn = build_reusable_dataset(_rows, "preference", "")
+    if '"chosen": "a-fixed"' not in _pref or '"rejected": "a-bad"' not in _pref:
+        failures.append("preference export did not build a correction pair")
+    _raw, _rn = build_reusable_dataset(_rows, "raw", "")
+    if _rn != 2:
+        failures.append("raw export should be lossless (one line per row)")
+    if "a-bad" in _chat:  # a rejected answer must never be a target to imitate
+        failures.append("chat export leaked a rejected answer as a target")
+
+    # Implicit chat feedback: praise approves, rejection marks bad, prose is None.
+    for _m in ("good job", "perfect, thanks!", "that's exactly right", "nice one", "thanks"):
+        if classify_implicit_feedback(_m) != 1:
+            failures.append(f"implicit feedback should be positive: {_m}")
+    for _m in ("no", "nope", "wrong", "that's wrong", "you're wrong"):
+        if classify_implicit_feedback(_m) != -1:
+            failures.append(f"implicit feedback should be negative: {_m}")
+    for _m in ("no way to do this without a loop?", "no idea, can you explain?",
+               "explain how recursion works", "right now show me the code"):
+        if classify_implicit_feedback(_m) is not None:
+            failures.append(f"implicit feedback false positive: {_m}")
 
     # Time-sensitivity gate: general knowledge stays local, fresh-fact questions
     # are allowed a lookup.
