@@ -3839,6 +3839,34 @@ CODE_NEEDS_LOOKUP = re.compile(
     r"enumeration|privilege escalation|pentest|attack)\b",
     re.I,
 )
+
+# Time-sensitive signal: the same notion the router is told to search on (today's
+# events, prices, scores, the latest version of something, a named current
+# holder). Used to let a single self-issued search through on an answer-routed
+# turn when the question genuinely needs fresh, external facts, while still
+# blocking reflexive searches for general knowledge.
+TIME_SENSITIVE = re.compile(
+    r"\b(today|todays|tonight|yesterday|right now|currently|current|latest|"
+    r"newest|recent|recently|this (?:week|month|year|morning|season)|"
+    r"as of|so far this|"
+    r"price|prices|cost|stock|shares|exchange rate|rate today|"
+    r"news|headline|breaking|score|scores|standings|fixture|"
+    r"weather|forecast|temperature|"
+    r"release|released|version|update|changelog|"
+    r"who is the (?:current|new)|latest version|out yet|release date)\b",
+    re.I,
+)
+
+
+def is_time_sensitive(message: str) -> bool:
+    """True if a question plausibly needs current/external facts to answer well.
+
+    Deliberately errs toward the router's own wording so the gate and the router
+    agree on what 'needs a lookup' means.
+    """
+    return bool(TIME_SENSITIVE.search(message or ""))
+
+
 # Framing words to strip so the search topic is the subject, not "write a python
 # script to ...". Applied only when building a query for a code lookup.
 _CODE_FRAMING = re.compile(
@@ -4842,6 +4870,15 @@ class Agent:
 
             action = decision.get("action")
             tool = None if action == "answer" else self.registry.get(action or "")
+            # When the router chose to answer from the model's own knowledge, do
+            # not honor a lookup tool the model tries to call on its own. The
+            # router already judged no external facts are needed; a self-issued
+            # web_search here is the "searches all the time" leak. Calculator and
+            # the like stay available; only the network lookups are withheld.
+            LOOKUP_TOOLS = {"web_search", "fetch_url"}
+            answer_routed = (action == "answer" and not for_code)
+            answered_retry = False
+            lookup_used = False
             ev = detail(f"router decision: {json.dumps(decision, ensure_ascii=False)[:200]}"
                         + ("" if online else " (offline)"))
             if ev:
@@ -5107,6 +5144,37 @@ class Agent:
                 return
 
             call = parse_tool_call(buffer, known)
+
+            # On an answer-routed turn, a self-issued network lookup is allowed
+            # ONCE, and only when the question is genuinely time-sensitive (the
+            # same signal the router searches on). That lets the model fetch
+            # fresh facts when it truly needs them while still blocking the
+            # reflexive "search everything" behaviour for general knowledge.
+            # parse_tool_call honors an explicit "tool" key regardless of the
+            # allowed set, so the gate must be here, at execution.
+            if (call is not None and answer_routed and call[0] in LOOKUP_TOOLS
+                    and is_time_sensitive(user_message) and not lookup_used):
+                lookup_used = True
+                yield {"type": "notice", "info": True,
+                       "message": "the question looks time-sensitive; allowing one lookup"}
+                # fall through to normal tool execution below
+            elif call is not None and answer_routed and call[0] in LOOKUP_TOOLS:
+                if not answered_retry:
+                    answered_retry = True
+                    yield {"type": "notice", "info": True,
+                           "message": "answering from my own knowledge (no lookup needed)"}
+                    scratch.append({"role": "user", "content":
+                        "Answer the question directly from your own knowledge. "
+                        "Do NOT call any tool and do NOT output JSON; just give the answer."})
+                    continue
+                # It insisted again: force a plain, tool-free answer.
+                nudge = scratch + [{"role": "user", "content":
+                    "Answer in prose from your own knowledge. No tools, no JSON."}]
+                direct_msgs, _ = self.assemble(base, nudge, reserve)
+                direct = await self.resilient_complete(direct_msgs, reserve, temperature)
+                yield done(strip_reasoning(direct).strip()
+                           or "I don't have enough to answer that confidently.", step)
+                return
 
             if call is None:
                 answer = strip_reasoning(buffer).strip()
@@ -8724,6 +8792,17 @@ def selftest() -> int:
         failures.append("chunk_text produced an oversized chunk")
     if chunk_text("short", 6000, 600) != ["short"]:
         failures.append("chunk_text split a short string")
+
+    # Time-sensitivity gate: general knowledge stays local, fresh-fact questions
+    # are allowed a lookup.
+    for _q in ("best way to store cinnamon", "explain how recursion works",
+               "write a python script to sort a list"):
+        if is_time_sensitive(_q):
+            failures.append(f"is_time_sensitive wrongly flagged general knowledge: {_q}")
+    for _q in ("bitcoin price today", "who is the current ceo of openai",
+               "latest version of python", "today's news about AI"):
+        if not is_time_sensitive(_q):
+            failures.append(f"is_time_sensitive missed a time-sensitive query: {_q}")
 
     # ThinkSplitter separates <think> reasoning from the answer, even when a tag
     # is split across streamed tokens.
