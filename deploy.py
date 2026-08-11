@@ -3330,6 +3330,73 @@ THINK_BLOCK = re.compile(r"(?is)<(think|thinking|reasoning)>.*?</\1>")
 OPEN_THINK = re.compile(r"(?is)<(think|thinking|reasoning)>.*\Z")
 
 
+class ThinkSplitter:
+    """Streaming splitter that separates a model's <think> reasoning from its
+    answer as tokens arrive.
+
+    A reasoning model emits <think>...</think> before its answer. We want the
+    reasoning shown live in its own visible "thinking" area, not stripped and
+    hidden and not dumped raw into the answer. Tokens can split a tag across
+    chunk boundaries, so a partial tag at the end of a feed is held over to the
+    next one. feed() returns a list of ("think"|"answer", text) pieces.
+    """
+
+    OPEN = "<think>"
+    CLOSE = "</think>"
+
+    def __init__(self) -> None:
+        self.in_think = False
+        self.carry = ""
+
+    @staticmethod
+    def _prefix_tail(data: str, tag: str) -> int:
+        """Length of a trailing slice of data that is a proper prefix of tag.
+
+        So "...</thi" holds back 4 chars until the rest of </think> arrives.
+        """
+        for size in range(min(len(tag) - 1, len(data)), 0, -1):
+            if tag.startswith(data[-size:]):
+                return size
+        return 0
+
+    def feed(self, text: str) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        data = self.carry + (text or "")
+        self.carry = ""
+        while data:
+            if self.in_think:
+                end = data.find(self.CLOSE)
+                if end == -1:
+                    keep = self._prefix_tail(data, self.CLOSE)
+                    if keep:
+                        self.carry = data[len(data) - keep:]
+                        data = data[:len(data) - keep]
+                    if data:
+                        out.append(("think", data))
+                    data = ""
+                else:
+                    if end:
+                        out.append(("think", data[:end]))
+                    data = data[end + len(self.CLOSE):]
+                    self.in_think = False
+            else:
+                start = data.find(self.OPEN)
+                if start == -1:
+                    keep = self._prefix_tail(data, self.OPEN)
+                    if keep:
+                        self.carry = data[len(data) - keep:]
+                        data = data[:len(data) - keep]
+                    if data:
+                        out.append(("answer", data))
+                    data = ""
+                else:
+                    if start:
+                        out.append(("answer", data[:start]))
+                    data = data[start + len(self.OPEN):]
+                    self.in_think = True
+        return out
+
+
 def strip_reasoning(text: str) -> str:
     """Remove a reasoning model's chain-of-thought block.
 
@@ -3785,6 +3852,58 @@ def is_code_request(message: str) -> bool:
 # Result lines from _web_search look like "N. Title\n   URL\n   snippet". Pull
 # the result URLs in order so the retrieval pipeline can fetch the top ones.
 _RESULT_URL = re.compile(r"^\s*(https?://\S+)\s*$", re.M)
+
+
+# Aggregator, listing and JS-shell URLs whose fetched HTML is mostly navigation
+# and script, not article text. Extracting from them wastes a fetch-and-read
+# cycle and, on 8GB, the junk-filled prompt is what stalls. Skip them and use the
+# next result (or the search snippet) instead.
+_LOW_VALUE_HOST = re.compile(
+    r"(?:^|\.)(?:news\.google\.|news\.yahoo\.|flipboard\.|reddit\.com|"
+    r"twitter\.com|x\.com|facebook\.com|pinterest\.|quora\.com)", re.I)
+_LOW_VALUE_PATH = re.compile(
+    r"/(?:category|categories|tag|tags|topics?|section|sections|feed|feeds|"
+    r"latest|trending|search|archive)(?:/|$|\?)", re.I)
+
+
+def is_low_value_url(url: str) -> bool:
+    """True for aggregator/listing/JS-shell pages unlikely to yield article text."""
+    try:
+        from urllib.parse import urlparse
+        parts = urlparse(url)
+    except Exception:
+        return False
+    host = parts.netloc.lower()
+    path = parts.path or "/"
+    if _LOW_VALUE_HOST.search(host):
+        return True
+    if _LOW_VALUE_PATH.search(path):
+        return True
+    # A bare domain root (no real path) is a homepage/shell, not an article.
+    if path in ("", "/") and not parts.query:
+        return True
+    return False
+
+
+def extractable_text_len(page: str) -> int:
+    """Rough count of article-like text in a fetched page (already tag-stripped).
+
+    Aggregator shells strip down to a pile of short link fragments; a real
+    article has long prose lines. Count characters only from lines that read like
+    prose (long, or sentence-punctuated) so a wall of two-word nav links scores
+    near zero even when the raw length is large.
+    """
+    total = 0
+    for line in (page or "").splitlines():
+        line = line.strip()
+        if len(line) >= 60 or (len(line) >= 30 and any(c in line for c in ".!?")):
+            total += len(line)
+    return total
+
+
+def is_thin_page(page: str, min_chars: int = 400) -> bool:
+    """True if a fetched page has too little real prose to be worth extracting."""
+    return extractable_text_len(page) < min_chars
 
 
 def top_result_urls(search_text: str, limit: int) -> list[str]:
@@ -4252,9 +4371,22 @@ class Agent:
                 # sources and answer. Memory stays flat (one page at a time), the
                 # work is visible as steps, and the model compares before it
                 # answers.
-                urls = top_result_urls(result, self.config.auto_fetch_results)
+                # Pull extra candidates so that skipping aggregator/thin pages
+                # still leaves enough good sources to reach auto_fetch_results.
+                want = self.config.auto_fetch_results
+                candidates = top_result_urls(result, want + 4)
                 source_notes: list[str] = []
-                for idx, url in enumerate(urls, 1):
+                good = 0
+                idx = 0
+                for url in candidates:
+                    if good >= want:
+                        break
+                    # Skip listing/aggregator/JS-shell URLs before spending a
+                    # fetch on them; their HTML is navigation, not article text.
+                    if is_low_value_url(url):
+                        yield {"type": "notice", "info": True,
+                               "message": f"skipping a listing/aggregator page: {url[:60]}"}
+                        continue
                     signature = "fetch_url:" + json.dumps({"url": url}, sort_keys=True,
                                                           ensure_ascii=False, default=str)
                     if signature in seen_calls:
@@ -4269,14 +4401,24 @@ class Agent:
                     seen_calls.append(signature)
                     if page_err:
                         continue  # a dead link is not fatal; the snippets remain
+                    # If the fetched page is mostly markup/nav with little prose,
+                    # treat it as a failed fetch: do not extract from it and do
+                    # not let it into the synthesis prompt (empty extractions plus
+                    # a junk-filled context are exactly what stalls on 8GB).
+                    if is_thin_page(page):
+                        yield {"type": "notice", "info": True,
+                               "message": f"source had little readable text, skipping: {url[:60]}"}
+                        continue
                     trace.append({"name": "fetch_url", "args": {"url": url},
                                   "result": page[:1000], "error": None})
+                    good += 1
+                    idx = good
                     page_budget = min(budget, self.config.auto_fetch_char_cap)
                     page_text, _ = await self.compress_tool_result(
                         "fetch_url", page[:self.config.auto_fetch_char_cap * 4], page_budget)
                     # Extraction pass, streamed and time-capped like a reasoning
                     # step so it never wedges and is visible as it works.
-                    yield {"type": "reason_step", "step": idx, "total": len(urls),
+                    yield {"type": "reason_step", "step": idx, "total": want,
                            "label": f"reading source {idx}: {url[:70]}"}
                     extract_messages = [
                         {"role": "system", "content":
@@ -4455,6 +4597,9 @@ class Agent:
 
             action = decision.get("action")
             tool = None if action == "answer" else self.registry.get(action or "")
+            if action == "answer" and not scratch:
+                yield {"type": "notice", "info": True,
+                       "message": "decided to answer from my own knowledge"}
 
             if tool is not None and tool.routable:
                 # Generic execution for any routable tool. Terminal tools (a
@@ -4508,8 +4653,9 @@ class Agent:
                 yield {"type": "phase", "label": "planning the approach"}
                 steps = await self.plan_steps(user_message)
                 if len(steps) >= 2:
-                    yield {"type": "notice", "message": f"working through this in "
-                           f"{len(steps)} steps", "info": True}
+                    plan_lines = "; ".join(f"{i}) {st}" for i, st in enumerate(steps, 1))
+                    yield {"type": "notice", "info": True,
+                           "message": f"plan ({len(steps)} steps): {plan_lines[:400]}"}
                     notes: list[str] = []
                     for i, sub in enumerate(steps, 1):
                         if cancel is not None and cancel.is_set():
@@ -4625,13 +4771,23 @@ class Agent:
                     ctx_reserve = min(self.config.context_size - 256, int(ctx_reserve * 1.6))
                     messages, _ = self.assemble(base, scratch, ctx_reserve)
                 stream = self.client.stream(messages, gen_reserve, step_temperature, stats)
+                # Split the model's <think> reasoning from its answer as it
+                # streams, so the reasoning shows in its own visible thinking
+                # area instead of being hidden or dumped raw into the answer.
+                splitter = ThinkSplitter()
                 try:
                     async for token in stream:
                         if cancel is not None and cancel.is_set():
                             cancelled = True
                             break
                         buffer += token
-                        yield {"type": "token", "token": token, "step": step}
+                        for kind, piece in splitter.feed(token):
+                            if not piece:
+                                continue
+                            if kind == "think":
+                                yield {"type": "think_token", "token": piece, "step": step}
+                            else:
+                                yield {"type": "token", "token": piece, "step": step}
                         visible = strip_reasoning(buffer).lstrip()
                         if visible.startswith(("{", "```")) and parse_tool_call(buffer, known):
                             break
@@ -5398,6 +5554,10 @@ HTML_PAGE = r"""
    .gnode.reason::before { border-color: var(--accent); }
    .gnode.reason .gbody { color: #b9c2cc; max-height: 160px; }
    .gnode.reason.done::before { border-color: var(--success); background: var(--success); }
+   .gnode.thinking::before { border-color: #8a8f94; }
+   .gnode.thinking .gtool { color: #9aa0a6; }
+   .gnode.thinking .gbody { color: #9aa0a6; font-style: italic; max-height: 200px; }
+   .gnode.thinking:not(.open) .gbody { display: none; }
    .feedback {
      align-self: flex-start;
      display: flex;
@@ -6015,6 +6175,32 @@ HTML_PAGE = r"""
      return { node: node, pill: pill, body: body };
    }
 
+   function traceThinking(t) {
+     if (t.thinking) return t.thinking;
+     var node = document.createElement("div");
+     node.className = "gnode thinking open";
+     var head = document.createElement("div");
+     head.className = "ghead";
+     var tag = document.createElement("span");
+     tag.className = "gtool";
+     tag.textContent = "thinking";
+     var caret = document.createElement("span");
+     caret.className = "gcaret";
+     caret.textContent = "\u25b8";
+     head.appendChild(tag);
+     head.appendChild(caret);
+     var body = document.createElement("pre");
+     body.className = "gbody";
+     body.textContent = "";
+     node.appendChild(head);
+     node.appendChild(body);
+     head.onclick = function() { node.classList.toggle("open"); };
+     t.trace.appendChild(node);
+     scrollDown();
+     t.thinking = { node: node, body: body };
+     return t.thinking;
+   }
+
    function traceReasonStep(t, step, total, label) {
      var node = document.createElement("div");
      node.className = "gnode reason";
@@ -6203,7 +6389,18 @@ HTML_PAGE = r"""
            if (trace.answer && trace.answer.node.classList.contains("pending")) {
              trace.answer.text.textContent = "";
            }
+         } else if (event.type === "think_token") {
+           traceThinking(trace).body.textContent += event.token;
+           bumpActivity(trace);
+           setActivity(trace, "thinking\u2026");
+           scrollDown();
          } else if (event.type === "token") {
+           // First answer token: the thinking phase is over, collapse it so the
+           // answer is the focus but the reasoning stays one click away.
+           if (trace.thinking && !trace.thinking.done) {
+             trace.thinking.done = true;
+             trace.thinking.node.classList.remove("open");
+           }
            traceAnswer(trace).text.textContent += event.token;
            bumpActivity(trace);
            setActivity(trace, "generating\u2026");
@@ -6228,6 +6425,7 @@ HTML_PAGE = r"""
              trace.tool = null;
            }
            trace.answer = null;
+           trace.thinking = null;
            setActivity(trace, "thinking\u2026");
          } else if (event.type === "notice") {
            traceNotice(trace, event.message || "", !!event.info);
@@ -7474,7 +7672,7 @@ def create_app(
             tasks.chat_in_flight += 1
             try:
                 yield await sse({"type": "start", "conversation_id": conversation_id, "agent": use_agent})
-                db.add_message(conversation_id, "user", request.message)
+                await asyncio.to_thread(db.add_message, conversation_id, "user", request.message)
                 if use_agent:
                     async for event in agent.run(
                         request.message, history, conversation_id, max_tokens, temperature
@@ -7484,7 +7682,8 @@ def create_app(
                             answer = event["answer"]
                             trace = event.get("trace", [])
                         elif event["type"] == "usage":
-                            db.log_metric(
+                            await asyncio.to_thread(
+                                db.log_metric,
                                 "agent_step", event["total_ms"], 200,
                                 stats=GenerationStats(
                                     prompt_tokens=event["prompt_tokens"],
@@ -7504,24 +7703,31 @@ def create_app(
                         yield await sse({"type": "context", "dropped": dropped,
                                          "tokens": messages_tokens(messages)})
                     plain_stats = GenerationStats()
+                    # Accumulate tokens in a list and join once: repeated string
+                    # concatenation in a hot loop is O(n^2) and drags on long replies.
+                    answer_parts: list[str] = []
                     async for token in model_client.stream(
                         messages, max_tokens, temperature, plain_stats
                     ):
-                        answer += token
+                        answer_parts.append(token)
                         yield await sse({"type": "token", "token": token, "step": 1})
+                    answer = "".join(answer_parts)
                     yield await sse({"type": "usage", "step": 1, **plain_stats.as_event()})
-                    db.log_metric(
+                    await asyncio.to_thread(
+                        db.log_metric,
                         "chat_stream_gen", plain_stats.total_ms, 200, stats=plain_stats,
                         model=config.model, step=1, conversation_id=conversation_id,
                     )
                     yield await sse({"type": "final", "answer": answer, "steps": 1, "trace": []})
 
                 if answer:
-                    db.add_message(
+                    await asyncio.to_thread(
+                        db.add_message,
                         conversation_id, "assistant", answer,
                         meta={"trace": trace} if trace else None,
                     )
-                db.log_metric("chat_stream", (time.time() - start_time) * 1000, 200)
+                await asyncio.to_thread(
+                    db.log_metric, "chat_stream", (time.time() - start_time) * 1000, 200)
             except Exception as exc:
                 db.log_metric("chat_stream", (time.time() - start_time) * 1000, 503, str(exc))
                 yield await sse({"type": "error", "error": str(exc)})
@@ -8210,6 +8416,34 @@ def selftest() -> int:
         failures.append("chunk_text produced an oversized chunk")
     if chunk_text("short", 6000, 600) != ["short"]:
         failures.append("chunk_text split a short string")
+
+    # ThinkSplitter separates <think> reasoning from the answer, even when a tag
+    # is split across streamed tokens.
+    _sp = ThinkSplitter()
+    _pieces = []
+    for _tok in ["<thi", "nk>weigh", "ing it</thi", "nk>Answer."]:
+        _pieces += _sp.feed(_tok)
+    _think = "".join(c for k, c in _pieces if k == "think")
+    _ans = "".join(c for k, c in _pieces if k == "answer")
+    if _think != "weighing it" or _ans != "Answer.":
+        failures.append(f"ThinkSplitter mis-split across tokens: {_think!r} / {_ans!r}")
+    _sp2 = ThinkSplitter()
+    if any(k == "think" for k, _ in _sp2.feed("a plain answer")):
+        failures.append("ThinkSplitter invented a think block")
+
+    # Retrieval guards: skip aggregator/listing/shell URLs and thin pages.
+    for u in ("https://news.google.com/topics/abc", "https://techcrunch.com/category/ai/",
+              "https://www.exploit-db.com/", "https://reddit.com/r/x"):
+        if not is_low_value_url(u):
+            failures.append(f"is_low_value_url missed {u}")
+    for u in ("https://en.wikipedia.org/wiki/Transformer",
+              "https://arstechnica.com/ai/2026/08/real-article/"):
+        if is_low_value_url(u):
+            failures.append(f"is_low_value_url wrongly flagged {u}")
+    if not is_thin_page("\n".join(["Home", "News", "Login"] * 30)):
+        failures.append("is_thin_page missed a navigation shell")
+    if is_thin_page("A substantial article sentence with real prose content here. " * 8):
+        failures.append("is_thin_page wrongly flagged an article")
 
     # The retrieval pipeline extracts the top result URLs from a search block.
     _sample = "1. A\n   https://a.com/x\n   s\n2. B\n   https://b.com/y\n   s"
