@@ -6854,6 +6854,11 @@ HTML_PAGE = r"""
          <button onclick="exportDataset('preference')" data-tip="{prompt, chosen, rejected} pairs from corrections and good/bad answers. For DPO-style preference tuning later." title="Export preference pairs">Preference pairs (DPO)</button>
          <button onclick="exportDataset('raw')" data-tip="Every column as JSONL. A lossless archive you can reshape into any format in the future." title="Export raw archive">Raw archive</button>
        </div>
+       <div class="row" style="margin-top:8px">
+         <label class="agent-toggle" data-tip="Only export rows you have marked reviewed. Curated data trains better on any model."><input id="exportReviewedOnly" type="checkbox"> reviewed only</label>
+         <button onclick="loadDatasetStats()" data-tip="Refresh the dataset counts." title="Refresh stats">Refresh</button>
+       </div>
+     </div>
      <div class="panel">
        <h3 data-tip="The local codebase the agent reads and edits in place. Review here before you push.">Codebase</h3>
        <label style="display:block;font-size:12px;color:#999;margin:4px 0 4px">Project directory (PROJECT_DIR)</label>
