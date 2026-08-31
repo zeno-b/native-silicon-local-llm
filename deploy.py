@@ -487,6 +487,44 @@ class Database:
                 ON feedback(created_at)
             """)
             conn.execute("""
+                CREATE TABLE IF NOT EXISTS conversation_meta (
+                    conversation_id TEXT PRIMARY KEY,
+                    title TEXT,
+                    pinned INTEGER DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS prompts (
+                    name TEXT PRIMARY KEY,
+                    body TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS documents (
+                    id INTEGER PRIMARY KEY,
+                    path TEXT UNIQUE,
+                    title TEXT,
+                    chars INTEGER,
+                    chunks INTEGER,
+                    indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            # FTS5 gives real ranked (BM25) retrieval with no extra dependency and
+            # no embedding model, which matters on an 8GB machine where a second
+            # model would compete for memory with the LLM itself.
+            try:
+                conn.execute("""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS doc_chunks
+                    USING fts5(path, chunk)
+                """)
+                self.fts_enabled = True
+            except sqlite3.OperationalError as exc:
+                self.fts_enabled = False
+                log(f"Full-text search unavailable ({exc}); knowledge base disabled.",
+                    logging.WARNING)
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS metrics (
                     id INTEGER PRIMARY KEY,
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -698,6 +736,265 @@ class Database:
             "corrected": corrected,
         }
 
+    def index_document(self, path: str, text: str, title: str = "",
+                       chunk_chars: int = 1200, overlap: int = 150) -> int:
+        """Store a document as overlapping chunks for retrieval. Returns chunk count."""
+        if not getattr(self, "fts_enabled", False):
+            return 0
+        self.remove_document(path)
+        chunks = []
+        chunk_chars = max(200, int(chunk_chars or 1200))
+        overlap = min(max(0, int(overlap or 0)), chunk_chars // 2)
+        step = max(100, chunk_chars - overlap)
+        for start in range(0, max(1, len(text)), step):
+            piece = text[start:start + chunk_chars].strip()
+            if piece:
+                chunks.append(piece)
+        for piece in chunks:
+            self.execute("INSERT INTO doc_chunks (path, chunk) VALUES (?, ?)", (path, piece))
+        self.execute(
+            "INSERT OR REPLACE INTO documents (path, title, chars, chunks) VALUES (?, ?, ?, ?)",
+            (path, title or Path(path).name, len(text), len(chunks)))
+        self.commit()
+        return len(chunks)
+
+    def remove_document(self, path: str) -> None:
+        if not getattr(self, "fts_enabled", False):
+            return
+        self.execute("DELETE FROM doc_chunks WHERE path = ?", (path,))
+        self.execute("DELETE FROM documents WHERE path = ?", (path,))
+        self.commit()
+
+    def search_documents(self, query: str, limit: int = 5, only: list[str] | None = None) -> list[dict]:
+        """BM25-ranked chunk search. Returns [{path, chunk}] best first."""
+        if not getattr(self, "fts_enabled", False):
+            return []
+        # FTS5 treats punctuation as syntax; reduce the query to bare terms and
+        # OR them so a natural-language question still matches.
+        terms = [t for t in re.findall(r"[A-Za-z0-9_]+", query or "") if len(t) > 2]
+        if not terms:
+            return []
+        expr = " OR ".join(terms[:12])
+        sql = "SELECT path, chunk FROM doc_chunks WHERE doc_chunks MATCH ?"
+        params: list[Any] = [expr]
+        if only:
+            # Scope retrieval to chosen documents ("chat with this document").
+            sql += " AND path IN (" + ",".join("?" for _ in only) + ")"
+            params.extend(only)
+        sql += " ORDER BY rank LIMIT ?"
+        params.append(limit)
+        try:
+            rows = self.execute(sql, tuple(params)).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [{"path": r["path"], "chunk": r["chunk"]} for r in rows]
+
+    def document_stats(self) -> dict:
+        if not getattr(self, "fts_enabled", False):
+            return {"enabled": False, "documents": 0, "chunks": 0, "items": []}
+        rows = self.execute(
+            "SELECT path, title, chars, chunks, indexed_at FROM documents ORDER BY indexed_at DESC"
+        ).fetchall()
+        items = [dict(r) for r in rows]
+        return {"enabled": True, "documents": len(items),
+                "chunks": sum(int(i["chunks"] or 0) for i in items), "items": items[:50]}
+
+    def clear_documents(self) -> int:
+        if not getattr(self, "fts_enabled", False):
+            return 0
+        n = self.execute("SELECT COUNT(*) AS c FROM documents").fetchone()["c"]
+        self.execute("DELETE FROM doc_chunks")
+        self.execute("DELETE FROM documents")
+        self.commit()
+        return int(n or 0)
+
+    def search_conversations(self, query: str, limit: int = 30) -> list[dict]:
+        """Find conversations containing a phrase, newest first, with a snippet."""
+        # Escape LIKE wildcards so searching for "%" or "_" looks for those
+        # characters instead of matching every conversation.
+        safe = (query or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = f"%{safe}%"
+        rows = self.execute(
+            """SELECT conversation_id, role, content, MAX(created_at) AS created_at
+               FROM messages WHERE content LIKE ? ESCAPE '\\'
+               GROUP BY conversation_id ORDER BY created_at DESC LIMIT ?""",
+            (like, limit)).fetchall()
+        out = []
+        for r in rows:
+            content = r["content"] or ""
+            idx = content.lower().find(query.lower())
+            start = max(0, idx - 60)
+            snippet = ("..." if start else "") + content[start:start + 200].strip()
+            out.append({"conversation_id": r["conversation_id"], "role": r["role"],
+                        "snippet": snippet, "created_at": r["created_at"]})
+        return out
+
+    def export_conversation(self, conversation_id: str, fmt: str = "markdown") -> str:
+        rows = self.get_messages(conversation_id, limit=10000)
+        if not rows:
+            raise ValueError(f"conversation {conversation_id!r} has no messages to export")
+        if fmt == "json":
+            return json.dumps([dict(r) for r in rows], indent=2, default=str)
+        lines = [f"# Conversation {conversation_id}", ""]
+        for r in rows:
+            who = "You" if r["role"] == "user" else "Assistant"
+            lines.append(f"## {who}")
+            lines.append((r["content"] or "").strip())
+            lines.append("")
+        return "\n".join(lines)
+
+    def save_prompt(self, name: str, body: str) -> None:
+        if not (name or "").strip():
+            raise ValueError("a prompt needs a name")
+        if not (body or "").strip():
+            raise ValueError("a prompt needs a body")
+        self.execute(
+            "INSERT OR REPLACE INTO prompts (name, body, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+            (name.strip(), body))
+        self.commit()
+
+    def list_prompts(self) -> list[dict]:
+        return [dict(r) for r in self.execute(
+            "SELECT name, body, updated_at FROM prompts ORDER BY name ASC").fetchall()]
+
+    def delete_prompt(self, name: str) -> bool:
+        cur = self.execute("DELETE FROM prompts WHERE name = ?", (name,))
+        self.commit()
+        return cur.rowcount > 0
+
+    def drop_last_exchange(self, conversation_id: str) -> str | None:
+        """Remove the last assistant reply (and return the user prompt that led to
+        it) so the turn can be regenerated."""
+        rows = self.get_messages(conversation_id, limit=50)
+        if not rows:
+            return None
+        last_user = None
+        to_delete = []
+        for r in reversed(rows):
+            if r["role"] == "assistant" and not to_delete:
+                to_delete.append(r["id"])
+                continue
+            if r["role"] == "user":
+                last_user = r["content"]
+                break
+        for mid in to_delete:
+            self.execute("DELETE FROM messages WHERE id = ?", (mid,))
+        self.commit()
+        return last_user
+
+    def export_backup(self) -> dict:
+        """Everything the user created: conversations, prompts, feedback, docs.
+
+        Plain JSON so a backup stays readable and restorable even if the schema
+        moves on. Model weights and adapters are not included; those are large
+        and re-downloadable.
+        """
+        def rows(sql: str) -> list[dict]:
+            try:
+                return [dict(r) for r in self.execute(sql).fetchall()]
+            except sqlite3.OperationalError:
+                return []
+        data = {
+            "version": 1,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "messages": rows("SELECT * FROM messages ORDER BY id ASC"),
+            "conversation_meta": rows("SELECT * FROM conversation_meta"),
+            "prompts": rows("SELECT * FROM prompts"),
+            "feedback": rows("SELECT * FROM feedback ORDER BY id ASC"),
+            "documents": rows("SELECT * FROM documents"),
+        }
+        if getattr(self, "fts_enabled", False):
+            data["doc_chunks"] = rows("SELECT path, chunk FROM doc_chunks")
+        return data
+
+    def import_backup(self, data: dict) -> dict:
+        """Merge a backup back in. Additive: existing rows are left alone and
+        conversations are keyed by their original ids."""
+        counts = {"messages": 0, "prompts": 0, "feedback": 0, "documents": 0}
+        if not isinstance(data, dict):
+            raise ValueError("backup must be a JSON object; got "
+                             f"{type(data).__name__}")
+        version = data.get("version")
+        if version is not None and not isinstance(version, int):
+            raise ValueError("backup 'version' must be a number")
+        if version is not None and version > 1:
+            raise ValueError(f"backup version {version} is newer than this app understands (1)")
+
+        def section(key: str) -> list:
+            value = data.get(key, [])
+            if not isinstance(value, list):
+                log(f"backup section {key!r} is not a list; skipping", logging.WARNING)
+                return []
+            return [row for row in value if isinstance(row, dict)]
+        for msg in section("messages"):
+            try:
+                self.execute(
+                    "INSERT INTO messages (conversation_id, role, content, created_at) "
+                    "VALUES (?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))",
+                    (msg.get("conversation_id"), msg.get("role"), msg.get("content"),
+                     msg.get("created_at")))
+                counts["messages"] += 1
+            except Exception:
+                continue
+        for meta in section("conversation_meta"):
+            try:
+                if meta.get("title"):
+                    self.set_conversation_title(meta["conversation_id"], meta["title"])
+                if meta.get("pinned"):
+                    self.set_conversation_pinned(meta["conversation_id"], True)
+            except Exception:
+                continue
+        for pr in section("prompts"):
+            try:
+                self.save_prompt(pr.get("name", ""), pr.get("body", ""))
+                counts["prompts"] += 1
+            except Exception:
+                continue
+        for fb in section("feedback"):
+            try:
+                self.record_feedback(
+                    fb.get("user_prompt", ""), fb.get("assistant_response", ""),
+                    int(fb.get("rating") or 0), int(fb.get("approved_for_training") or 0),
+                    fb.get("corrected_response"), fb.get("session_id"), fb.get("model_id"),
+                    fb.get("source") or "import")
+                counts["feedback"] += 1
+            except Exception:
+                continue
+        by_path: dict[str, list[str]] = {}
+        for ch in section("doc_chunks"):
+            by_path.setdefault(ch.get("path", ""), []).append(ch.get("chunk", ""))
+        for path, chunks in by_path.items():
+            if not path:
+                continue
+            try:
+                self.index_document(path, "\n\n".join(chunks), Path(path).name)
+                counts["documents"] += 1
+            except Exception:
+                continue
+        self.commit()
+        return counts
+
+    def fork_conversation(self, conversation_id: str, upto_message_id: int | None = None) -> str:
+        """Copy a conversation (optionally only up to a message) into a new one,
+        so you can explore a different direction without losing the original."""
+        existing = self.execute(
+            "SELECT COUNT(*) AS c FROM messages WHERE conversation_id = ?",
+            (conversation_id,)).fetchone()
+        if not existing or not existing["c"]:
+            raise ValueError(f"conversation {conversation_id!r} has no messages to fork")
+        new_id = f"fork-{uuid.uuid4().hex[:10]}"
+        sql = "SELECT role, content FROM messages WHERE conversation_id = ?"
+        params: list[Any] = [conversation_id]
+        if upto_message_id:
+            sql += " AND id <= ?"
+            params.append(upto_message_id)
+        sql += " ORDER BY id ASC"
+        for row in self.execute(sql, tuple(params)).fetchall():
+            self.add_message(new_id, row["role"], row["content"])
+        base = self.conversation_title(conversation_id) or conversation_id[:8]
+        self.set_conversation_title(new_id, f"{base} (fork)"[:120])
+        return new_id
+
     def record_feedback(self, user_prompt: str, assistant_response: str, rating: int,
                         approved: int, corrected: str | None = None,
                         session_id: str | None = None, model_id: str | None = None,
@@ -829,7 +1126,51 @@ class Database:
             "FROM messages GROUP BY conversation_id ORDER BY last_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
-        return [dict(row) for row in rows]
+        out = []
+        for row in rows:
+            item = dict(row)
+            cid = item["conversation_id"]
+            meta = self.execute(
+                "SELECT title, pinned FROM conversation_meta WHERE conversation_id = ?",
+                (cid,)).fetchone()
+            custom = (meta["title"] if meta else None)
+            item["pinned"] = bool(meta["pinned"]) if meta else False
+            if custom:
+                item["title"] = custom
+            else:
+                # Fall back to the first user message as a readable title.
+                first = self.execute(
+                    "SELECT content FROM messages WHERE conversation_id = ? AND role = 'user' "
+                    "ORDER BY id ASC LIMIT 1", (cid,)).fetchone()
+                item["title"] = ((first["content"] or "").strip()[:90] if first else "") or "(no messages)"
+            out.append(item)
+        # Pinned conversations float to the top, newest first within each group.
+        out.sort(key=lambda c: (not c["pinned"], c.get("last_at") or ""), reverse=False)
+        out.sort(key=lambda c: c["pinned"], reverse=True)
+        return out
+
+    def set_conversation_title(self, conversation_id: str, title: str) -> None:
+        self.execute(
+            "INSERT INTO conversation_meta (conversation_id, title, updated_at) "
+            "VALUES (?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(conversation_id) DO UPDATE SET title = excluded.title, "
+            "updated_at = CURRENT_TIMESTAMP",
+            (conversation_id, title.strip()[:120]))
+        self.commit()
+
+    def set_conversation_pinned(self, conversation_id: str, pinned: bool) -> None:
+        self.execute(
+            "INSERT INTO conversation_meta (conversation_id, pinned, updated_at) "
+            "VALUES (?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(conversation_id) DO UPDATE SET pinned = excluded.pinned, "
+            "updated_at = CURRENT_TIMESTAMP",
+            (conversation_id, 1 if pinned else 0))
+        self.commit()
+
+    def conversation_title(self, conversation_id: str) -> str | None:
+        row = self.execute("SELECT title FROM conversation_meta WHERE conversation_id = ?",
+                           (conversation_id,)).fetchone()
+        return row["title"] if row else None
 
     def log_tool_call(
         self,
@@ -1381,6 +1722,41 @@ def scan_js_strings(body: str) -> list[str]:
             if char in ('"', "'", "`"):
                 quote = char
                 quote_line = line
+                index += 1
+                continue
+            if char == "/":
+                # A regex literal. Distinguish it from division by looking at the
+                # previous significant character: after a value (identifier, digit,
+                # closing bracket) a slash is division; otherwise it starts a regex.
+                prev = ""
+                back = index - 1
+                while back >= 0 and body[back] in " \t\n":
+                    back -= 1
+                if back >= 0:
+                    prev = body[back]
+                if prev and (prev.isalnum() or prev in ")]_$"):
+                    index += 1
+                    continue
+                scan = index + 1
+                in_class = False
+                while scan < len(body):
+                    ch = body[scan]
+                    if ch == "\\":
+                        scan += 2
+                        continue
+                    if ch == "\n":
+                        break
+                    if ch == "[":
+                        in_class = True
+                    elif ch == "]":
+                        in_class = False
+                    elif ch == "/" and not in_class:
+                        break
+                    scan += 1
+                if scan < len(body) and body[scan] == "/":
+                    line += body.count("\n", index, scan)
+                    index = scan + 1
+                    continue
             index += 1
             continue
 
@@ -1595,6 +1971,15 @@ class Config:
     # Refuse to fine-tune on fewer than this many approved examples: a tiny set
     # overfits and causes catastrophic forgetting rather than a useful shift.
     train_min_examples: int = field(default_factory=lambda: int(os.environ.get("TRAIN_MIN_EXAMPLES", "16")))
+    # Knowledge base (RAG): when documents are indexed, the best-matching passages
+    # are prepended to the question so answers come from your own material with
+    # citations. Uses SQLite FTS5 (BM25) — no embedding model, so it costs no
+    # extra memory on an 8GB machine. No-op while the index is empty.
+    rag_enabled: bool = field(default_factory=lambda: os.environ.get("RAG_ENABLED", "1") == "1")
+    rag_passages: int = field(default_factory=lambda: int(os.environ.get("RAG_PASSAGES", "4")))
+    # Comma-separated document paths to restrict retrieval to. Empty = search the
+    # whole knowledge base. Set from the UI to "chat with this document".
+    rag_scope: str = field(default_factory=lambda: os.environ.get("RAG_SCOPE", "").strip())
     # Local codebase the file tools read and edit. When empty, tools stay in the
     # sandboxed ./workspace. When set to a project directory, the agent can read
     # and change that project's files in place; you review with git and decide
@@ -1811,6 +2196,7 @@ class Config:
     # here needs a process restart and is rejected by /api/config.
     MUTABLE = (
         "system_prompt", "identity", "train_min_examples", "project_dir",
+        "rag_enabled", "rag_passages", "rag_scope",
         "max_tokens", "temperature", "repetition_penalty",
         "repetition_context_size", "repetition_penalty_enabled", "context_size",
         "history_turns", "agent_enabled", "agent_max_steps",
@@ -1904,6 +2290,10 @@ class Config:
         self.reasoning_step_timeout = min(300, max(10, self.reasoning_step_timeout))
         self.retrieval_deadline = min(600.0, max(15.0, self.retrieval_deadline))
         self.auto_iterate_rounds = min(5, max(0, self.auto_iterate_rounds))
+        self.rag_passages = min(20, max(1, self.rag_passages))
+        # A scope of unusable entries would silently return nothing; normalise it.
+        self.rag_scope = ",".join(
+            part.strip() for part in str(self.rag_scope or "").split(",") if part.strip())
         self.reasoning_tokens = min(2048, max(64, self.reasoning_tokens))
         self.ready_wait_timeout = min(300.0, max(2.0, self.ready_wait_timeout))
         # Ratios kept in sane bands so a bad value cannot break chunking: the
@@ -2960,11 +3350,53 @@ class ToolRegistry:
         ))
         self._add(Tool(
             name="read_file",
-            description="Read a text file from the project directory.",
-            parameters={"path": "file path relative to the workspace"},
+            description=("Read a file from the project directory. Handles text and code, and also "
+                         "previews structured and document types: .csv/.tsv (columns + sample rows), "
+                         ".json (pretty or shape), .ipynb (cells), .pdf and .docx (extracted text if "
+                         "the reader library is installed). Binary files are described, not dumped."),
+            parameters={"path": "file path relative to the project"},
             required=["path"],
             handler=self._read_file,
         ))
+        self._add(Tool(
+            name="file_info",
+            description="Report a file's size, extension, text/binary kind, and line count without dumping its contents.",
+            parameters={"path": "file or directory path relative to the project"},
+            required=["path"],
+            handler=self._file_info,
+        ))
+        if self.db is not None and getattr(self.db, "fts_enabled", False):
+            self._add(Tool(
+                name="index_url",
+                description=(
+                    "Fetch a web page and add it to the knowledge base so it can be searched "
+                    "later without fetching again. Use for documentation you will refer back to."
+                ),
+                parameters={"url": "page to fetch and index"},
+                required=["url"],
+                handler=self._index_url,
+            ))
+            self._add(Tool(
+                name="search_docs",
+                description=(
+                    "Search the indexed knowledge base (documents you have added) and return "
+                    "the most relevant passages with their source paths. Use this to answer "
+                    "questions about the user's own documents instead of guessing."
+                ),
+                parameters={"query": "what to look for", "limit": "max passages (default 5)"},
+                required=["query"],
+                handler=self._search_docs,
+            ))
+            self._add(Tool(
+                name="index_docs",
+                description=(
+                    "Add a file or a whole directory from the project into the knowledge base "
+                    "so it can be searched later. Reads PDFs, docx, csv, notebooks and text."
+                ),
+                parameters={"path": "file or directory to index"},
+                required=["path"],
+                handler=self._index_docs,
+            ))
         self._add(Tool(
             name="write_file",
             description="Create or overwrite a text file in the project directory. Edits happen in place; review with git before pushing.",
@@ -3240,8 +3672,12 @@ class ToolRegistry:
                 compile(src, rel, "exec")
             except SyntaxError as exc:
                 problems.append(f"{rel}:{exc.lineno}: {exc.msg}")
-            except Exception:
-                continue
+            except FileNotFoundError:
+                problems.append(f"{rel}: file disappeared before it could be checked")
+            except (PermissionError, OSError) as exc:
+                problems.append(f"{rel}: could not be read ({exc})")
+            except Exception as exc:
+                problems.append(f"{rel}: could not be checked ({type(exc).__name__}: {exc})")
         return "\n".join(problems)
 
     def git_diff(self, files: list[str] | None = None, limit: int = 40000) -> str:
@@ -3357,18 +3793,288 @@ class ToolRegistry:
 
     def _read_file(self, path: str) -> str:
         target = self._resolve(path)
+        if target.is_dir():
+            raise ValueError(f"{path} is a directory, not a file. Use list_files to see what is inside.")
         if not target.is_file():
             raise ValueError(f"no such file: {path}")
-        return target.read_text(encoding="utf-8", errors="replace")[:self.config.tool_raw_chars]
+        cap = self.config.tool_raw_chars
+        ext = target.suffix.lower()
+        try:
+            if ext == ".ipynb":
+                return self._read_notebook(target, cap)
+            if ext in (".csv", ".tsv"):
+                return self._read_tabular(target, cap, "\t" if ext == ".tsv" else ",")
+            if ext == ".json":
+                return self._read_json(target, cap)
+            if ext == ".pdf":
+                return self._read_pdf(target, cap)
+            if ext in (".docx",):
+                return self._read_docx(target, cap)
+            if ext in (".xlsx", ".xlsm"):
+                return self._read_xlsx(target, cap)
+            if ext in (".yaml", ".yml"):
+                return self._read_yaml(target, cap)
+            if ext == ".toml":
+                return self._read_toml(target, cap)
+            try:
+                raw = target.read_bytes()[:cap * 2]
+            except PermissionError:
+                raise ValueError(f"no permission to read {path}") from None
+            except OSError as exc:
+                raise ValueError(f"could not read {path}: {exc}") from None
+            if b"\x00" in raw[:4096]:
+                kb = target.stat().st_size / 1024
+                return (f"[binary file: {target.name}, {kb:.1f} KB, type {ext or 'unknown'}]. "
+                        "Not shown as text. Use file_info for details.")
+            return raw.decode("utf-8", errors="replace")[:cap]
+        except Exception as exc:
+            # Never fail a read outright: fall back to raw text with a note.
+            try:
+                return (f"[could not parse {ext or 'file'} ({type(exc).__name__}: {exc}); "
+                        "showing raw text]\n\n"
+                        + target.read_text(encoding="utf-8", errors="replace")[:cap])
+            except Exception:
+                raise ValueError(f"could not read {path}: {exc}") from exc
+
+    def _read_notebook(self, target: Path, cap: int) -> str:
+        nb = json.loads(target.read_text(encoding="utf-8", errors="replace"))
+        out = []
+        for i, cell in enumerate(nb.get("cells", [])):
+            kind = cell.get("cell_type", "?")
+            src = "".join(cell.get("source", []))
+            out.append(f"# --- cell {i} [{kind}] ---\n{src}")
+        return (f"[notebook: {len(nb.get('cells', []))} cells]\n\n" + "\n\n".join(out))[:cap]
+
+    def _read_tabular(self, target: Path, cap: int, delim: str) -> str:
+        import csv as _csv
+        rows = []
+        with target.open(newline="", encoding="utf-8", errors="replace") as fh:
+            reader = _csv.reader(fh, delimiter=delim)
+            for i, row in enumerate(reader):
+                rows.append(row)
+                if i >= 50:
+                    break
+        total = sum(1 for _ in target.open(encoding="utf-8", errors="replace"))
+        if not rows:
+            return "[tabular: file is empty]"
+        header = rows[0]
+        preview = "\n".join(delim.join(r) for r in rows[:20])
+        return (f"[tabular: ~{total} rows, {len(header)} columns]\n"
+                f"columns: {', '.join(header)}\n\nfirst rows:\n{preview}")[:cap]
+
+    def _read_json(self, target: Path, cap: int) -> str:
+        text = target.read_text(encoding="utf-8", errors="replace")
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            return (f"[invalid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}; "
+                    "showing raw text]\n\n" + text[:cap])
+        pretty = json.dumps(data, indent=2, ensure_ascii=False)
+        if len(pretty) <= cap:
+            return pretty
+        # Too big: describe the shape instead of dumping.
+        def shape(v, depth=0):
+            if isinstance(v, dict):
+                keys = list(v.keys())[:20]
+                return "{" + ", ".join(f"{k}: {type(v[k]).__name__}" for k in keys) + \
+                       (", ..." if len(v) > 20 else "") + "}"
+            if isinstance(v, list):
+                return f"[{len(v)} items of {type(v[0]).__name__ if v else 'empty'}]"
+            return type(v).__name__
+        return (f"[json too large to show fully; {len(pretty)} chars]\n"
+                f"top-level: {shape(data)}\n\nhead:\n{pretty[:cap - 200]}")
+
+    def _read_pdf(self, target: Path, cap: int) -> str:
+        for mod, fn in (("pypdf", "PdfReader"), ("PyPDF2", "PdfReader")):
+            try:
+                m = __import__(mod)
+                reader = getattr(m, fn)(str(target))
+                text = "\n".join((p.extract_text() or "") for p in reader.pages)
+                return (f"[pdf: {len(reader.pages)} pages]\n\n" + text.strip())[:cap] or \
+                       f"[pdf: {len(reader.pages)} pages, no extractable text (scanned?)]"
+            except ImportError:
+                continue
+            except Exception as exc:
+                return f"[could not extract pdf text: {exc}]"
+        return "[pdf detected but no PDF library installed. `pip install pypdf` to read PDFs.]"
+
+    def _read_docx(self, target: Path, cap: int) -> str:
+        try:
+            import docx  # python-docx
+        except ImportError:
+            return "[docx detected but python-docx not installed. `pip install python-docx` to read.]"
+        try:
+            doc = docx.Document(str(target))
+            text = "\n".join(p.text for p in doc.paragraphs)
+            return (f"[docx: {len(doc.paragraphs)} paragraphs]\n\n" + text.strip())[:cap]
+        except Exception as exc:
+            return f"[could not read docx: {exc}]"
+
+    def _read_xlsx(self, target: Path, cap: int) -> str:
+        try:
+            import openpyxl
+        except ImportError:
+            return "[xlsx detected but openpyxl not installed. `pip install openpyxl` to read.]"
+        try:
+            wb = openpyxl.load_workbook(str(target), read_only=True, data_only=True)
+            out = []
+            for ws in wb.worksheets:
+                out.append(f"# sheet: {ws.title} ({ws.max_row} rows x {ws.max_column} cols)")
+                for i, row in enumerate(ws.iter_rows(values_only=True)):
+                    out.append(", ".join("" if c is None else str(c) for c in row))
+                    if i >= 20:
+                        out.append("...")
+                        break
+            wb.close()
+            return "\n".join(out)[:cap]
+        except Exception as exc:
+            return f"[could not read xlsx: {exc}]"
+
+    def _read_yaml(self, target: Path, cap: int) -> str:
+        text = target.read_text(encoding="utf-8", errors="replace")
+        try:
+            import yaml
+            data = yaml.safe_load(text)
+        except ImportError:
+            return "[yaml] (PyYAML not installed; showing raw text)\n\n" + text[:cap]
+        except Exception as exc:
+            return f"[yaml parse error: {exc}; showing raw text]\n\n" + text[:cap]
+        return (f"[yaml, top-level {type(data).__name__}]\n\n" + text)[:cap]
+
+    def _read_toml(self, target: Path, cap: int) -> str:
+        text = target.read_text(encoding="utf-8", errors="replace")
+        try:
+            import tomllib  # Python 3.11+
+            data = tomllib.loads(text)
+            keys = ", ".join(list(data.keys())[:20])
+            return (f"[toml, top-level keys: {keys}]\n\n" + text)[:cap]
+        except ModuleNotFoundError:
+            return "[toml] (tomllib unavailable; showing raw text)\n\n" + text[:cap]
+        except Exception as exc:
+            return f"[toml parse error: {exc}; showing raw text]\n\n" + text[:cap]
+
+    def _index_url(self, url: str) -> str:
+        """Fetch a web page and add its text to the knowledge base."""
+        if self.db is None or not getattr(self.db, "fts_enabled", False):
+            return "Knowledge base unavailable (SQLite FTS5 not enabled)."
+        if not str(url).lower().startswith(("http://", "https://")):
+            return (f"{url!r} is not a web address. Give a full URL starting with "
+                    "http:// or https://, or use index_docs for a local file.")
+        try:
+            text = self._fetch_url(url)
+        except Exception as exc:
+            return f"Could not fetch {url}: {type(exc).__name__}: {exc}"
+        if not text or len(text.strip()) < 50:
+            return f"Nothing substantial to index from {url}."
+        n = self.db.index_document(url, text, url)
+        return f"Indexed {url} into the knowledge base ({n} passages)."
+
+    def _search_docs(self, query: str, limit: Any = None) -> str:
+        try:
+            k = min(10, max(1, int(limit)))
+        except (TypeError, ValueError):
+            k = 5
+        hits = self.db.search_documents(query, limit=k) if self.db else []
+        if not hits:
+            return "No matching passages in the knowledge base."
+        out = []
+        for h in hits:
+            out.append(f"[{h['path']}]\n{h['chunk']}")
+        return "\n\n".join(out)[:self.config.tool_raw_chars]
+
+    def _index_docs(self, path: str) -> str:
+        """Index a file or directory into the knowledge base, reusing the
+        type-aware readers so PDFs, notebooks and spreadsheets are handled."""
+        if self.db is None or not getattr(self.db, "fts_enabled", False):
+            return "Knowledge base unavailable (SQLite FTS5 not enabled)."
+        target = self._resolve(path)
+        if not target.exists():
+            raise ValueError(f"no such path: {path}")
+        files = [target] if target.is_file() else [
+            f for f in sorted(target.rglob("*"))
+            if f.is_file() and not self._is_ignored(f, self._ignored_set())]
+        indexed, skipped, chunks = 0, 0, 0
+        for f in files[:200]:
+            try:
+                text = self._read_file(self._rel(f))
+            except Exception:
+                skipped += 1
+                continue
+            if not text or text.startswith("[binary file"):
+                skipped += 1
+                continue
+            n = self.db.index_document(self._rel(f), text, f.name)
+            chunks += n
+            indexed += 1
+        if not files:
+            return f"Nothing to index: {path} contains no readable files."
+        if not indexed:
+            return (f"Indexed nothing from {path}: all {skipped} file(s) were binary, "
+                    "empty or unreadable.")
+        note = f", skipped {skipped}" if skipped else ""
+        more = " (only the first 200 files were considered)" if len(files) > 200 else ""
+        return (f"Indexed {indexed} file(s) into the knowledge base "
+                f"({chunks} passages){note}.{more}")
+
+    def _file_info(self, path: str) -> str:
+        target = self._resolve(path)
+        if not target.exists():
+            raise ValueError(f"no such path: {path}")
+        if target.is_dir():
+            n = sum(1 for _ in target.iterdir())
+            return f"{self._rel(target)}: directory with {n} entries"
+        size = target.stat().st_size
+        ext = target.suffix.lower() or "(none)"
+        raw = target.read_bytes()[:4096]
+        binary = b"\x00" in raw
+        info = [f"path: {self._rel(target)}", f"size: {size} bytes ({size/1024:.1f} KB)",
+                f"extension: {ext}", f"kind: {'binary' if binary else 'text'}"]
+        if not binary:
+            try:
+                lines = sum(1 for _ in target.open(encoding="utf-8", errors="replace"))
+                info.append(f"lines: {lines}")
+            except Exception:
+                pass
+        return "\n".join(info)
 
     def _write_file(self, path: str, content: str) -> str:
         target = self._resolve(path)
+        if target.is_dir():
+            raise ValueError(f"{path} is a directory; give a file path to write to.")
         existed = target.is_file()
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(str(content), encoding="utf-8")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(str(content), encoding="utf-8")
+        except PermissionError:
+            raise ValueError(f"no permission to write {path}") from None
+        except OSError as exc:
+            raise ValueError(f"could not write {path}: {exc}") from None
         self._note_change(target)
         verb = "Updated" if existed else "Created"
-        return f"{verb} {self._rel(target)} ({len(str(content))} characters)"
+        note = self._validate_written(target, str(content))
+        return f"{verb} {self._rel(target)} ({len(str(content))} characters){note}"
+
+    def _validate_written(self, target: Path, content: str) -> str:
+        """After writing a structured file, check it parses and report the result
+        inline so the agent catches malformed JSON/YAML/TOML immediately."""
+        ext = target.suffix.lower()
+        try:
+            if ext == ".json":
+                json.loads(content)
+                return "  [valid JSON \u2713]"
+            if ext in (".yaml", ".yml"):
+                import yaml
+                yaml.safe_load(content)
+                return "  [valid YAML \u2713]"
+            if ext == ".toml":
+                import tomllib
+                tomllib.loads(content)
+                return "  [valid TOML \u2713]"
+        except ImportError:
+            return ""
+        except Exception as exc:
+            return f"  [\u26a0 warning: not valid {ext[1:].upper()}: {exc}]"
+        return ""
 
     def _edit_file(self, path: str, find: str, replace: str, count: Any = None) -> str:
         target = self._resolve(path)
@@ -4681,6 +5387,43 @@ class Agent:
 
         return fallback
 
+    def with_retrieved_context(self, user_message: str) -> str:
+        """Prepend the most relevant knowledge-base passages to the question.
+
+        This is the RAG step: when documents have been indexed, the best-matching
+        passages are injected so the model answers from the user's own material
+        (with source paths) instead of guessing. Silent no-op when the knowledge
+        base is empty, so behaviour is unchanged until documents are added.
+        """
+        db = getattr(self.registry, "db", None)
+        if not self.config.rag_enabled or db is None:
+            return user_message
+        if not getattr(db, "fts_enabled", False):
+            return user_message
+        try:
+            scope = [p.strip() for p in (self.config.rag_scope or "").split(",") if p.strip()]
+            hits = db.search_documents(user_message, limit=self.config.rag_passages,
+                                       only=scope or None)
+        except Exception as exc:
+            log(f"knowledge-base lookup skipped: {exc}", logging.DEBUG)
+            return user_message
+        if not hits:
+            return user_message
+        budget = max(400, int(self.config.context_size * 0.25) * 4)
+        blocks, used = [], 0
+        for h in hits:
+            piece = f"[{h['path']}]\n{h['chunk']}"
+            if used + len(piece) > budget:
+                break
+            blocks.append(piece)
+            used += len(piece)
+        if not blocks:
+            return user_message
+        return ("Relevant passages from the user's indexed documents:\n\n"
+                + "\n\n".join(blocks)
+                + "\n\nUsing those passages where they apply (cite the [path] when you do), "
+                  "answer:\n" + user_message)
+
     def build_base(
         self,
         history: list[dict],
@@ -4693,7 +5436,7 @@ class Agent:
             "content": build_agent_system_prompt(self.config.system_prompt_with_identity, self.registry,
                                               reasoning=self.config.reasoning_visible),
         }
-        user = {"role": "user", "content": user_message}
+        user = {"role": "user", "content": self.with_retrieved_context(user_message)}
         return trim_to_context(
             system,
             [{"role": m["role"], "content": m["content"]} for m in history],
@@ -6371,7 +7114,36 @@ HTML_PAGE = r"""
      --warn: #ffd93d;
      --success: #9be29b;
      --tool: #b48ead;
+     --code-bg: #151515;
+     --panel-bg: #131313;
+     --hl-kw: #c792ea;
+     --hl-str: #9be29b;
+     --hl-num: #ffd93d;
+     --hl-com: #7a7a7a;
    }
+   /* Light theme. Applied by adding class="light" to <html>, persisted in
+      localStorage, so the whole palette flips from these variables alone. */
+   html.light {
+     --bg: #f7f7f8;
+     --fg: #1c1c1e;
+     --accent: #0a63d6;
+     --surface: #ffffff;
+     --border: #d6d6db;
+     --error: #c0392b;
+     --warn: #a4750a;
+     --success: #1f7a3d;
+     --tool: #7a4fa3;
+     --code-bg: #f2f2f5;
+     --panel-bg: #ffffff;
+     --hl-kw: #7719aa;
+     --hl-str: #1f7a3d;
+     --hl-num: #a4750a;
+     --hl-com: #8a8a8f;
+   }
+   .hl-kw { color: var(--hl-kw); }
+   .hl-str { color: var(--hl-str); }
+   .hl-num { color: var(--hl-num); }
+   .hl-com { color: var(--hl-com); font-style: italic; }
    * { box-sizing: border-box; }
    body {
      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
@@ -6621,9 +7393,118 @@ HTML_PAGE = r"""
      padding: 14px 16px;
      overflow-y: auto;
      display: none;
-     background: #131313;
+     background: var(--panel-bg);
    }
    #settings.open { display: block; }
+   /* Prompt library panel: same shell as settings so it feels native. */
+   #promptsPanel {
+     width: 320px;
+     border-left: 1px solid var(--border);
+     padding: 14px 16px;
+     overflow-y: auto;
+     background: var(--panel-bg);
+   }
+   #promptsPanel.hidden { display: none; }
+   #promptsPanel h3 { margin: 0 0 10px; font-size: 14px; }
+   .prompt-item {
+     border: 1px solid var(--border);
+     border-radius: 8px;
+     padding: 8px 10px;
+     margin-bottom: 8px;
+     background: #181818;
+   }
+   .prompt-item .pname { font-size: 13px; font-weight: 600; }
+   .prompt-item .pbody {
+     font-size: 12px; color: #999; margin: 4px 0 8px;
+     max-height: 48px; overflow: hidden;
+   }
+   /* Conversation history rows */
+   .conv-item {
+     border: 1px solid var(--border);
+     border-radius: 8px;
+     padding: 10px 12px;
+     margin-bottom: 8px;
+     background: #181818;
+   }
+   .conv-item .ctitle { font-size: 13px; font-weight: 600; }
+   .conv-item .cmeta { font-size: 11px; color: #888; margin-top: 2px; }
+   .conv-item .csnip { font-size: 12px; color: #aaa; margin-top: 6px; }
+   /* Knowledge-base drop zone */
+   #dropZone {
+     border: 1px dashed var(--border);
+     border-radius: 10px;
+     padding: 18px;
+     text-align: center;
+     color: #999;
+     font-size: 13px;
+     cursor: pointer;
+     margin-top: 10px;
+     transition: border-color .15s, background .15s;
+   }
+   #dropZone:hover { border-color: var(--accent); }
+   #dropZone.dragging { border-color: var(--accent); background: rgba(10,132,255,.08); }
+   /* Command palette */
+   #palette {
+     position: fixed; inset: 0; background: rgba(0,0,0,.55);
+     display: flex; align-items: flex-start; justify-content: center;
+     padding-top: 12vh; z-index: 60;
+   }
+   #palette.hidden { display: none; }
+   #paletteBox {
+     width: min(560px, 92vw);
+     background: #1b1b1b; border: 1px solid var(--border);
+     border-radius: 12px; overflow: hidden;
+     box-shadow: 0 20px 60px rgba(0,0,0,.5);
+   }
+   #paletteInput {
+     width: 100%; border: 0; outline: none; padding: 14px 16px;
+     background: #1b1b1b; color: var(--fg); font-size: 15px;
+     border-bottom: 1px solid var(--border);
+   }
+   #paletteList { max-height: 320px; overflow-y: auto; }
+   .pal-item { padding: 10px 16px; font-size: 13px; cursor: pointer; }
+   .pal-item.sel, .pal-item:hover { background: rgba(10,132,255,.15); }
+   .pal-item .palhint { color: #888; font-size: 11px; margin-left: 8px; }
+   /* Rendered markdown in answers */
+   .md-p { margin: 0 0 10px; line-height: 1.55; white-space: pre-wrap; }
+   .md-h { margin: 12px 0 6px; font-size: 14px; font-weight: 600; }
+   .md-list { margin: 0 0 10px; padding-left: 22px; line-height: 1.55; }
+   .md-list li { margin: 2px 0; }
+   .md-quote {
+     margin: 0 0 10px; padding: 6px 12px;
+     border-left: 3px solid var(--border); color: #bbb;
+   }
+   .inline-code {
+     background: #232323; border: 1px solid var(--border); border-radius: 4px;
+     padding: 1px 5px; font-size: 12px; font-family: ui-monospace, Menlo, monospace;
+   }
+   .codeblock {
+     border: 1px solid var(--border); border-radius: 8px;
+     overflow: hidden; margin: 0 0 10px; background: var(--code-bg);
+   }
+   .codebar {
+     display: flex; justify-content: space-between; align-items: center;
+     padding: 5px 10px; background: #1d1d1d;
+     border-bottom: 1px solid var(--border);
+     font-size: 11px; color: #999;
+   }
+   .codebar button {
+     font-size: 11px; padding: 2px 8px; border-radius: 6px;
+     border: 1px solid var(--border); background: #262626; color: #ccc; cursor: pointer;
+   }
+   .codebar button:hover { border-color: var(--accent); color: var(--fg); }
+   .codeblock pre {
+     margin: 0; padding: 10px 12px; overflow-x: auto;
+     font-size: 12px; line-height: 1.45;
+     font-family: ui-monospace, Menlo, monospace;
+   }
+   /* Per-message actions */
+   .msg-actions { margin-top: 6px; display: flex; gap: 6px; }
+   .msg-actions button {
+     font-size: 11px; padding: 2px 8px; border-radius: 6px;
+     border: 1px solid var(--border); background: #1a1a1a; color: #bbb; cursor: pointer;
+   }
+   .msg-actions button:hover { border-color: var(--accent); color: var(--fg); }
    #settings h3 { margin: 0 0 10px; font-size: 14px; }
    #settings label {
      display: block;
@@ -6717,10 +7598,16 @@ HTML_PAGE = r"""
    <nav class="views">
      <button id="navChat" class="active" onclick="showView('chat')" data-tip-below data-tip="Talk to the model. Ask questions, paste code or documents, run tools." title="Chat view">Chat</button>
      <button id="navTasks" onclick="showView('tasks')" data-tip-below data-tip="Scheduled or saved jobs the agent runs on demand or on a timer." title="Tasks view">Tasks</button>
+     <button id="navHistory" onclick="showView('history')" data-tip-below data-tip="Browse, search, reopen and manage past conversations." title="History view">History</button>
      <button id="navModels" onclick="showView('models')" data-tip-below data-tip="Pick or download a model, and attach a fine-tuned adapter." title="Models view">Models</button>
    </nav>
    <div class="actions">
      <button onclick="newChat()" data-tip-below data-tip="Start a fresh conversation. Clears the current thread from view." title="New chat">New chat</button>
+     <button onclick="regenerateLast()" data-tip-below data-tip="Discard the last answer and generate a new one for the same question." title="Regenerate last answer">Regenerate</button>
+     <button onclick="showView('history')" data-tip-below data-tip="Browse and search every past conversation." title="Search conversations">Search</button>
+     <button onclick="exportChat()" data-tip-below data-tip="Download this conversation as Markdown." title="Export conversation">Export</button>
+     <button onclick="togglePrompts()" data-tip-below data-tip="Save and reuse prompts you type often." title="Prompt library">Prompts</button>
+     <button id="themeBtn" onclick="toggleTheme()" data-tip-below data-tip="Switch between the dark and light colour scheme." title="Toggle theme">Light</button>
      <button onclick="retrain()" data-tip-below data-tip="Fine-tune the model on your thumbs-up/down feedback so far (LoRA)." title="Retrain on feedback">Retrain</button>
      <button onclick="toggleSettings()" data-tip-below data-tip="Model, tools, generation and memory settings you can change live." title="Open settings">Settings</button>
    </div>
@@ -6798,6 +7685,32 @@ HTML_PAGE = r"""
      </div>
    </div>
 
+   <div id="historyView" class="view hidden">
+     <div class="panel">
+       <h3 data-tip="Every conversation stored locally. Reopen one to continue it.">Conversations</h3>
+       <div class="row">
+         <div><input id="historySearch" type="text" placeholder="search all conversations..." onkeydown="if(event.key==='Enter')runHistorySearch()"></div>
+         <div style="flex:0 0 auto"><button onclick="runHistorySearch()" data-tip="Find conversations containing this text." title="Search">Search</button></div>
+         <div style="flex:0 0 auto"><button onclick="loadHistory()" data-tip="Show all recent conversations again." title="Show all">Show all</button></div>
+       </div>
+       <div id="historyList" style="margin-top:12px">loading...</div>
+     </div>
+
+     <div class="panel">
+       <h3 data-tip="Save or restore everything you have created in this app.">Backup</h3>
+       <div class="hint">
+         Downloads your conversations, prompts, feedback and indexed documents as
+         one JSON file. Restoring merges a backup back in without deleting what is
+         already here. Model weights are not included; they are re-downloadable.
+       </div>
+       <div class="row" style="margin-top:10px">
+         <button onclick="downloadBackup()" data-tip="Download everything as a JSON file." title="Download backup">Download backup</button>
+         <button onclick="document.getElementById('restoreInput').click()" data-tip="Merge a previously downloaded backup back in." title="Restore backup">Restore backup</button>
+       </div>
+       <input id="restoreInput" type="file" accept="application/json" style="display:none">
+     </div>
+   </div>
+
    <div id="modelsView" class="view hidden">
      <div class="panel">
        <h3>Current</h3>
@@ -6860,6 +7773,41 @@ HTML_PAGE = r"""
        </div>
      </div>
      <div class="panel">
+       <h3 data-tip="Index your own documents so answers come from your material, with sources.">Knowledge base</h3>
+       <div id="docsStats" class="logbox" style="max-height:none">loading...</div>
+       <div class="hint">
+         Indexed documents are searched on every question and the best passages are
+         added to the prompt with their source path. Uses SQLite full-text ranking,
+         so it needs no embedding model and no extra memory. PDFs, docx, notebooks,
+         spreadsheets and text are all read.
+       </div>
+       <div id="dropZone" data-tip="Drag files here, or click to choose, to add them to the knowledge base.">
+         <strong>Drop files here</strong> or click to choose &mdash; PDFs, Word docs, spreadsheets, notebooks, text.
+       </div>
+       <input id="fileInput" type="file" multiple style="display:none">
+       <label style="display:block;font-size:12px;color:#999;margin:10px 0 4px">File or folder to index (relative to the project)</label>
+       <div class="row">
+         <div><input id="docsPath" type="text" placeholder="docs"></div>
+         <div style="flex:0 0 auto"><button onclick="indexDocs()" data-tip="Read and index this file or folder into the knowledge base." title="Index">Index</button></div>
+       </div>
+       <div class="row" style="margin-top:8px">
+         <div><input id="docsUrl" type="text" placeholder="https://example.com/docs"></div>
+         <div style="flex:0 0 auto"><button onclick="indexUrl()" data-tip="Fetch a web page and add it to the knowledge base so you can ask about it later without re-fetching." title="Index URL">Index URL</button></div>
+       </div>
+       <div class="row" style="margin-top:8px">
+         <div><input id="docsQuery" type="text" placeholder="test a search..."></div>
+         <div style="flex:0 0 auto"><button onclick="searchDocs()" data-tip="Preview what the model would retrieve for this question." title="Search">Search</button></div>
+         <div style="flex:0 0 auto"><button onclick="clearDocs()" data-tip="Remove every indexed document. Your files are not touched." title="Clear">Clear</button></div>
+       </div>
+       <label style="display:block;font-size:12px;color:#999;margin:12px 0 4px" data-tip="Limit retrieval to specific documents, so answers come only from what you choose.">Answer only from these documents</label>
+       <div id="docScope" style="max-height:150px;overflow-y:auto"></div>
+       <div class="row" style="margin-top:8px">
+         <button onclick="applyScope()" data-tip="Restrict retrieval to the ticked documents." title="Apply scope">Apply scope</button>
+         <button onclick="clearScope()" data-tip="Search the whole knowledge base again." title="Use all documents">Use all</button>
+       </div>
+       <pre id="docsResult" class="gbody gdiff" style="display:none;margin-top:8px"></pre>
+     </div>
+     <div class="panel">
        <h3 data-tip="The local codebase the agent reads and edits in place. Review here before you push.">Codebase</h3>
        <label style="display:block;font-size:12px;color:#999;margin:4px 0 4px">Project directory (PROJECT_DIR)</label>
        <div class="row">
@@ -6881,6 +7829,27 @@ HTML_PAGE = r"""
        <pre id="projectDiff" class="gbody gdiff" style="display:none;margin-top:8px"></pre>
      </div>
    </div>
+
+   <div id="palette" class="hidden">
+     <div id="paletteBox">
+       <input id="paletteInput" type="text" placeholder="Type a command..." autocomplete="off">
+       <div id="paletteList"></div>
+     </div>
+   </div>
+
+   <aside id="promptsPanel" class="hidden">
+     <h3>Prompt library</h3>
+     <div class="hint">Save prompts you type often, then insert one into the message box with a click.</div>
+     <div id="promptList" style="margin-top:10px">loading...</div>
+     <label style="display:block;font-size:12px;color:#999;margin:12px 0 4px">Save the current message box as</label>
+     <div class="row">
+       <div><input id="promptName" type="text" placeholder="name, e.g. code-review"></div>
+       <div style="flex:0 0 auto"><button onclick="savePrompt()" data-tip="Save whatever is in the message box under this name." title="Save prompt">Save</button></div>
+     </div>
+     <div class="row" style="margin-top:10px">
+       <button onclick="togglePrompts()" title="Close">Close</button>
+     </div>
+   </aside>
 
    <aside id="settings">
      <h3>Generation</h3>
@@ -7056,13 +8025,275 @@ HTML_PAGE = r"""
      chat.scrollTop = chat.scrollHeight;
    }
 
+   // ------------------------------------------------------- markdown ---
+   // Builds DOM nodes rather than assigning innerHTML, so model output can never
+   // inject markup or scripts into the page. Handles fenced code (with a copy
+   // button and language label), headings, lists, blockquotes, inline code,
+   // bold/italic and links.
+
+   function renderInline(text, host) {
+     // Order matters: code spans first so their contents are never re-parsed.
+     var pattern = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\*[^*\n]+\*|_[^_\n]+_)|(\[[^\]\n]+\]\([^)\s]+\))/;
+     var rest = text;
+     while (rest) {
+       var m = rest.match(pattern);
+       if (!m) { host.appendChild(document.createTextNode(rest)); break; }
+       if (m.index > 0) host.appendChild(document.createTextNode(rest.slice(0, m.index)));
+       var tok = m[0];
+       if (tok[0] === "`") {
+         var code = document.createElement("code");
+         code.className = "inline-code";
+         code.textContent = tok.slice(1, -1);
+         host.appendChild(code);
+       } else if (tok.slice(0, 2) === "**") {
+         var b = document.createElement("strong");
+         b.textContent = tok.slice(2, -2);
+         host.appendChild(b);
+       } else if (tok[0] === "[") {
+         var close = tok.indexOf("](");
+         var a = document.createElement("a");
+         a.textContent = tok.slice(1, close);
+         a.href = tok.slice(close + 2, -1);
+         a.target = "_blank";
+         a.rel = "noopener noreferrer";
+         host.appendChild(a);
+       } else {
+         var i = document.createElement("em");
+         i.textContent = tok.slice(1, -1);
+         host.appendChild(i);
+       }
+       rest = rest.slice(m.index + tok.length);
+     }
+   }
+
+   // Minimal offline syntax highlighting. A real grammar is overkill here and a
+   // CDN library would break the offline-first promise, so this tokenises the
+   // few things that carry most of the visual signal: comments, strings,
+   // numbers and keywords. Everything is inserted as text nodes, never HTML.
+   var HL_KEYWORDS = {
+     python: "def class return if elif else for while import from as try except finally raise with lambda yield pass break continue in is not and or None True False async await global nonlocal assert del",
+     javascript: "function return if else for while var let const class new try catch finally throw typeof instanceof in of do switch case break continue default null undefined true false async await import export from extends this",
+     json: "true false null",
+     bash: "if then else fi for while do done case esac function return export local echo cd set source",
+     sql: "select from where group by order having insert update delete create table drop alter join left right inner outer on as values set distinct limit"
+   };
+   HL_KEYWORDS.js = HL_KEYWORDS.javascript;
+   HL_KEYWORDS.ts = HL_KEYWORDS.javascript;
+   HL_KEYWORDS.py = HL_KEYWORDS.python;
+   HL_KEYWORDS.sh = HL_KEYWORDS.bash;
+
+   function highlightInto(code, lang, host) {
+     var words = HL_KEYWORDS[(lang || "").toLowerCase()];
+     if (!words) { host.textContent = code; return; }
+     var keywords = {};
+     words.split(" ").forEach(function(w) { keywords[w] = true; });
+     var lineComment = (lang === "python" || lang === "py" || lang === "bash" || lang === "sh") ? "#" : "//";
+     var i = 0;
+     function emit(text, cls) {
+       if (!text) return;
+       if (!cls) { host.appendChild(document.createTextNode(text)); return; }
+       var span = document.createElement("span");
+       span.className = cls;
+       span.textContent = text;
+       host.appendChild(span);
+     }
+     while (i < code.length) {
+       var ch = code[i];
+       // Comment to end of line
+       if (code.startsWith(lineComment, i)) {
+         var nl = code.indexOf("\n", i);
+         if (nl < 0) nl = code.length;
+         emit(code.slice(i, nl), "hl-com");
+         i = nl;
+         continue;
+       }
+       // String literal
+       if (ch === '"' || ch === "'" || ch === "`") {
+         var j = i + 1;
+         while (j < code.length && code[j] !== ch) {
+           if (code[j] === "\\") j++;
+           j++;
+         }
+         emit(code.slice(i, Math.min(j + 1, code.length)), "hl-str");
+         i = j + 1;
+         continue;
+       }
+       // Number
+       if (ch >= "0" && ch <= "9") {
+         var k = i;
+         while (k < code.length && /[0-9._xa-fA-F]/.test(code[k])) k++;
+         emit(code.slice(i, k), "hl-num");
+         i = k;
+         continue;
+       }
+       // Word (keyword or plain identifier)
+       if (/[A-Za-z_$]/.test(ch)) {
+         var w = i;
+         while (w < code.length && /[A-Za-z0-9_$]/.test(code[w])) w++;
+         var word = code.slice(i, w);
+         emit(word, keywords[word] ? "hl-kw" : null);
+         i = w;
+         continue;
+       }
+       emit(ch, null);
+       i++;
+     }
+   }
+
+   function makeCodeBlock(code, lang) {
+     var wrap = document.createElement("div");
+     wrap.className = "codeblock";
+     var bar = document.createElement("div");
+     bar.className = "codebar";
+     var label = document.createElement("span");
+     label.textContent = lang || "code";
+     var copy = document.createElement("button");
+     copy.textContent = "Copy";
+     copy.title = "Copy this code";
+     copy.onclick = function() {
+       navigator.clipboard.writeText(code).then(function() {
+         copy.textContent = "Copied";
+         setTimeout(function() { copy.textContent = "Copy"; }, 1200);
+       }, function() { alert("Could not copy."); });
+     };
+     bar.appendChild(label);
+     bar.appendChild(copy);
+     var pre = document.createElement("pre");
+     var el = document.createElement("code");
+     highlightInto(code, lang, el);
+     pre.appendChild(el);
+     wrap.appendChild(bar);
+     wrap.appendChild(pre);
+     return wrap;
+   }
+
+   // Re-render streaming text as markdown, but only every ~250ms: parsing on
+   // every token would be wasteful and would make half-typed code fences flicker.
+   function scheduleMarkdown(node) {
+     if (node.mdTimer) return;
+     node.mdTimer = setTimeout(function() {
+       node.mdTimer = null;
+       // Don't render a code fence that is still open; wait for it to close.
+       var fences = (node.raw.match(/```/g) || []).length;
+       if (fences % 2 === 1) return;
+       renderMarkdown(node.raw, node.text);
+       scrollDown();
+     }, 250);
+   }
+
+   function renderMarkdown(text, host) {
+     host.innerHTML = "";
+     var lines = String(text == null ? "" : text).split("\n");
+     var i = 0;
+     var list = null;
+     function endList() { list = null; }
+     while (i < lines.length) {
+       var line = lines[i];
+       var fence = line.match(/^\s*```(\w+)?\s*$/);
+       if (fence) {
+         endList();
+         var lang = fence[1] || "";
+         var buf = [];
+         i++;
+         while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) { buf.push(lines[i]); i++; }
+         i++;
+         host.appendChild(makeCodeBlock(buf.join("\n"), lang));
+         continue;
+       }
+       var heading = line.match(/^(#{1,4})\s+(.*)$/);
+       if (heading) {
+         endList();
+         var h = document.createElement("h" + Math.min(4, heading[1].length + 2));
+         h.className = "md-h";
+         renderInline(heading[2], h);
+         host.appendChild(h);
+         i++;
+         continue;
+       }
+       var item = line.match(/^\s*[-*+]\s+(.*)$/) || line.match(/^\s*(\d+)\.\s+(.*)$/);
+       if (item) {
+         var ordered = /^\s*\d+\./.test(line);
+         if (!list || list.ordered !== ordered) {
+           var el = document.createElement(ordered ? "ol" : "ul");
+           el.className = "md-list";
+           host.appendChild(el);
+           list = { el: el, ordered: ordered };
+         }
+         var li = document.createElement("li");
+         renderInline(item.length === 2 ? item[1] : item[2], li);
+         list.el.appendChild(li);
+         i++;
+         continue;
+       }
+       if (/^\s*>\s?/.test(line)) {
+         endList();
+         var q = document.createElement("blockquote");
+         q.className = "md-quote";
+         renderInline(line.replace(/^\s*>\s?/, ""), q);
+         host.appendChild(q);
+         i++;
+         continue;
+       }
+       if (!line.trim()) { endList(); i++; continue; }
+       endList();
+       var p = document.createElement("p");
+       p.className = "md-p";
+       var block = [line];
+       i++;
+       while (i < lines.length && lines[i].trim() && !/^\s*(```|#{1,4}\s|[-*+]\s|\d+\.\s|>)/.test(lines[i])) {
+         block.push(lines[i]);
+         i++;
+       }
+       renderInline(block.join("\n"), p);
+       host.appendChild(p);
+     }
+     return host;
+   }
+
    function addMessage(role, text) {
      var div = document.createElement("div");
      div.className = "msg " + role;
-     div.textContent = text;
+     if (role === "assistant") {
+       var body = document.createElement("div");
+       renderMarkdown(text, body);
+       div.appendChild(body);
+     } else {
+       div.textContent = text;
+     }
+     addMessageActions(div, role, text);
      chat.appendChild(div);
      scrollDown();
      return div;
+   }
+
+   // Copy / edit-and-resend controls under each message.
+   function addMessageActions(div, role, text) {
+     var bar = document.createElement("div");
+     bar.className = "msg-actions";
+     var copy = document.createElement("button");
+     copy.textContent = "Copy";
+     copy.title = "Copy this message to the clipboard";
+     copy.onclick = function() {
+       var payload = div.dataset.raw || text || div.textContent || "";
+       navigator.clipboard.writeText(payload).then(function() {
+         copy.textContent = "Copied";
+         setTimeout(function() { copy.textContent = "Copy"; }, 1200);
+       }, function() { alert("Could not copy."); });
+     };
+     bar.appendChild(copy);
+     if (role === "user") {
+       var edit = document.createElement("button");
+       edit.textContent = "Edit & resend";
+       edit.title = "Put this question back in the box to change and ask again";
+       edit.onclick = function() {
+         input.value = div.dataset.raw || text || div.textContent || "";
+         input.focus();
+         showView("chat");
+       };
+       bar.appendChild(edit);
+     }
+     div.dataset.raw = text || "";
+     div.appendChild(bar);
    }
 
    function addSystem(text) {
@@ -7422,7 +8653,10 @@ HTML_PAGE = r"""
              trace.thinking.done = true;
              trace.thinking.node.classList.remove("open");
            }
-           traceAnswer(trace).text.textContent += event.token;
+           var ansNode = traceAnswer(trace);
+           ansNode.raw = (ansNode.raw || "") + event.token;
+           ansNode.text.textContent = ansNode.raw;
+           scheduleMarkdown(ansNode);
            bumpActivity(trace);
            setActivity(trace, "generating\u2026");
            scrollDown();
@@ -7454,7 +8688,9 @@ HTML_PAGE = r"""
            setActivity(trace, event.message || "working\u2026");
          } else if (event.type === "final") {
            var ans = traceAnswer(trace);
-           ans.text.textContent = event.answer || "(no answer)";
+           if (ans.mdTimer) { clearTimeout(ans.mdTimer); ans.mdTimer = null; }
+           // Streaming re-renders on a debounce; the final pass is authoritative.
+           renderMarkdown(event.answer || "(no answer)", ans.text);
            ans.node.classList.remove("pending");
            answered = true;
            updateContextMeter(estimateTokens(event.answer || ""));
@@ -7793,7 +9029,7 @@ HTML_PAGE = r"""
 
    function showView(name) {
      currentView = name;
-     ["chat", "tasks", "models"].forEach(function(view) {
+     ["chat", "tasks", "history", "models"].forEach(function(view) {
        var el = document.getElementById(view + "View");
        if (el) el.classList.toggle("hidden", view !== name);
        var nav = document.getElementById("nav" + view.charAt(0).toUpperCase() + view.slice(1));
@@ -7807,6 +9043,8 @@ HTML_PAGE = r"""
      if (name === "tasks") {
        loadTasks();
        tasksTimer = setInterval(loadTasks, 3000);
+     } else if (name === "history") {
+       loadHistory();
      } else if (name === "models") {
        loadModels();
        loadModelLog();
@@ -8388,8 +9626,485 @@ HTML_PAGE = r"""
      }
    }
 
+   async function loadDocsStats() {
+     var box = document.getElementById("docsStats");
+     if (!box) return;
+     try {
+       var s = await fetchJSON("/api/docs/stats");
+       if (!s.enabled) { box.textContent = "Knowledge base unavailable (SQLite FTS5 not enabled in this Python build)."; return; }
+       var lines = ["Documents: " + s.documents, "Passages:  " + s.chunks];
+       if (s.items && s.items.length) {
+         lines.push("");
+         lines.push("Indexed:");
+         s.items.slice(0, 15).forEach(function(i) {
+           lines.push("  " + i.path + "  (" + i.chunks + " passages)");
+         });
+         if (s.items.length > 15) lines.push("  ... and " + (s.items.length - 15) + " more");
+       } else {
+         lines.push("");
+         lines.push("Nothing indexed yet — answers use the model's own knowledge.");
+       }
+       box.textContent = lines.join("\n");
+       renderScope(s.items || []);
+     } catch (err) {
+       box.textContent = "Could not load knowledge base stats: " + err.message;
+     }
+   }
+
+   async function renderScope(items) {
+     var host = document.getElementById("docScope");
+     if (!host) return;
+     var current = [];
+     try {
+       var sc = await fetchJSON("/api/docs/scope");
+       current = ((sc.data || sc).scope || "").split(",").map(function(x) { return x.trim(); })
+                   .filter(Boolean);
+     } catch (err) { current = []; }
+     if (!items.length) { host.textContent = "Nothing indexed yet."; return; }
+     host.innerHTML = "";
+     items.forEach(function(it) {
+       var row = document.createElement("label");
+       row.className = "agent-toggle";
+       row.style.display = "block";
+       var cb = document.createElement("input");
+       cb.type = "checkbox";
+       cb.value = it.path;
+       cb.checked = current.indexOf(it.path) >= 0;
+       row.appendChild(cb);
+       row.appendChild(document.createTextNode(" " + it.path));
+       host.appendChild(row);
+     });
+   }
+
+   async function applyScope() {
+     var boxes = document.querySelectorAll("#docScope input[type=checkbox]");
+     var picked = [];
+     boxes.forEach(function(b) { if (b.checked) picked.push(b.value); });
+     try {
+       await fetchJSON("/api/docs/scope?paths=" + encodeURIComponent(picked.join(",")),
+                       { method: "POST" });
+       alert(picked.length
+         ? ("Answers will use only these " + picked.length + " document(s).")
+         : "No documents ticked — using the whole knowledge base.");
+     } catch (err) {
+       alert("Could not set scope: " + err.message);
+     }
+   }
+
+   async function clearScope() {
+     try {
+       await fetchJSON("/api/docs/scope?paths=", { method: "POST" });
+       loadDocsStats();
+       alert("Using the whole knowledge base.");
+     } catch (err) {
+       alert("Could not clear scope: " + err.message);
+     }
+   }
+
+   async function indexDocs() {
+     var path = (document.getElementById("docsPath").value || "").trim();
+     if (!path) { alert("Enter a file or folder path relative to the project."); return; }
+     try {
+       var r = await fetchJSON("/api/docs/index?path=" + encodeURIComponent(path), { method: "POST" });
+       var d = r.data || r;
+       if (d.error) { alert(d.error); return; }
+       alert(d.result || "Indexed.");
+       loadDocsStats();
+     } catch (err) {
+       alert("Indexing failed: " + err.message);
+     }
+   }
+
+   async function searchDocs() {
+     var q = (document.getElementById("docsQuery").value || "").trim();
+     var pre = document.getElementById("docsResult");
+     if (!q) { alert("Type a question to test retrieval."); return; }
+     try {
+       var r = await fetchJSON("/api/docs/search?q=" + encodeURIComponent(q));
+       var hits = (r.data || r).hits || [];
+       pre.style.display = "block";
+       pre.textContent = hits.length
+         ? hits.map(function(h) { return "[" + h.path + "]\n" + h.chunk; }).join("\n\n")
+         : "No matching passages.";
+     } catch (err) {
+       pre.style.display = "block";
+       pre.textContent = "Search failed: " + err.message;
+     }
+   }
+
+   async function clearDocs() {
+     if (!confirm("Remove every indexed document? Your actual files are not touched.")) return;
+     try {
+       var r = await fetchJSON("/api/docs/clear", { method: "POST" });
+       alert("Cleared " + ((r.data || r).cleared || 0) + " document(s).");
+       loadDocsStats();
+     } catch (err) {
+       alert("Clear failed: " + err.message);
+     }
+   }
+
+   async function indexUrl() {
+     var url = (document.getElementById("docsUrl").value || "").trim();
+     if (!url) { alert("Enter a URL to fetch and index."); return; }
+     try {
+       var r = await fetchJSON("/api/docs/index_url?url=" + encodeURIComponent(url), { method: "POST" });
+       var d = r.data || r;
+       if (d.error) { alert(d.error); return; }
+       alert(d.result || "Indexed.");
+       loadDocsStats();
+     } catch (err) {
+       alert("Indexing failed: " + err.message);
+     }
+   }
+
+   async function regenerateLast() {
+     if (busy) { alert("Wait for the current answer to finish."); return; }
+     try {
+       var r = await fetchJSON("/api/conversation/" + encodeURIComponent(conversationId) + "/regenerate",
+                               { method: "POST" });
+       var d = r.data || r;
+       if (d.error) { alert(d.error); return; }
+       // Drop the last rendered answer, then re-send the same question.
+       var nodes = chat.querySelectorAll(".turn, .msg.assistant");
+       if (nodes.length) nodes[nodes.length - 1].remove();
+       input.value = d.prompt;
+       send();
+     } catch (err) {
+       alert("Could not regenerate: " + err.message);
+     }
+   }
+
+   function exportChat() {
+     window.location = "/api/conversation/" + encodeURIComponent(conversationId) + "/export?format=markdown";
+   }
+
+   // ---------------------------------------------------- history panel ---
+
+   function renderConversations(items, isSearch) {
+     var host = document.getElementById("historyList");
+     if (!items.length) {
+       host.textContent = isSearch ? "No conversations matched." : "No conversations yet.";
+       return;
+     }
+     host.innerHTML = "";
+     items.forEach(function(c) {
+       var id = c.conversation_id || c.id;
+       var row = document.createElement("div");
+       row.className = "conv-item";
+       var title = document.createElement("div");
+       title.className = "ctitle";
+       title.textContent = (c.pinned ? "\u2605 " : "") + (c.title || id).toString().slice(0, 90);
+       var meta = document.createElement("div");
+       meta.className = "cmeta";
+       var when = c.last_at || c.created_at || "";
+       var count = (c.messages !== undefined) ? c.messages : null;
+       meta.textContent = id.slice(0, 8) + (when ? " · " + when : "")
+         + (count !== null ? " · " + count + " messages" : "");
+       row.appendChild(title);
+       row.appendChild(meta);
+       if (c.snippet) {
+         var sn = document.createElement("div");
+         sn.className = "csnip";
+         sn.textContent = c.snippet;
+         row.appendChild(sn);
+       }
+       var bar = document.createElement("div");
+       bar.className = "msg-actions";
+       var open = document.createElement("button");
+       open.textContent = "Open";
+       open.title = "Reopen this conversation and continue it";
+       open.onclick = function() { openConversation(id); };
+       var exp = document.createElement("button");
+       exp.textContent = "Export";
+       exp.title = "Download as Markdown";
+       exp.onclick = function() {
+         window.location = "/api/conversation/" + encodeURIComponent(id) + "/export?format=markdown";
+       };
+       var del = document.createElement("button");
+       del.textContent = "Delete";
+       del.title = "Delete this conversation permanently";
+       del.onclick = async function() {
+         if (!confirm("Delete this conversation? This cannot be undone.")) return;
+         try {
+           await fetchJSON("/api/conversation/" + encodeURIComponent(id), { method: "DELETE" });
+           loadHistory();
+         } catch (err) { alert("Delete failed: " + err.message); }
+       };
+       var pin = document.createElement("button");
+       pin.textContent = c.pinned ? "Unpin" : "Pin";
+       pin.title = "Keep this conversation at the top of the list";
+       pin.onclick = async function() {
+         try {
+           await fetchJSON("/api/conversation/" + encodeURIComponent(id) + "/pin?pinned="
+                           + (c.pinned ? "false" : "true"), { method: "POST" });
+           loadHistory();
+         } catch (err) { alert("Could not pin: " + err.message); }
+       };
+       var ren = document.createElement("button");
+       ren.textContent = "Rename";
+       ren.title = "Give this conversation a name";
+       ren.onclick = async function() {
+         var name = prompt("Name this conversation:", c.title || "");
+         if (!name) return;
+         try {
+           await fetchJSON("/api/conversation/" + encodeURIComponent(id) + "/title?title="
+                           + encodeURIComponent(name), { method: "POST" });
+           loadHistory();
+         } catch (err) { alert("Could not rename: " + err.message); }
+       };
+       var fork = document.createElement("button");
+       fork.textContent = "Fork";
+       fork.title = "Copy this conversation so you can take it a different direction";
+       fork.onclick = async function() {
+         try {
+           var fr = await fetchJSON("/api/conversation/" + encodeURIComponent(id) + "/fork",
+                                    { method: "POST" });
+           var nid = (fr.data || fr).conversation_id;
+           addSystem("Forked into a new conversation.");
+           openConversation(nid);
+         } catch (err) { alert("Could not fork: " + err.message); }
+       };
+       bar.appendChild(open); bar.appendChild(fork); bar.appendChild(pin);
+       bar.appendChild(ren); bar.appendChild(exp); bar.appendChild(del);
+       row.appendChild(bar);
+       host.appendChild(row);
+     });
+   }
+
+   async function loadHistory() {
+     var host = document.getElementById("historyList");
+     if (!host) return;
+     host.textContent = "loading...";
+     try {
+       var r = await fetchJSON("/api/conversations");
+       renderConversations((r.data || r).conversations || [], false);
+     } catch (err) {
+       host.textContent = "Could not load conversations: " + err.message;
+     }
+   }
+
+   async function runHistorySearch() {
+     var q = (document.getElementById("historySearch").value || "").trim();
+     if (!q) { loadHistory(); return; }
+     var host = document.getElementById("historyList");
+     host.textContent = "searching...";
+     try {
+       var r = await fetchJSON("/api/conversations/search?q=" + encodeURIComponent(q));
+       renderConversations((r.data || r).results || [], true);
+     } catch (err) {
+       host.textContent = "Search failed: " + err.message;
+     }
+   }
+
+   async function openConversation(id) {
+     try {
+       var r = await fetchJSON("/api/conversation/" + encodeURIComponent(id));
+       var msgs = (r.data || r).messages || [];
+       conversationId = id;
+       localStorage.setItem("llm_conversation", id);
+       chat.innerHTML = "";
+       msgs.forEach(function(m) {
+         if (m.role === "user" || m.role === "assistant") addMessage(m.role, m.content || "");
+       });
+       showView("chat");
+     } catch (err) {
+       alert("Could not open conversation: " + err.message);
+     }
+   }
+
+   // ---------------------------------------------------- prompt library ---
+
+   function togglePrompts() {
+     var panel = document.getElementById("promptsPanel");
+     panel.classList.toggle("hidden");
+     if (!panel.classList.contains("hidden")) loadPrompts();
+   }
+
+   async function loadPrompts() {
+     var host = document.getElementById("promptList");
+     if (!host) return;
+     host.textContent = "loading...";
+     try {
+       var r = await fetchJSON("/api/prompts");
+       var items = (r.data || r).prompts || [];
+       if (!items.length) { host.textContent = "No saved prompts yet."; return; }
+       host.innerHTML = "";
+       items.forEach(function(pr) {
+         var row = document.createElement("div");
+         row.className = "prompt-item";
+         var n = document.createElement("div");
+         n.className = "pname"; n.textContent = pr.name;
+         var b = document.createElement("div");
+         b.className = "pbody"; b.textContent = pr.body;
+         var bar = document.createElement("div");
+         bar.className = "msg-actions";
+         var ins = document.createElement("button");
+         ins.textContent = "Insert";
+         ins.title = "Put this prompt in the message box";
+         ins.onclick = function() { input.value = pr.body; input.focus(); showView("chat"); };
+         var del = document.createElement("button");
+         del.textContent = "Delete";
+         del.onclick = async function() {
+           try {
+             await fetchJSON("/api/prompts/" + encodeURIComponent(pr.name), { method: "DELETE" });
+             loadPrompts();
+           } catch (err) { alert("Delete failed: " + err.message); }
+         };
+         bar.appendChild(ins); bar.appendChild(del);
+         row.appendChild(n); row.appendChild(b); row.appendChild(bar);
+         host.appendChild(row);
+       });
+     } catch (err) {
+       host.textContent = "Could not load prompts: " + err.message;
+     }
+   }
+
+   async function savePrompt() {
+     var name = (document.getElementById("promptName").value || "").trim();
+     var body = (input.value || "").trim();
+     if (!name) { alert("Give the prompt a name."); return; }
+     if (!body) { alert("Type the prompt in the message box first, then save it."); return; }
+     try {
+       await fetchJSON("/api/prompts?name=" + encodeURIComponent(name) + "&body=" + encodeURIComponent(body),
+                       { method: "POST" });
+       document.getElementById("promptName").value = "";
+       loadPrompts();
+     } catch (err) {
+       alert("Could not save: " + err.message);
+     }
+   }
+
+   // ------------------------------------------------- file drag & drop ---
+
+   async function uploadFiles(files) {
+     if (!files || !files.length) return;
+     for (var i = 0; i < files.length; i++) {
+       var form = new FormData();
+       form.append("file", files[i]);
+       try {
+         var resp = await fetch("/api/docs/upload", { method: "POST", body: form });
+         var data = await resp.json();
+         if (data.error) { alert(files[i].name + ": " + data.error); continue; }
+         addSystem(data.result || ("Indexed " + files[i].name));
+       } catch (err) {
+         alert("Upload failed for " + files[i].name + ": " + err.message);
+       }
+     }
+     loadDocsStats();
+   }
+
+   function wireDropZone() {
+     var zone = document.getElementById("dropZone");
+     var picker = document.getElementById("fileInput");
+     if (!zone || !picker) return;
+     zone.onclick = function() { picker.click(); };
+     picker.onchange = function() { uploadFiles(picker.files); picker.value = ""; };
+     ["dragenter", "dragover"].forEach(function(ev) {
+       zone.addEventListener(ev, function(e) {
+         e.preventDefault(); e.stopPropagation(); zone.classList.add("dragging");
+       });
+     });
+     ["dragleave", "drop"].forEach(function(ev) {
+       zone.addEventListener(ev, function(e) {
+         e.preventDefault(); e.stopPropagation(); zone.classList.remove("dragging");
+       });
+     });
+     zone.addEventListener("drop", function(e) {
+       if (e.dataTransfer && e.dataTransfer.files) uploadFiles(e.dataTransfer.files);
+     });
+   }
+
+   // ------------------------------------------------- command palette ---
+
+   var PALETTE_COMMANDS = [
+     { label: "New chat", hint: "start a fresh conversation", run: function() { newChat(); } },
+     { label: "Regenerate last answer", hint: "same question, new answer", run: function() { regenerateLast(); } },
+     { label: "Search conversations", hint: "history", run: function() { showView("history"); } },
+     { label: "Export this conversation", hint: "markdown", run: function() { exportChat(); } },
+     { label: "Prompt library", hint: "saved prompts", run: function() { togglePrompts(); } },
+     { label: "Knowledge base", hint: "index documents", run: function() { showView("models"); } },
+     { label: "Toggle theme", hint: "light / dark", run: function() { toggleTheme(); } },
+     { label: "Download backup", hint: "save everything", run: function() { downloadBackup(); } },
+     { label: "Settings", hint: "model and generation", run: function() { toggleSettings(); } },
+     { label: "Chat", hint: "back to the conversation", run: function() { showView("chat"); } },
+     { label: "Tasks", hint: "scheduled jobs", run: function() { showView("tasks"); } }
+   ];
+   var paletteSel = 0;
+
+   function renderPalette() {
+     var q = (document.getElementById("paletteInput").value || "").toLowerCase();
+     var list = document.getElementById("paletteList");
+     var matches = PALETTE_COMMANDS.filter(function(c) {
+       return !q || c.label.toLowerCase().indexOf(q) >= 0 || c.hint.toLowerCase().indexOf(q) >= 0;
+     });
+     if (paletteSel >= matches.length) paletteSel = 0;
+     list.innerHTML = "";
+     matches.forEach(function(c, i) {
+       var row = document.createElement("div");
+       row.className = "pal-item" + (i === paletteSel ? " sel" : "");
+       row.textContent = c.label;
+       var hint = document.createElement("span");
+       hint.className = "palhint"; hint.textContent = c.hint;
+       row.appendChild(hint);
+       row.onclick = function() { closePalette(); c.run(); };
+       list.appendChild(row);
+     });
+     list.dataset.count = matches.length;
+     return matches;
+   }
+
+   function openPalette() {
+     document.getElementById("palette").classList.remove("hidden");
+     var box = document.getElementById("paletteInput");
+     box.value = ""; paletteSel = 0; renderPalette(); box.focus();
+   }
+
+   function closePalette() {
+     document.getElementById("palette").classList.add("hidden");
+   }
+
+   // ----------------------------------------------------------- theme ---
+
+   function applyTheme(name) {
+     var light = name === "light";
+     document.documentElement.classList.toggle("light", light);
+     var btn = document.getElementById("themeBtn");
+     if (btn) btn.textContent = light ? "Dark" : "Light";
+     try { localStorage.setItem("llm_theme", light ? "light" : "dark"); } catch (err) { /* private mode */ }
+   }
+
+   function toggleTheme() {
+     applyTheme(document.documentElement.classList.contains("light") ? "dark" : "light");
+   }
+
+   // ---------------------------------------------------------- backup ---
+
+   function downloadBackup() {
+     window.location = "/api/backup";
+   }
+
+   async function restoreBackup(file) {
+     if (!file) return;
+     try {
+       var text = await file.text();
+       var data = JSON.parse(text);
+       var r = await fetchJSON("/api/backup/restore", {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+         body: JSON.stringify(data)
+       });
+       var d = (r.data || r).restored || {};
+       alert("Restored " + (d.messages || 0) + " messages, " + (d.prompts || 0) + " prompts, "
+             + (d.feedback || 0) + " feedback rows, " + (d.documents || 0) + " documents.");
+       loadHistory();
+     } catch (err) {
+       alert("Restore failed: " + err.message);
+     }
+   }
+
    async function loadModels() {
      loadDatasetStats();
+     loadDocsStats();
      loadProjectStatus();
      try {
        var out = await fetchJSON("/api/models");
@@ -8487,6 +10202,49 @@ HTML_PAGE = r"""
    loadConfig();
    loadMemory();
    loadPerf();
+   wireDropZone();
+
+   // Restore the saved colour scheme before anything renders.
+   try {
+     applyTheme(localStorage.getItem("llm_theme") === "light" ? "light" : "dark");
+   } catch (err) { applyTheme("dark"); }
+
+   var _restoreInput = document.getElementById("restoreInput");
+   if (_restoreInput) _restoreInput.addEventListener("change", function() {
+     if (_restoreInput.files && _restoreInput.files[0]) restoreBackup(_restoreInput.files[0]);
+     _restoreInput.value = "";
+   });
+
+   // Cmd/Ctrl+K opens the command palette; arrows and Enter drive it, Esc closes.
+   document.addEventListener("keydown", function(e) {
+     var pal = document.getElementById("palette");
+     var open = pal && !pal.classList.contains("hidden");
+     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+       e.preventDefault();
+       open ? closePalette() : openPalette();
+       return;
+     }
+     if (!open) return;
+     if (e.key === "Escape") { e.preventDefault(); closePalette(); return; }
+     var matches = renderPalette();
+     if (e.key === "ArrowDown") {
+       e.preventDefault(); paletteSel = Math.min(paletteSel + 1, matches.length - 1); renderPalette();
+     } else if (e.key === "ArrowUp") {
+       e.preventDefault(); paletteSel = Math.max(paletteSel - 1, 0); renderPalette();
+     } else if (e.key === "Enter") {
+       e.preventDefault();
+       var chosen = matches[paletteSel];
+       closePalette();
+       if (chosen) chosen.run();
+     }
+   });
+   var _palInput = document.getElementById("paletteInput");
+   if (_palInput) _palInput.addEventListener("input", function() { paletteSel = 0; renderPalette(); });
+   var _palOverlay = document.getElementById("palette");
+   if (_palOverlay) _palOverlay.addEventListener("click", function(e) {
+     if (e.target === _palOverlay) closePalette();
+   });
+
    setInterval(refreshHealth, 3000);
    refreshHealth();
  </script>
@@ -8612,7 +10370,7 @@ def create_app(
     registry: ToolRegistry | None = None,
 ):
     """Create and configure the FastAPI application with Pydantic validation."""
-    from fastapi import FastAPI, Query
+    from fastapi import FastAPI, Query, UploadFile, File
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, Response
 
@@ -8738,6 +10496,266 @@ def create_app(
     def dataset_stats():
         return db.dataset_stats()
 
+    @app.get("/api/docs/stats")
+    def docs_stats():
+        return db.document_stats()
+
+    @app.post("/api/docs/index")
+    def docs_index(path: str = Query(...)):
+        try:
+            return {"result": registry._index_docs(path), "stats": db.document_stats()}
+        except Exception as exc:
+            return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=400)
+
+    @app.get("/api/docs/search")
+    def docs_search(q: str = Query(...), limit: int = 5):
+        return {"hits": db.search_documents(q, limit=limit)}
+
+    @app.post("/api/docs/clear")
+    def docs_clear():
+        return {"cleared": db.clear_documents()}
+
+    try:
+        import multipart  # noqa: F401  (python-multipart, required by FastAPI for uploads)
+        _uploads_ok = True
+    except ImportError:
+        _uploads_ok = False
+        log("File upload disabled: `pip install python-multipart` to enable drag-and-drop.",
+            logging.WARNING)
+
+    if _uploads_ok:
+        @app.post("/api/docs/upload")
+        async def docs_upload(file: UploadFile = File(...)):
+            """Accept a file from the browser and index it into the knowledge base.
+
+            Written into the project's uploads/ folder first so the type-aware
+            readers (pdf, docx, csv, notebook, ...) can parse it the same way they
+            parse any other project file.
+            """
+            try:
+                root = registry._root()
+                dest_dir = root / "uploads"
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                # Take only the base name so "../../etc/passwd" cannot escape, and
+                # reject a name that is empty or purely dots after stripping.
+                name = Path(file.filename or "").name.strip()
+                if not name or set(name) <= {"."}:
+                    name = f"upload-{uuid.uuid4().hex[:8]}.bin"
+                dest = dest_dir / name
+                if dest.resolve().parent != dest_dir.resolve():
+                    return JSONResponse({"error": "invalid file name"}, status_code=400)
+                data = await file.read()
+                if not data:
+                    return JSONResponse({"error": "the uploaded file is empty"}, status_code=400)
+                if len(data) > 25 * 1024 * 1024:
+                    return JSONResponse({"error": "file is larger than 25 MB"}, status_code=400)
+                dest.write_bytes(data)
+                result = registry._index_docs(f"uploads/{name}")
+                return {"result": result, "path": f"uploads/{name}", "stats": db.document_stats()}
+            except Exception as exc:
+                return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=400)
+
+    @app.get("/api/uploads/enabled")
+    def uploads_enabled():
+        return {"enabled": _uploads_ok}
+
+    @app.post("/api/docs/index_url")
+    def docs_index_url(url: str = Query(...)):
+        try:
+            return {"result": registry._index_url(url), "stats": db.document_stats()}
+        except Exception as exc:
+            return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=400)
+
+    @app.get("/api/conversations/search")
+    def conversations_search(q: str = Query(...), limit: int = 30):
+        return {"results": db.search_conversations(q, limit=limit)}
+
+    @app.get("/api/conversation/{conversation_id}/export")
+    def conversation_export(conversation_id: str, format: str = Query("markdown", pattern="^(markdown|json)$")):
+        try:
+            text = db.export_conversation(conversation_id, format)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        ext = "md" if format == "markdown" else "json"
+        return Response(
+            content=text,
+            media_type="text/markdown" if format == "markdown" else "application/json",
+            headers={"Content-Disposition": f'attachment; filename="conversation-{conversation_id}.{ext}"'},
+        )
+
+    @app.get("/api/prompts")
+    def prompts_list():
+        return {"prompts": db.list_prompts()}
+
+    @app.post("/api/prompts")
+    def prompts_save(name: str = Query(...), body: str = Query(...)):
+        try:
+            db.save_prompt(name, body)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return {"saved": name.strip(), "prompts": db.list_prompts()}
+
+    @app.delete("/api/prompts/{name}")
+    def prompts_delete(name: str):
+        return {"deleted": db.delete_prompt(name)}
+
+    @app.get("/api/backup")
+    def backup_export():
+        data = db.export_backup()
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        return Response(
+            content=json.dumps(data, indent=2, default=str),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="backup-{stamp}.json"'},
+        )
+
+    @app.post("/api/backup/restore")
+    async def backup_restore(body: dict):
+        try:
+            counts = db.import_backup(body)
+            if not any(counts.values()):
+                return JSONResponse(
+                    {"error": "nothing was restored; the file did not contain any "
+                              "recognisable conversations, prompts, feedback or documents",
+                     "restored": counts},
+                    status_code=400)
+            return {"restored": counts}
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception as exc:
+            return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=400)
+
+    @app.post("/api/conversation/{conversation_id}/fork")
+    def conversation_fork(conversation_id: str, upto: int | None = None):
+        try:
+            return {"conversation_id": db.fork_conversation(conversation_id, upto)}
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+    @app.post("/api/conversation/{conversation_id}/title")
+    def conversation_title(conversation_id: str, title: str = Query(...)):
+        db.set_conversation_title(conversation_id, title)
+        return {"conversation_id": conversation_id, "title": title}
+
+    @app.post("/api/conversation/{conversation_id}/pin")
+    def conversation_pin(conversation_id: str, pinned: bool = True):
+        db.set_conversation_pinned(conversation_id, pinned)
+        return {"conversation_id": conversation_id, "pinned": pinned}
+
+    @app.post("/api/docs/scope")
+    def docs_scope(paths: str = Query("")):
+        """Restrict retrieval to selected documents ('' = whole knowledge base)."""
+        wanted = [p.strip() for p in (paths or "").split(",") if p.strip()]
+        known = {d["path"] for d in db.document_stats().get("items", [])}
+        unknown = [p for p in wanted if p not in known]
+        if unknown:
+            # Scoping to a path that was never indexed would silently return no
+            # passages, which reads as "the model ignored my documents".
+            return JSONResponse(
+                {"error": "these documents are not in the knowledge base: "
+                          + ", ".join(unknown[:5]),
+                 "indexed": sorted(known)[:20]},
+                status_code=400)
+        changed = config.apply({"rag_scope": ",".join(wanted)})
+        return {"scope": config.rag_scope, "changed": changed}
+
+    @app.get("/api/docs/scope")
+    def docs_scope_get():
+        return {"scope": config.rag_scope}
+
+    @app.post("/api/conversation/{conversation_id}/regenerate")
+    def conversation_regenerate(conversation_id: str):
+        """Drop the last answer and hand back the prompt that produced it, so the
+        client can re-send and get a fresh response."""
+        prompt = db.drop_last_exchange(conversation_id)
+        if not prompt:
+            return JSONResponse({"error": "nothing to regenerate"}, status_code=400)
+        return {"prompt": prompt}
+
+    @app.post("/v1/chat/completions")
+    async def openai_chat_completions(body: dict):
+        """OpenAI-compatible endpoint backed by this app's agent.
+
+        Lets external tools (SDKs, editors, other front-ends) drive the full
+        stack — routing, tools, knowledge base, retries — not just the raw model.
+        Supports stream=true (OpenAI-shaped SSE deltas) and non-streaming.
+        """
+        try:
+            messages = body.get("messages") or []
+            prompt = ""
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    prompt = msg.get("content") or ""
+                    break
+            if not prompt:
+                return JSONResponse({"error": {"message": "no user message provided"}},
+                                    status_code=400)
+            history = [{"role": m.get("role"), "content": m.get("content") or ""}
+                       for m in messages[:-1] if m.get("role") in ("user", "assistant")]
+            max_tokens = int(body.get("max_tokens") or config.max_tokens)
+            temperature = float(body.get("temperature", config.temperature))
+            cid = f"openai-{uuid.uuid4().hex[:8]}"
+
+            # Streaming: emit OpenAI-shaped SSE deltas so editors and SDK clients
+            # that expect stream=True (Continue, Zed, the OpenAI SDK) work.
+            if body.get("stream"):
+                async def sse_stream():
+                    made = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+                    created = int(time.time())
+
+                    def chunk(delta: dict, finish=None) -> str:
+                        payload = {
+                            "id": made, "object": "chat.completion.chunk",
+                            "created": created, "model": config.model,
+                            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                        }
+                        return f"data: {json.dumps(payload)}\n\n"
+
+                    yield chunk({"role": "assistant", "content": ""})
+                    sent = ""
+                    try:
+                        async for event in agent.run_iterating(prompt, history, cid,
+                                                               max_tokens, temperature):
+                            if event.get("type") == "token":
+                                piece = event.get("token") or ""
+                                if piece:
+                                    sent += piece
+                                    yield chunk({"content": piece})
+                            elif event.get("type") == "final":
+                                full = event.get("answer") or ""
+                                # If the answer never streamed as tokens, send it now.
+                                if full and not sent:
+                                    yield chunk({"content": full})
+                    except Exception as exc:
+                        yield chunk({"content": f"\n[error: {type(exc).__name__}: {exc}]"})
+                    yield chunk({}, finish="stop")
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(sse_stream(), media_type="text/event-stream")
+
+            answer, used = "", []
+            async for event in agent.run_iterating(prompt, history, cid,
+                                                   max_tokens, temperature):
+                if event.get("type") == "final":
+                    answer = event.get("answer") or ""
+                    used = event.get("tools_used") or []
+            return {
+                "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": config.model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": answer},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "x_tools_used": used,
+            }
+        except Exception as exc:
+            return JSONResponse({"error": {"message": f"{type(exc).__name__}: {exc}"}},
+                                status_code=500)
+
     def _git(args: list[str], limit: int = 60000) -> tuple[bool, str]:
         """Run a read-only git command in the project dir. Returns (ok, output)."""
         root = registry._root()
@@ -8854,6 +10872,26 @@ def create_app(
         max_tokens = request.max_tokens or config.max_tokens
         temperature = config.temperature if request.temperature is None else request.temperature
         return max_tokens, temperature
+
+    def maybe_autotitle(conversation_id: str, first_message: str) -> None:
+        """Title a conversation from its opening question, once.
+
+        Uses the question itself rather than a model call: on an 8GB machine a
+        second generation per conversation is real latency for a cosmetic gain.
+        """
+        try:
+            if db.conversation_title(conversation_id):
+                return
+            text = " ".join((first_message or "").split())
+            if not text:
+                return
+            title = text[:60].rstrip()
+            if len(text) > 60:
+                cut = title.rfind(" ")
+                title = (title[:cut] if cut > 20 else title) + "..."
+            db.set_conversation_title(conversation_id, title)
+        except Exception as exc:
+            log(f"auto-title skipped: {exc}", logging.DEBUG)
 
     def note_implicit_feedback(conversation_id: str, message: str) -> str | None:
         """Turn a short "good job" / "no, wrong" into feedback on the prior answer.
@@ -9076,6 +11114,9 @@ def create_app(
                         conversation_id, "assistant", answer,
                         meta={"trace": trace} if trace else None,
                     )
+                    # Give a brand-new conversation a short title derived from the
+                    # opening question, so the history list is readable at a glance.
+                    await asyncio.to_thread(maybe_autotitle, conversation_id, request.message)
                 await asyncio.to_thread(
                     db.log_metric, "chat_stream", (time.time() - start_time) * 1000, 200)
             except Exception as exc:
@@ -9639,6 +11680,24 @@ def selftest() -> int:
     if "<script>" not in page or "</script>" not in page:
         failures.append("rendered page is missing its <script> block")
 
+    # Structural checks that catch a broken layout (an unbalanced <div> leaves a
+    # view unclosed and collapses the page) and dangling element references (JS
+    # that reads an element the markup never defines). These are exactly the
+    # class of bug that JS syntax checking alone cannot see.
+    _divs_open = len(re.findall(r"<div\b", page))
+    _divs_close = len(re.findall(r"</div>", page))
+    if _divs_open != _divs_close:
+        failures.append(f"UI <div> tags are unbalanced ({_divs_open} open, {_divs_close} close)")
+    _script = re.search(r"<script>(.*?)</script>", page, re.S)
+    if _script:
+        _body = _script.group(1)
+        _defined = set(re.findall(r'\bid="([A-Za-z0-9_]+)"', page))
+        _defined |= set(re.findall(r"getElementById\(['\"]([A-Za-z0-9_]+)['\"]\)\s*\.\w+\s*=", _body))
+        _refs = set(re.findall(r"getElementById\(['\"]([A-Za-z0-9_]+)['\"]\)", _body))
+        _missing = sorted(r for r in _refs if r not in _defined)
+        if _missing:
+            failures.append("UI references elements with no matching id: " + ", ".join(_missing))
+
     with tempfile.TemporaryDirectory() as tmp:
         db = Database(Path(tmp) / "selftest.db")
         db.execute(
@@ -9848,6 +11907,250 @@ def selftest() -> int:
     # auto_iterate_rounds is clamped to a sane band.
     if not (0 <= Config(auto_iterate_rounds=999).auto_iterate_rounds <= 5):
         failures.append("auto_iterate_rounds not clamped")
+    # Type-aware read_file: structured/binary types handled, not dumped as garbage.
+    import json as _json2
+    _ftp = Path(_tf.mkdtemp())
+    _ftreg = ToolRegistry(Config(project_dir=str(_ftp)), None)
+    (_ftp / "d.csv").write_text("name,age\nA,1\nB,2\n")
+    (_ftp / "c.json").write_text(_json2.dumps({"k": 1, "l": [1, 2]}))
+    (_ftp / "n.ipynb").write_text(_json2.dumps({"cells": [{"cell_type": "code", "source": ["x=1\n"]}]}))
+    (_ftp / "b.bin").write_bytes(bytes([0, 1, 2, 0]) * 50)
+    if "columns: name, age" not in _ftreg._read_file("d.csv"):
+        failures.append("read_file did not preview CSV columns")
+    if '"k": 1' not in _ftreg._read_file("c.json"):
+        failures.append("read_file did not pretty-print JSON")
+    if "cell 0 [code]" not in _ftreg._read_file("n.ipynb"):
+        failures.append("read_file did not extract notebook cells")
+    if "binary file" not in _ftreg._read_file("b.bin"):
+        failures.append("read_file dumped a binary file instead of describing it")
+    if "kind: binary" not in _ftreg._file_info("b.bin"):
+        failures.append("file_info did not detect a binary file")
+    # TOML preview (stdlib) and structured write validation need no third-party libs.
+    (_ftp / "p.toml").write_text('[tool]\nk = "v"\n')
+    if "top-level keys: tool" not in _ftreg._read_file("p.toml"):
+        failures.append("read_file did not preview TOML keys")
+    if "valid JSON" not in _ftreg._write_file("ok.json", '{"a": 1}'):
+        failures.append("write_file did not confirm valid JSON")
+    if "not valid JSON" not in _ftreg._write_file("bad.json", "{oops}"):
+        failures.append("write_file did not warn on invalid JSON")
+
+    # Knowledge base: index, BM25 search, replace-on-reindex, and clear.
+    with tempfile.TemporaryDirectory() as _kbtmp:
+        _kbdb = Database(Path(_kbtmp) / "kb.db")
+        if getattr(_kbdb, "fts_enabled", False):
+            _kbdb.index_document("d/a.md", "Retrieval uses BM25 ranking over chunks.", "a")
+            _kbdb.index_document("d/b.md", "Deployment targets Apple Silicon with mlx.", "b")
+            _h = _kbdb.search_documents("bm25 ranking")
+            if not _h or "a.md" not in _h[0]["path"]:
+                failures.append("knowledge base did not rank the matching document first")
+            if not any("b.md" in x["path"] for x in _kbdb.search_documents("apple silicon")):
+                failures.append("knowledge base missed a second document")
+            _kbdb.index_document("d/a.md", "short", "a")
+            if _kbdb.document_stats()["documents"] != 2:
+                failures.append("re-indexing a path should replace, not duplicate")
+            if _kbdb.clear_documents() != 2 or _kbdb.document_stats()["documents"] != 0:
+                failures.append("clearing the knowledge base did not empty it")
+            # RAG injection is a no-op on an empty index and cites paths when not.
+            _ragcfg = Config()
+            _ragreg = ToolRegistry(_ragcfg, _kbdb)
+            _ragag = Agent(_ragcfg, _ragreg, ModelClient(_ragcfg))
+            if _ragag.with_retrieved_context("anything") != "anything":
+                failures.append("RAG should be a no-op when nothing is indexed")
+            _kbdb.index_document("d/c.md", "The cache eviction policy is least-recently-used.", "c")
+            _aug = _ragag.with_retrieved_context("what is the eviction policy?")
+            if "d/c.md" not in _aug or "eviction" not in _aug:
+                failures.append("RAG did not inject the matching passage with its source")
+
+    # Conversation search, export, prompt library, and regenerate.
+    with tempfile.TemporaryDirectory() as _convtmp:
+        _cdb = Database(Path(_convtmp) / "c.db")
+        _cdb.add_message("cx", "user", "how do I tune the KV cache?")
+        _cdb.add_message("cx", "assistant", "Lower max_kv_size to save memory.")
+        _hits = _cdb.search_conversations("kv cache")
+        if not _hits or _hits[0]["conversation_id"] != "cx":
+            failures.append("conversation search did not find a matching chat")
+        _md = _cdb.export_conversation("cx")
+        if "## You" not in _md or "max_kv_size" not in _md:
+            failures.append("markdown export missing content or speaker headings")
+        if '"role"' not in _cdb.export_conversation("cx", "json"):
+            failures.append("json export did not produce structured messages")
+        _cdb.save_prompt("review", "Review this code:")
+        _cdb.save_prompt("review", "Review this code carefully:")
+        if len(_cdb.list_prompts()) != 1:
+            failures.append("saving the same prompt name should update, not duplicate")
+        if not _cdb.delete_prompt("review") or _cdb.list_prompts():
+            failures.append("prompt deletion did not work")
+        _again = _cdb.drop_last_exchange("cx")
+        if not _again or "KV cache" not in _again:
+            failures.append("regenerate did not return the prompt that produced the answer")
+        if [r["role"] for r in _cdb.get_messages("cx")] != ["user"]:
+            failures.append("regenerate did not remove the previous answer")
+
+    # Conversation list carries a readable title for the history panel.
+    with tempfile.TemporaryDirectory() as _htmp:
+        _hdb = Database(Path(_htmp) / "h.db")
+        _hdb.add_message("h1", "user", "How do I tune the KV cache?")
+        _hdb.add_message("h1", "assistant", "Lower max_kv_size.")
+        _convs = _hdb.list_conversations()
+        if not _convs or "title" not in _convs[0]:
+            failures.append("conversation list is missing a title for the history panel")
+        elif "KV cache" not in _convs[0]["title"]:
+            failures.append("conversation title should come from the first user message")
+        if _convs and _convs[0].get("messages") != 2:
+            failures.append("conversation list lost its message count")
+
+    # UI: the new panels and their handlers must exist and resolve.
+    _page = render_ui()
+    for _needed in ("historyView", "promptsPanel", "dropZone", "palette", "paletteInput",
+                    "historyList", "promptList", "fileInput"):
+        if f'id="{_needed}"' not in _page:
+            failures.append(f"UI is missing the {_needed} element")
+    _scriptm = re.search(r"<script>(.*?)</script>", _page, re.S)
+    if _scriptm:
+        for _fn in ("loadHistory", "runHistorySearch", "openConversation", "togglePrompts",
+                    "loadPrompts", "savePrompt", "uploadFiles", "wireDropZone",
+                    "openPalette", "closePalette", "addMessageActions"):
+            if not re.search(rf"function\s+{_fn}\s*\(", _scriptm.group(1)):
+                failures.append(f"UI handler {_fn} is not defined")
+
+    # Conversation titles, pinning, and scoped retrieval.
+    with tempfile.TemporaryDirectory() as _mtmp:
+        _mdb = Database(Path(_mtmp) / "m.db")
+        _mdb.add_message("m1", "user", "first chat")
+        _mdb.add_message("m2", "user", "second chat")
+        _mdb.set_conversation_title("m1", "Renamed thread")
+        _mdb.set_conversation_pinned("m1", True)
+        _ml = _mdb.list_conversations()
+        if not _ml or _ml[0]["conversation_id"] != "m1":
+            failures.append("pinned conversations should sort to the top")
+        if _ml and _ml[0]["title"] != "Renamed thread":
+            failures.append("custom conversation title was not used")
+        if _mdb.conversation_title("m2") is not None:
+            failures.append("untitled conversation should report no custom title")
+        if getattr(_mdb, "fts_enabled", False):
+            _mdb.index_document("x.md", "BM25 ranking scores retrieval results.", "x")
+            _mdb.index_document("y.md", "BM25 ranking appears here too.", "y")
+            if len({h["path"] for h in _mdb.search_documents("bm25 ranking")}) != 2:
+                failures.append("unscoped search should span the knowledge base")
+            _scoped = _mdb.search_documents("bm25 ranking", only=["y.md"])
+            if {h["path"] for h in _scoped} != {"y.md"}:
+                failures.append("scoped search should return only the chosen document")
+
+    # UI: markdown rendering helpers must exist alongside the panels.
+    _page2 = render_ui()
+    _sm = re.search(r"<script>(.*?)</script>", _page2, re.S)
+    if _sm:
+        for _fn in ("renderMarkdown", "renderInline", "makeCodeBlock", "renderScope",
+                    "applyScope", "clearScope"):
+            if not re.search(rf"function\s+{_fn}\s*\(", _sm.group(1)):
+                failures.append(f"UI helper {_fn} is not defined")
+        # Model output must never be injected as raw HTML.
+        if "innerHTML = text" in _sm.group(1) or "innerHTML=text" in _sm.group(1):
+            failures.append("model output is being assigned as innerHTML (injection risk)")
+    for _needed in ("docScope",):
+        if f'id="{_needed}"' not in _page2:
+            failures.append(f"UI is missing the {_needed} element")
+
+    # Backup round-trips and forking preserves the original conversation.
+    with tempfile.TemporaryDirectory() as _btmp:
+        _bdb = Database(Path(_btmp) / "b1.db")
+        _bdb.add_message("k1", "user", "first question")
+        _bdb.add_message("k1", "assistant", "first answer")
+        _bdb.add_message("k1", "user", "second question")
+        _bdb.set_conversation_title("k1", "Kept name")
+        _bdb.save_prompt("p1", "body")
+        _payload = _bdb.export_backup()
+        if not _payload.get("messages") or "version" not in _payload:
+            failures.append("backup export produced no messages or no version")
+        _bdb2 = Database(Path(_btmp) / "b2.db")
+        _restored = _bdb2.import_backup(_payload)
+        if _restored["messages"] != 3 or _restored["prompts"] != 1:
+            failures.append("backup restore did not bring back messages and prompts")
+        if not _bdb2.list_conversations() or _bdb2.list_conversations()[0]["title"] != "Kept name":
+            failures.append("backup restore lost the conversation title")
+        _msgs = _bdb.get_messages("k1")
+        _fork = _bdb.fork_conversation("k1", _msgs[1]["id"])
+        if len(_bdb.get_messages(_fork)) != 2:
+            failures.append("fork should copy only messages up to the chosen point")
+        if len(_bdb.get_messages("k1")) != 3:
+            failures.append("fork must not modify the original conversation")
+
+    # UI: highlighting, streaming render, theme and backup helpers exist.
+    _page3 = render_ui()
+    _sm3 = re.search(r"<script>(.*?)</script>", _page3, re.S)
+    if _sm3:
+        for _fn in ("highlightInto", "scheduleMarkdown", "applyTheme", "toggleTheme",
+                    "downloadBackup", "restoreBackup"):
+            if not re.search(rf"function\s+{_fn}\s*\(", _sm3.group(1)):
+                failures.append(f"UI helper {_fn} is not defined")
+    if "html.light" not in _page3:
+        failures.append("light theme styles are missing")
+    if 'id="restoreInput"' not in _page3 or 'id="themeBtn"' not in _page3:
+        failures.append("backup/theme controls are missing from the UI")
+
+    # Error handling: malformed input is rejected clearly instead of crashing.
+    with tempfile.TemporaryDirectory() as _etmp:
+        _edb = Database(Path(_etmp) / "e.db")
+        for _bad, _why in ((None, "None"), ([1, 2], "a list"), ("text", "a string")):
+            try:
+                _edb.import_backup(_bad)
+                failures.append(f"import_backup accepted {_why} instead of rejecting it")
+            except ValueError:
+                pass
+            except Exception as _exc:
+                failures.append(f"import_backup({_why}) raised {type(_exc).__name__}, not ValueError")
+        try:
+            _edb.import_backup({"version": 99})
+            failures.append("import_backup accepted a newer backup version")
+        except ValueError:
+            pass
+        # A section of the wrong shape is skipped, not fatal.
+        _edb.import_backup({"messages": "not-a-list"})
+        for _call, _label in (
+            (lambda: _edb.fork_conversation("ghost"), "fork of an empty conversation"),
+            (lambda: _edb.export_conversation("ghost"), "export of an empty conversation"),
+            (lambda: _edb.save_prompt("", "body"), "prompt with no name"),
+            (lambda: _edb.save_prompt("name", "  "), "prompt with no body"),
+        ):
+            try:
+                _call()
+                failures.append(f"{_label} should have been refused")
+            except ValueError:
+                pass
+        # LIKE wildcards are matched literally, not as "match everything".
+        _edb.add_message("w1", "user", "100% sure")
+        _edb.add_message("w2", "user", "nothing special")
+        if [r["conversation_id"] for r in _edb.search_conversations("%")] != ["w1"]:
+            failures.append("a '%' search should match literally, not every conversation")
+
+        _eproj = Path(_etmp) / "proj"
+        (_eproj / "sub").mkdir(parents=True)
+        _ereg = ToolRegistry(Config(project_dir=str(_eproj)), _edb)
+        for _call, _label in (
+            (lambda: _ereg._read_file("sub"), "reading a directory"),
+            (lambda: _ereg._write_file("sub", "x"), "writing onto a directory"),
+        ):
+            try:
+                _call()
+                failures.append(f"{_label} should have been refused")
+            except ValueError:
+                pass
+        (_eproj / "empty.csv").write_text("")
+        if "empty" not in _ereg._read_file("empty.csv"):
+            failures.append("an empty CSV should say so rather than show a bogus preview")
+        (_eproj / "bad.json").write_text("{nope")
+        if "invalid JSON" not in _ereg._read_file("bad.json"):
+            failures.append("invalid JSON should be reported with its position")
+        if "not a web address" not in _ereg._index_url("not-a-url"):
+            failures.append("index_url should explain that a bare word is not a URL")
+        if "disappeared" not in _ereg.syntax_check(["gone.py"]):
+            failures.append("syntax_check should report an unreadable file, not skip it")
+    # Safeguards clamp the retrieval settings too.
+    if Config(rag_passages=-3).rag_passages < 1 or Config(rag_passages=999).rag_passages > 20:
+        failures.append("rag_passages is not clamped to a usable range")
+    if Config(rag_scope=" , ,a.md , ").rag_scope != "a.md":
+        failures.append("rag_scope should drop blank entries")
+
     # In-process syntax check catches broken Python without executing it.
     _syproj = Path(_tf.mkdtemp())
     _syreg = ToolRegistry(Config(project_dir=str(_syproj)), None)
