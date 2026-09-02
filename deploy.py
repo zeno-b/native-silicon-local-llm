@@ -3347,6 +3347,11 @@ class ToolRegistry:
             },
             required=[],
             handler=self._list_files,
+            routable=bool(self.config.project_dir),
+            route_hint=('{"action":"list_files","recursive":"true"} if the user asks '
+                        "about their project, codebase or repository in general terms "
+                        '("what is in my project", "fix this code") and you do not yet '
+                        "know which files exist. ALWAYS start here for codebase work."),
         ))
         self._add(Tool(
             name="read_file",
@@ -3357,6 +3362,9 @@ class ToolRegistry:
             parameters={"path": "file path relative to the project"},
             required=["path"],
             handler=self._read_file,
+            routable=bool(self.config.project_dir),
+            route_hint=('{"action":"read_file","path":"<path>"} if the user names a '
+                        "specific file in their project to look at, fix or change."),
         ))
         self._add(Tool(
             name="file_info",
@@ -3423,6 +3431,9 @@ class ToolRegistry:
         self._add(Tool(
             name="search_files",
             description="Search project files for a regular expression and return matching lines.",
+            routable=bool(self.config.project_dir),
+            route_hint=('{"action":"search_files","pattern":"<regex>"} if the user asks '
+                        "where something is defined or used in their project."),
             parameters={
                 "pattern": "regular expression",
                 "path": "subdirectory to search, default the workspace root",
@@ -5329,10 +5340,22 @@ class Agent:
 
         # The menu: an answer option plus one line per routable tool, taken
         # straight from each tool's route_hint.
-        answer_option = ('{"action":"answer"} — the DEFAULT. Use it whenever you '
-                         "can answer from your own knowledge: general facts, "
-                         "explanations, definitions, writing, math, reasoning, and "
-                         "all code. Most questions are answer.")
+        # When a real codebase is attached, "answer" must NOT claim to cover code:
+        # a request to fix the user's own files cannot be satisfied from weights.
+        has_project = bool(self.config.project_dir)
+        if has_project:
+            answer_option = ('{"action":"answer"} — the DEFAULT for general questions '
+                             "you can answer from your own knowledge: facts, "
+                             "explanations, definitions, writing, math, reasoning, and "
+                             "code written from scratch that does NOT touch the user's "
+                             "project. If the user refers to THEIR code, this project, "
+                             "a file, a bug, or says 'fix this', do NOT answer — use a "
+                             "file tool to look at the real files first.")
+        else:
+            answer_option = ('{"action":"answer"} — the DEFAULT. Use it whenever you '
+                             "can answer from your own knowledge: general facts, "
+                             "explanations, definitions, writing, math, reasoning, and "
+                             "all code. Most questions are answer.")
         options = [answer_option] + [t.route_hint for t in routable]
         system = (
             "You are a router. Read the user's latest message and reply with "
@@ -6199,7 +6222,13 @@ class Agent:
                        "message": "working offline — answering from my own knowledge"}
                 decision = {"action": "answer"}
             elif is_code_request(user_message):
-                if (CODE_NEEDS_LOOKUP.search(user_message)
+                # With a project attached, code requests must go through the
+                # router so it can pick a file tool: "fix this code" is about the
+                # user's real files and cannot be answered from weights alone.
+                if self.config.project_dir:
+                    yield {"type": "phase", "label": "deciding how to handle this"}
+                    decision = await self.route(user_message, history)
+                elif (CODE_NEEDS_LOOKUP.search(user_message)
                         and self.registry.get("web_search") is not None):
                     decision = {"action": "web_search",
                                 "query": code_search_topic(user_message)}
@@ -7498,6 +7527,30 @@ HTML_PAGE = r"""
      font-size: 12px; line-height: 1.45;
      font-family: ui-monospace, Menlo, monospace;
    }
+   /* Folder picker */
+   #browser {
+     position: fixed; inset: 0; background: rgba(0,0,0,.55);
+     display: flex; align-items: flex-start; justify-content: center;
+     padding-top: 10vh; z-index: 70;
+   }
+   #browser.hidden { display: none; }
+   #browserBox {
+     width: min(620px, 94vw); background: var(--panel-bg);
+     border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+     box-shadow: 0 20px 60px rgba(0,0,0,.5);
+   }
+   #browserPath {
+     padding: 12px 14px; font-size: 12px; color: #999;
+     border-bottom: 1px solid var(--border);
+     overflow-wrap: anywhere;
+   }
+   #browserList { max-height: 46vh; overflow-y: auto; }
+   .dir-item {
+     padding: 9px 14px; font-size: 13px; cursor: pointer;
+     display: flex; justify-content: space-between; gap: 10px;
+   }
+   .dir-item:hover { background: rgba(10,132,255,.15); }
+   .dir-item .repo { color: var(--success); font-size: 11px; }
    /* Per-message actions */
    .msg-actions { margin-top: 6px; display: flex; gap: 6px; }
    .msg-actions button {
@@ -7812,6 +7865,7 @@ HTML_PAGE = r"""
        <label style="display:block;font-size:12px;color:#999;margin:4px 0 4px">Project directory (PROJECT_DIR)</label>
        <div class="row">
          <div><input id="cfgProjectDir" type="text" placeholder="/Users/you/path/to/repo"></div>
+         <div style="flex:0 0 auto"><button onclick="openBrowser()" data-tip="Browse your folders and pick the project directory." title="Browse for a folder">Browse...</button></div>
          <div style="flex:0 0 auto"><button onclick="saveProjectDir()" data-tip="Point the file tools at this local codebase. Empty = sandbox workspace only." title="Set project directory">Set</button></div>
        </div>
        <div class="hint">
@@ -7827,6 +7881,17 @@ HTML_PAGE = r"""
        </div>
        <div class="hint" id="sandboxHint" style="margin-top:8px"></div>
        <pre id="projectDiff" class="gbody gdiff" style="display:none;margin-top:8px"></pre>
+     </div>
+   </div>
+
+   <div id="browser" class="hidden">
+     <div id="browserBox">
+       <div id="browserPath">~</div>
+       <div id="browserList"></div>
+       <div class="row" style="padding:10px 14px;border-top:1px solid var(--border)">
+         <button onclick="chooseCurrentFolder()" data-tip="Use the folder shown above as the project directory." title="Use this folder">Use this folder</button>
+         <button onclick="closeBrowser()" title="Cancel">Cancel</button>
+       </div>
      </div>
    </div>
 
@@ -10063,6 +10128,70 @@ HTML_PAGE = r"""
      document.getElementById("palette").classList.add("hidden");
    }
 
+   // --------------------------------------------------- folder picker ---
+
+   var browsePath = "";
+
+   async function openBrowser(start) {
+     document.getElementById("browser").classList.remove("hidden");
+     await loadBrowse(start || (document.getElementById("cfgProjectDir").value || "").trim());
+   }
+
+   function closeBrowser() {
+     document.getElementById("browser").classList.add("hidden");
+   }
+
+   async function loadBrowse(path) {
+     var list = document.getElementById("browserList");
+     var label = document.getElementById("browserPath");
+     list.textContent = "loading...";
+     try {
+       var r = await fetchJSON("/api/browse?path=" + encodeURIComponent(path || ""));
+       var d = r.data || r;
+       if (d.error) { list.textContent = d.error; return; }
+       browsePath = d.path;
+       label.textContent = d.path + (d.is_git_repo ? "   (git repository)" : "");
+       list.innerHTML = "";
+       if (d.parent) {
+         var up = document.createElement("div");
+         up.className = "dir-item";
+         up.textContent = "../";
+         up.onclick = function() { loadBrowse(d.parent); };
+         list.appendChild(up);
+       }
+       if (!d.entries.length) {
+         var none = document.createElement("div");
+         none.className = "dir-item";
+         none.textContent = "(no sub-folders)";
+         list.appendChild(none);
+       }
+       d.entries.forEach(function(e) {
+         var row = document.createElement("div");
+         row.className = "dir-item";
+         var name = document.createElement("span");
+         name.textContent = e.name + "/";
+         row.appendChild(name);
+         if (e.is_git_repo) {
+           var tag = document.createElement("span");
+           tag.className = "repo";
+           tag.textContent = "git repo";
+           row.appendChild(tag);
+         }
+         row.onclick = function() { loadBrowse(e.path); };
+         list.appendChild(row);
+       });
+     } catch (err) {
+       list.textContent = "Could not browse: " + err.message;
+     }
+   }
+
+   function chooseCurrentFolder() {
+     if (!browsePath) return;
+     document.getElementById("cfgProjectDir").value = browsePath;
+     closeBrowser();
+     saveProjectDir();
+   }
+
    // ----------------------------------------------------------- theme ---
 
    function applyTheme(name) {
@@ -10622,6 +10751,46 @@ def create_app(
             return {"restored": counts}
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception as exc:
+            return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=400)
+
+    @app.get("/api/browse")
+    def browse_directories(path: str = Query("")):
+        """List sub-directories so the UI can offer a real folder picker.
+
+        The browser cannot hand back an absolute path (it only exposes file
+        contents, never locations), so directory selection has to be served from
+        this side. Read-only: names and paths, never file contents.
+        """
+        try:
+            base = Path(path).expanduser() if path.strip() else Path.home()
+            base = base.resolve()
+            if not base.is_dir():
+                return JSONResponse({"error": f"{base} is not a directory"}, status_code=400)
+            entries = []
+            for child in sorted(base.iterdir(), key=lambda c: c.name.lower()):
+                if child.name.startswith(".") and child.name != ".git":
+                    continue
+                try:
+                    if child.is_dir():
+                        entries.append({
+                            "name": child.name,
+                            "path": str(child),
+                            "is_git_repo": (child / ".git").exists(),
+                        })
+                except OSError:
+                    continue
+                if len(entries) >= 300:
+                    break
+            return {
+                "path": str(base),
+                "parent": str(base.parent) if base.parent != base else None,
+                "home": str(Path.home()),
+                "is_git_repo": (base / ".git").exists(),
+                "entries": entries,
+            }
+        except PermissionError:
+            return JSONResponse({"error": f"no permission to read {path}"}, status_code=403)
         except Exception as exc:
             return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=400)
 
@@ -12150,6 +12319,23 @@ def selftest() -> int:
         failures.append("rag_passages is not clamped to a usable range")
     if Config(rag_scope=" , ,a.md , ").rag_scope != "a.md":
         failures.append("rag_scope should drop blank entries")
+
+    # Codebase work must be routable: with a project attached the router has to be
+    # able to choose a file tool, or "fix this code" is answered from weights and
+    # the user's files are never touched.
+    with tempfile.TemporaryDirectory() as _rtmp:
+        _rproj = Path(_rtmp) / "proj"
+        _rproj.mkdir()
+        _withproj = ToolRegistry(Config(project_dir=str(_rproj)), None)
+        _routable = {t.name for t in _withproj.routable()}
+        for _needed in ("list_files", "read_file", "search_files"):
+            if _needed not in _routable:
+                failures.append(f"{_needed} must be routable when a project is set")
+        _noproj = ToolRegistry(Config(project_dir=""), None)
+        if "list_files" in {t.name for t in _noproj.routable()}:
+            failures.append("file tools should not be routable without a project")
+    if not is_code_request("fix this code"):
+        failures.append("'fix this code' must be recognised as a code request")
 
     # In-process syntax check catches broken Python without executing it.
     _syproj = Path(_tf.mkdtemp())
