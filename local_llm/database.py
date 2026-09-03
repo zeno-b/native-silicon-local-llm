@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Literal
 
 from .core import *  # noqa: F401,F403
+from .obslog import *  # noqa: F401,F403
 
 
 class Database:
@@ -295,16 +296,160 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_task_events_run
                 ON task_events(run_id, seq)
             """)
+            # Memories are per-user: uniqueness is (user_id, key), not key alone,
+            # so one user's note can never overwrite or read another's. Fresh
+            # databases get this shape directly; the migration below upgrades an
+            # older single-user memories table (key as the sole primary key).
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS memories (
-                    key TEXT PRIMARY KEY,
+                    id INTEGER PRIMARY KEY,
+                    user_id TEXT NOT NULL DEFAULT 'local',
+                    key TEXT NOT NULL,
                     value TEXT NOT NULL,
                     conversation_id TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, key)
                 )
             """)
+
+            self._migrate_multiuser(conn)
             conn.commit()
+
+    # ---------------------------------------------------------- migrations --
+
+    def _migrate_multiuser(self, conn: sqlite3.Connection) -> None:
+        """Additive, idempotent migration to the multi-user / multi-node schema.
+
+        Adds the users/sessions/imports/routing_events tables and stamps a
+        `user_id` owner column (backfilled to the sentinel local user) onto every
+        user-owned table. Safe to run on every startup and on any older database:
+        it only creates what is missing and only backfills NULLs.
+        """
+        sentinel = SENTINEL_LOCAL_USER
+
+        # --- Auth: users and sessions ------------------------------------- #
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT,
+                role TEXT NOT NULL DEFAULT 'user',
+                source TEXT NOT NULL DEFAULT 'local',
+                email TEXT,
+                display_name TEXT,
+                oidc_subject TEXT,
+                disabled INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login_at TIMESTAMP
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_oidc ON users(oidc_subject)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL,
+                ip TEXT,
+                user_agent TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at)")
+
+        # --- Claude-history import jobs ------------------------------------ #
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS imports (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                filename TEXT,
+                size_bytes INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending',
+                progress INTEGER NOT NULL DEFAULT 0,
+                counts TEXT,
+                warnings TEXT,
+                error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                finished_at TIMESTAMP
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_imports_user ON imports(user_id, created_at DESC)")
+
+        # --- Node routing observability ----------------------------------- #
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS routing_events (
+                id INTEGER PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                correlation_id TEXT,
+                task_id TEXT,
+                user_id TEXT,
+                conversation_id TEXT,
+                kind TEXT,
+                requested_model TEXT,
+                selected_model TEXT,
+                selected_node TEXT,
+                reason TEXT,
+                candidates TEXT,
+                status TEXT,
+                attempt INTEGER DEFAULT 0,
+                duration_ms REAL,
+                error TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_routing_created ON routing_events(created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_routing_task ON routing_events(task_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_routing_node ON routing_events(selected_node, created_at DESC)")
+
+        # --- Owner column on every user-owned table ----------------------- #
+        # ADD COLUMN ... DEFAULT is constant so existing rows read as the
+        # sentinel owner; the explicit UPDATE covers any pre-existing NULLs.
+        for table in ("messages", "conversation_meta", "feedback", "tasks",
+                      "tool_calls", "metrics", "documents", "task_runs"):
+            cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if not cols:
+                continue  # table absent on this build
+            if "user_id" not in cols:
+                # Only announce it as a migration when there is real data to
+                # stamp; a brand-new table is just being born with the column.
+                existing = conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()
+                if existing and existing["c"]:
+                    log(f"Migrating {table}: adding user_id owner column "
+                        f"({existing['c']} rows -> owner '{sentinel}').")
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN user_id TEXT NOT NULL DEFAULT '{sentinel}'")
+                conn.execute(
+                    f"UPDATE {table} SET user_id = ? WHERE user_id IS NULL OR user_id = ''",
+                    (sentinel,))
+        for table, col in (("messages", "user_id"), ("feedback", "user_id"),
+                           ("tasks", "user_id"), ("documents", "user_id")):
+            conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{table}_user ON {table}({col})")
+
+        # --- memories: migrate the old (key-only PK) table if present ------ #
+        mem_cols = {row["name"] for row in conn.execute("PRAGMA table_info(memories)")}
+        if mem_cols and "user_id" not in mem_cols:
+            log("Migrating memories to per-user keys ((user_id, key) unique).")
+            conn.execute("ALTER TABLE memories RENAME TO memories_legacy")
+            conn.execute("""
+                CREATE TABLE memories (
+                    id INTEGER PRIMARY KEY,
+                    user_id TEXT NOT NULL DEFAULT 'local',
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    conversation_id TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, key)
+                )
+            """)
+            conn.execute(
+                "INSERT INTO memories (user_id, key, value, conversation_id, created_at, updated_at) "
+                "SELECT ?, key, value, conversation_id, created_at, updated_at FROM memories_legacy",
+                (sentinel,))
+            conn.execute("DROP TABLE memories_legacy")
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         conn = self._connection()
@@ -353,9 +498,13 @@ class Database:
         limit: int = 50,
         approved_only: bool = False,
         search: str | None = None,
+        user_id: str | None = None,
     ) -> list[dict]:
         sql = "SELECT * FROM feedback WHERE 1=1"
         params: list[Any] = []
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
         if approved_only:
             sql += " AND approved_for_training = 1"
         if search:
@@ -386,8 +535,14 @@ class Database:
         }
 
     def index_document(self, path: str, text: str, title: str = "",
-                       chunk_chars: int = 1200, overlap: int = 150) -> int:
-        """Store a document as overlapping chunks for retrieval. Returns chunk count."""
+                       chunk_chars: int = 1200, overlap: int = 150,
+                       user_id: str | None = None) -> int:
+        """Store a document as overlapping chunks for retrieval. Returns chunk count.
+
+        The owner (user_id, defaulting to the sentinel local user) is recorded on
+        the documents row so retrieval can be scoped: a user sees their own
+        documents plus anything owned by the shared owner.
+        """
         if not getattr(self, "fts_enabled", False):
             return 0
         self.remove_document(path)
@@ -403,10 +558,20 @@ class Database:
         for piece in chunks:
             self.execute(f"INSERT INTO {table} (path, chunk) VALUES (?, ?)", (path, piece))
         self.execute(
-            "INSERT OR REPLACE INTO documents (path, title, chars, chunks) VALUES (?, ?, ?, ?)",
-            (path, title or Path(path).name, len(text), len(chunks)))
+            "INSERT OR REPLACE INTO documents (path, title, chars, chunks, user_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (path, title or Path(path).name, len(text), len(chunks),
+             user_id or SENTINEL_LOCAL_USER))
         self.commit()
         return len(chunks)
+
+    def _owned_paths_clause(self, user_id: str | None) -> tuple[str, list[Any]]:
+        """SQL fragment restricting chunk paths to those a user may retrieve
+        (their own documents plus shared ones). Empty when user_id is None."""
+        if user_id is None:
+            return "", []
+        return (" AND path IN (SELECT path FROM documents WHERE user_id IN (?, ?))",
+                [user_id, SHARED_OWNER])
 
     def _chunk_table(self) -> str:
         """Which table holds chunks: the FTS5 virtual table, or the plain
@@ -420,8 +585,14 @@ class Database:
         self.execute("DELETE FROM documents WHERE path = ?", (path,))
         self.commit()
 
-    def search_documents(self, query: str, limit: int = 5, only: list[str] | None = None) -> list[dict]:
-        """BM25-ranked chunk search. Returns [{path, chunk}] best first."""
+    def search_documents(self, query: str, limit: int = 5, only: list[str] | None = None,
+                         user_id: str | None = None) -> list[dict]:
+        """BM25-ranked chunk search. Returns [{path, chunk}] best first.
+
+        When user_id is given, results are restricted to documents that user owns
+        plus shared documents, so one user's imported material never leaks into
+        another user's retrieval.
+        """
         if not getattr(self, "fts_enabled", False):
             return []
         # FTS5 treats punctuation as syntax; reduce the query to bare terms and
@@ -430,7 +601,7 @@ class Database:
         if not terms:
             return []
         if getattr(self, "search_mode", "fts5") != "fts5":
-            return self._search_documents_fallback(terms, limit, only)
+            return self._search_documents_fallback(terms, limit, only, user_id)
         expr = " OR ".join(terms[:12])
         sql = "SELECT path, chunk FROM doc_chunks WHERE doc_chunks MATCH ?"
         params: list[Any] = [expr]
@@ -438,6 +609,9 @@ class Database:
             # Scope retrieval to chosen documents ("chat with this document").
             sql += " AND path IN (" + ",".join("?" for _ in only) + ")"
             params.extend(only)
+        owner_clause, owner_params = self._owned_paths_clause(user_id)
+        sql += owner_clause
+        params.extend(owner_params)
         sql += " ORDER BY rank LIMIT ?"
         params.append(limit)
         try:
@@ -447,7 +621,8 @@ class Database:
         return [{"path": r["path"], "chunk": r["chunk"]} for r in rows]
 
     def _search_documents_fallback(self, terms: list[str], limit: int,
-                                   only: list[str] | None) -> list[dict]:
+                                   only: list[str] | None,
+                                   user_id: str | None = None) -> list[dict]:
         """Ranked search without FTS5.
 
         Scores each chunk the way BM25 broadly does: a term is worth more when it
@@ -461,6 +636,9 @@ class Database:
         if only:
             clauses.append("path IN (" + ",".join("?" for _ in only) + ")")
             params.extend(only)
+        if user_id is not None:
+            clauses.append("path IN (SELECT path FROM documents WHERE user_id IN (?, ?))")
+            params.extend([user_id, SHARED_OWNER])
         if terms:
             like_bits = []
             for term in terms[:12]:
@@ -499,11 +677,16 @@ class Database:
         scored.sort(key=lambda item: item[0], reverse=True)
         return [{"path": p, "chunk": c} for _, p, c in scored[:limit]]
 
-    def document_stats(self) -> dict:
+    def document_stats(self, user_id: str | None = None) -> dict:
         if not getattr(self, "fts_enabled", False):
             return {"enabled": False, "documents": 0, "chunks": 0, "items": []}
+        where, params = "", []
+        if user_id is not None:
+            where = "WHERE user_id IN (?, ?)"
+            params = [user_id, SHARED_OWNER]
         rows = self.execute(
-            "SELECT path, title, chars, chunks, indexed_at FROM documents ORDER BY indexed_at DESC"
+            f"SELECT path, title, chars, chunks, indexed_at FROM documents {where} "
+            f"ORDER BY indexed_at DESC", tuple(params)
         ).fetchall()
         items = [dict(r) for r in rows]
         return {"enabled": True, "documents": len(items),
@@ -519,17 +702,24 @@ class Database:
         self.commit()
         return int(n or 0)
 
-    def search_conversations(self, query: str, limit: int = 30) -> list[dict]:
+    def search_conversations(self, query: str, limit: int = 30,
+                             user_id: str | None = None) -> list[dict]:
         """Find conversations containing a phrase, newest first, with a snippet."""
         # Escape LIKE wildcards so searching for "%" or "_" looks for those
         # characters instead of matching every conversation.
         safe = (query or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         like = f"%{safe}%"
+        owner = ""
+        params: list[Any] = [like]
+        if user_id is not None:
+            owner = "AND user_id = ?"
+            params.append(user_id)
+        params.append(limit)
         rows = self.execute(
-            """SELECT conversation_id, role, content, MAX(created_at) AS created_at
-               FROM messages WHERE content LIKE ? ESCAPE '\\'
+            f"""SELECT conversation_id, role, content, MAX(created_at) AS created_at
+               FROM messages WHERE content LIKE ? ESCAPE '\\' {owner}
                GROUP BY conversation_id ORDER BY created_at DESC LIMIT ?""",
-            (like, limit)).fetchall()
+            tuple(params)).fetchall()
         out = []
         for r in rows:
             content = r["content"] or ""
@@ -540,8 +730,9 @@ class Database:
                         "snippet": snippet, "created_at": r["created_at"]})
         return out
 
-    def export_conversation(self, conversation_id: str, fmt: str = "markdown") -> str:
-        rows = self.get_messages(conversation_id, limit=10000)
+    def export_conversation(self, conversation_id: str, fmt: str = "markdown",
+                            user_id: str | None = None) -> str:
+        rows = self.get_messages(conversation_id, limit=10000, user_id=user_id)
         if not rows:
             raise ValueError(f"conversation {conversation_id!r} has no messages to export")
         if fmt == "json":
@@ -573,10 +764,10 @@ class Database:
         self.commit()
         return cur.rowcount > 0
 
-    def drop_last_exchange(self, conversation_id: str) -> str | None:
+    def drop_last_exchange(self, conversation_id: str, user_id: str | None = None) -> str | None:
         """Remove the last assistant reply (and return the user prompt that led to
         it) so the turn can be regenerated."""
-        rows = self.get_messages(conversation_id, limit=50)
+        rows = self.get_messages(conversation_id, limit=50, user_id=user_id)
         if not rows:
             return None
         last_user = None
@@ -685,23 +876,34 @@ class Database:
         self.commit()
         return counts
 
-    def fork_conversation(self, conversation_id: str, upto_message_id: int | None = None) -> str:
+    def fork_conversation(self, conversation_id: str, upto_message_id: int | None = None,
+                          user_id: str | None = None) -> str:
         """Copy a conversation (optionally only up to a message) into a new one,
-        so you can explore a different direction without losing the original."""
-        existing = self.execute(
-            "SELECT COUNT(*) AS c FROM messages WHERE conversation_id = ?",
-            (conversation_id,)).fetchone()
+        so you can explore a different direction without losing the original.
+
+        When user_id is given the source is filtered by owner and the new
+        conversation is owned by that user, so a fork stays within one account.
+        """
+        check = "SELECT COUNT(*) AS c FROM messages WHERE conversation_id = ?"
+        check_params: list[Any] = [conversation_id]
+        if user_id is not None:
+            check += " AND user_id = ?"
+            check_params.append(user_id)
+        existing = self.execute(check, tuple(check_params)).fetchone()
         if not existing or not existing["c"]:
             raise ValueError(f"conversation {conversation_id!r} has no messages to fork")
         new_id = f"fork-{uuid.uuid4().hex[:10]}"
         sql = "SELECT role, content FROM messages WHERE conversation_id = ?"
         params: list[Any] = [conversation_id]
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
         if upto_message_id:
             sql += " AND id <= ?"
             params.append(upto_message_id)
         sql += " ORDER BY id ASC"
         for row in self.execute(sql, tuple(params)).fetchall():
-            self.add_message(new_id, row["role"], row["content"])
+            self.add_message(new_id, row["role"], row["content"], user_id=user_id)
         base = self.conversation_title(conversation_id) or conversation_id[:8]
         self.set_conversation_title(new_id, f"{base} (fork)"[:120])
         return new_id
@@ -709,15 +911,15 @@ class Database:
     def record_feedback(self, user_prompt: str, assistant_response: str, rating: int,
                         approved: int, corrected: str | None = None,
                         session_id: str | None = None, model_id: str | None = None,
-                        source: str = "button") -> None:
+                        source: str = "button", user_id: str | None = None) -> None:
         """Insert one feedback row (used by the button and by implicit chat feedback)."""
         self.execute(
             """INSERT INTO feedback
                (user_prompt, assistant_response, rating, corrected_response,
-                approved_for_training, session_id, model_id, source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                approved_for_training, session_id, model_id, source, user_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (user_prompt, assistant_response, rating, corrected, approved,
-             session_id or "implicit", model_id, source),
+             session_id or "implicit", model_id, source, user_id or SENTINEL_LOCAL_USER),
         )
         self.commit()
 
@@ -799,43 +1001,83 @@ class Database:
         role: str,
         content: str,
         meta: dict | None = None,
+        user_id: str | None = None,
     ) -> int:
         cursor = self.execute(
-            "INSERT INTO messages (conversation_id, role, content, est_tokens, meta) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO messages (conversation_id, role, content, est_tokens, meta, user_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             (
                 conversation_id,
                 role,
                 content,
                 estimate_tokens(content),
                 json.dumps(meta) if meta else None,
+                user_id or SENTINEL_LOCAL_USER,
             ),
         )
         self.commit()
         return int(cursor.lastrowid or 0)
 
-    def get_messages(self, conversation_id: str, limit: int = 200) -> list[dict]:
-        """Return the tail of a conversation in chronological order."""
+    def get_messages(self, conversation_id: str, limit: int = 200,
+                     user_id: str | None = None) -> list[dict]:
+        """Return the tail of a conversation in chronological order.
+
+        When user_id is given, the conversation is filtered by owner too, so a
+        client cannot read another user's conversation by guessing its id.
+        """
+        sql = "SELECT * FROM messages WHERE conversation_id = ?"
+        params: list[Any] = [conversation_id]
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
         rows = self.execute(
-            "SELECT * FROM (SELECT * FROM messages WHERE conversation_id = ? "
-            "ORDER BY id DESC LIMIT ?) ORDER BY id ASC",
-            (conversation_id, limit),
+            f"SELECT * FROM ({sql} ORDER BY id DESC LIMIT ?) ORDER BY id ASC",
+            (*params, limit),
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def clear_conversation(self, conversation_id: str) -> int:
-        cursor = self.execute(
-            "DELETE FROM messages WHERE conversation_id = ?", (conversation_id,)
-        )
+    def can_access_conversation(self, conversation_id: str, user_id: str | None) -> bool:
+        """True if the conversation is empty (new) or owned by this user.
+
+        A None user_id means "no scoping" (admin/global or auth disabled) and
+        always passes. An empty conversation belongs to whoever writes first.
+        """
+        if user_id is None:
+            return True
+        row = self.execute(
+            "SELECT user_id, COUNT(*) AS c FROM messages WHERE conversation_id = ?",
+            (conversation_id,)).fetchone()
+        if not row or not row["c"]:
+            return True
+        return row["user_id"] == user_id
+
+    def conversation_owner(self, conversation_id: str) -> str | None:
+        row = self.execute(
+            "SELECT user_id FROM messages WHERE conversation_id = ? LIMIT 1",
+            (conversation_id,)).fetchone()
+        return row["user_id"] if row else None
+
+    def clear_conversation(self, conversation_id: str, user_id: str | None = None) -> int:
+        sql = "DELETE FROM messages WHERE conversation_id = ?"
+        params: list[Any] = [conversation_id]
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
+        cursor = self.execute(sql, tuple(params))
         self.execute("DELETE FROM tool_calls WHERE conversation_id = ?", (conversation_id,))
         self.commit()
         return cursor.rowcount
 
-    def list_conversations(self, limit: int = 50) -> list[dict]:
+    def list_conversations(self, limit: int = 50, user_id: str | None = None) -> list[dict]:
+        where = ""
+        params: list[Any] = []
+        if user_id is not None:
+            where = "WHERE user_id = ?"
+            params.append(user_id)
         rows = self.execute(
-            "SELECT conversation_id, COUNT(*) AS messages, MAX(created_at) AS last_at "
-            "FROM messages GROUP BY conversation_id ORDER BY last_at DESC LIMIT ?",
-            (limit,),
+            f"SELECT conversation_id, COUNT(*) AS messages, MAX(created_at) AS last_at "
+            f"FROM messages {where} GROUP BY conversation_id ORDER BY last_at DESC LIMIT ?",
+            (*params, limit),
         ).fetchall()
         out = []
         for row in rows:
@@ -891,55 +1133,78 @@ class Database:
         result: str,
         duration_ms: float,
         error: str | None = None,
+        user_id: str | None = None,
     ) -> None:
+        # Redact secrets from both args and result before they hit disk: a tool
+        # can receive a URL with embedded credentials or return a page that
+        # echoes a token. Persisting them raw would defeat log redaction.
+        safe_args = json.dumps(redact_obj(args or {}), ensure_ascii=False)[:4000]
+        safe_result = redact_text(result or "")[:8000]
         self.execute(
-            "INSERT INTO tool_calls (conversation_id, name, args, result, duration_ms, error) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tool_calls (conversation_id, name, args, result, duration_ms, error, user_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 conversation_id,
                 name,
-                json.dumps(args, ensure_ascii=False)[:4000],
-                (result or "")[:8000],
+                safe_args,
+                safe_result,
                 duration_ms,
-                error,
+                redact_text(error) if error else None,
+                user_id or SENTINEL_LOCAL_USER,
             ),
         )
         self.commit()
 
-    def list_tool_calls(self, limit: int = 100, conversation_id: str | None = None) -> list[dict]:
+    def list_tool_calls(self, limit: int = 100, conversation_id: str | None = None,
+                        user_id: str | None = None) -> list[dict]:
+        clauses: list[str] = []
+        params: list[Any] = []
         if conversation_id:
-            rows = self.execute(
-                "SELECT * FROM tool_calls WHERE conversation_id = ? ORDER BY id DESC LIMIT ?",
-                (conversation_id, limit),
-            ).fetchall()
-        else:
-            rows = self.execute(
-                "SELECT * FROM tool_calls ORDER BY id DESC LIMIT ?", (limit,)
-            ).fetchall()
+            clauses.append("conversation_id = ?")
+            params.append(conversation_id)
+        if user_id is not None:
+            clauses.append("user_id = ?")
+            params.append(user_id)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        rows = self.execute(
+            f"SELECT * FROM tool_calls {where} ORDER BY id DESC LIMIT ?", tuple(params)
+        ).fetchall()
         return [dict(row) for row in rows]
 
-    def remember(self, key: str, value: str, conversation_id: str | None = None) -> None:
-        """Upsert a durable note the agent can read back in a later session."""
+    def remember(self, key: str, value: str, conversation_id: str | None = None,
+                 user_id: str | None = None) -> None:
+        """Upsert a durable note the agent can read back in a later session.
+
+        Scoped per user: the conflict target is (user_id, key), so one user's
+        note can never overwrite another's under the same key.
+        """
         stamp = datetime.now(timezone.utc).isoformat()
         self.execute(
-            "INSERT INTO memories (key, value, conversation_id, updated_at) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "INSERT INTO memories (user_id, key, value, conversation_id, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, "
             "conversation_id = excluded.conversation_id, updated_at = excluded.updated_at",
-            (key, value, conversation_id, stamp),
+            (user_id or SENTINEL_LOCAL_USER, key, value, conversation_id, stamp),
         )
         self.commit()
 
-    def recall(self, query: str | None = None, limit: int = 10) -> list[dict]:
+    def recall(self, query: str | None = None, limit: int = 10,
+               user_id: str | None = None) -> list[dict]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if user_id is not None:
+            clauses.append("user_id = ?")
+            params.append(user_id)
         if query:
-            rows = self.execute(
-                "SELECT * FROM memories WHERE key LIKE ? OR value LIKE ? "
-                "ORDER BY updated_at DESC LIMIT ?",
-                (f"%{query}%", f"%{query}%", limit),
-            ).fetchall()
-        else:
-            rows = self.execute(
-                "SELECT * FROM memories ORDER BY updated_at DESC LIMIT ?", (limit,)
-            ).fetchall()
+            clauses.append("(key LIKE ? OR value LIKE ?)")
+            params.extend([f"%{query}%", f"%{query}%"])
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        rows = self.execute(
+            f"SELECT * FROM memories {where} ORDER BY updated_at DESC LIMIT ?",
+            tuple(params),
+        ).fetchall()
         return [dict(row) for row in rows]
 
     # ---------------------------------------------------------------- tasks --
@@ -949,7 +1214,7 @@ class Database:
         "tools", "system_prompt", "use_history", "model", "next_task_id",
     )
 
-    def create_task(self, **fields: Any) -> dict:
+    def create_task(self, user_id: str | None = None, **fields: Any) -> dict:
         task_id = str(uuid.uuid4())[:12]
         interval = int(fields.get("interval_seconds") or 0)
         enabled = 1 if fields.get("enabled", True) else 0
@@ -958,8 +1223,8 @@ class Database:
         next_run = iso(utc_now()) if (enabled and interval > 0) else None
         self.execute(
             "INSERT INTO tasks (id, name, goal, enabled, interval_seconds, max_steps, "
-            "tools, system_prompt, use_history, model, next_task_id, next_run_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "tools, system_prompt, use_history, model, next_task_id, next_run_at, user_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 str(fields.get("name") or "task").strip()[:120],
@@ -973,6 +1238,7 @@ class Database:
                 fields.get("model") or None,
                 fields.get("next_task_id") or None,
                 next_run,
+                user_id or SENTINEL_LOCAL_USER,
             ),
         )
         self.commit()
@@ -1152,11 +1418,20 @@ class Database:
         self.commit()
         return cursor.rowcount
 
-    def count_memories(self) -> int:
+    def count_memories(self, user_id: str | None = None) -> int:
+        if user_id is not None:
+            return self.execute(
+                "SELECT COUNT(*) as cnt FROM memories WHERE user_id = ?",
+                (user_id,)).fetchone()["cnt"]
         return self.execute("SELECT COUNT(*) as cnt FROM memories").fetchone()["cnt"]
 
-    def forget(self, key: str) -> bool:
-        cursor = self.execute("DELETE FROM memories WHERE key = ?", (key,))
+    def forget(self, key: str, user_id: str | None = None) -> bool:
+        sql = "DELETE FROM memories WHERE key = ?"
+        params: list[Any] = [key]
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
+        cursor = self.execute(sql, tuple(params))
         self.commit()
         return cursor.rowcount > 0
 
@@ -1170,18 +1445,19 @@ class Database:
         model: str | None = None,
         step: int | None = None,
         conversation_id: str | None = None,
+        user_id: str | None = None,
     ) -> None:
         self.execute(
             "INSERT INTO metrics (endpoint, duration_ms, status_code, error, prompt_tokens, "
-            "completion_tokens, ttft_ms, decode_tps, model, step, conversation_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "completion_tokens, ttft_ms, decode_tps, model, step, conversation_id, user_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 endpoint, duration_ms, status_code, error,
                 stats.prompt_tokens if stats else None,
                 stats.completion_tokens if stats else None,
                 round(stats.ttft_ms, 1) if stats and stats.ttft_ms else None,
                 round(stats.decode_tps, 2) if stats and stats.decode_tps else None,
-                model, step, conversation_id,
+                model, step, conversation_id, user_id or SENTINEL_LOCAL_USER,
             ),
         )
         self.commit()
@@ -1222,6 +1498,203 @@ class Database:
             (conversation_id, limit),
         ).fetchall()
         return [dict(row) for row in reversed(rows)]
+
+    # ------------------------------------------------------------- users --
+
+    def create_user(self, username: str, password_hash: str | None = None,
+                    role: str = "user", source: str = "local",
+                    email: str | None = None, display_name: str | None = None,
+                    oidc_subject: str | None = None, user_id: str | None = None) -> dict:
+        uid = user_id or uuid.uuid4().hex
+        self.execute(
+            "INSERT INTO users (id, username, password_hash, role, source, email, "
+            "display_name, oidc_subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (uid, username, password_hash, role, source, email, display_name, oidc_subject))
+        self.commit()
+        return self.get_user(uid) or {}
+
+    def get_user(self, user_id: str) -> dict | None:
+        row = self.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_user_by_username(self, username: str) -> dict | None:
+        row = self.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        return dict(row) if row else None
+
+    def get_user_by_oidc(self, subject: str) -> dict | None:
+        if not subject:
+            return None
+        row = self.execute("SELECT * FROM users WHERE oidc_subject = ?", (subject,)).fetchone()
+        return dict(row) if row else None
+
+    def list_users(self) -> list[dict]:
+        return [dict(r) for r in self.execute(
+            "SELECT * FROM users ORDER BY created_at ASC").fetchall()]
+
+    def count_users(self, role: str | None = None) -> int:
+        if role:
+            return self.execute("SELECT COUNT(*) AS c FROM users WHERE role = ?",
+                                (role,)).fetchone()["c"]
+        return self.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+
+    def update_user(self, user_id: str, **fields: Any) -> dict | None:
+        allowed = {"password_hash", "role", "email", "display_name", "disabled",
+                   "username", "oidc_subject", "source"}
+        sets, params = [], []
+        for key, value in fields.items():
+            if key not in allowed:
+                continue
+            if key == "disabled":
+                value = 1 if value else 0
+            sets.append(f"{key} = ?")
+            params.append(value)
+        if not sets:
+            return self.get_user(user_id)
+        sets.append("updated_at = ?")
+        params.append(iso(utc_now()))
+        params.append(user_id)
+        self.execute(f"UPDATE users SET {', '.join(sets)} WHERE id = ?", tuple(params))
+        self.commit()
+        return self.get_user(user_id)
+
+    def touch_login(self, user_id: str) -> None:
+        self.execute("UPDATE users SET last_login_at = ? WHERE id = ?",
+                     (iso(utc_now()), user_id))
+        self.commit()
+
+    def delete_user(self, user_id: str) -> bool:
+        cur = self.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        self.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        self.commit()
+        return cur.rowcount > 0
+
+    # ---------------------------------------------------------- sessions --
+
+    def create_session(self, token_hash: str, user_id: str, expires_at: str,
+                       ip: str | None = None, user_agent: str | None = None) -> None:
+        self.execute(
+            "INSERT OR REPLACE INTO sessions (token_hash, user_id, expires_at, ip, user_agent) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (token_hash, user_id, expires_at, ip, (user_agent or "")[:400]))
+        self.commit()
+
+    def get_session(self, token_hash: str) -> dict | None:
+        row = self.execute("SELECT * FROM sessions WHERE token_hash = ?",
+                           (token_hash,)).fetchone()
+        return dict(row) if row else None
+
+    def delete_session(self, token_hash: str) -> bool:
+        cur = self.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
+        self.commit()
+        return cur.rowcount > 0
+
+    def delete_user_sessions(self, user_id: str) -> int:
+        cur = self.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        self.commit()
+        return cur.rowcount
+
+    def purge_expired_sessions(self) -> int:
+        cur = self.execute("DELETE FROM sessions WHERE expires_at < ?", (iso(utc_now()),))
+        self.commit()
+        return cur.rowcount
+
+    # ----------------------------------------------------------- imports --
+
+    def create_import(self, import_id: str, user_id: str, filename: str,
+                      size_bytes: int) -> dict:
+        self.execute(
+            "INSERT INTO imports (id, user_id, filename, size_bytes, status, progress) "
+            "VALUES (?, ?, ?, ?, 'pending', 0)",
+            (import_id, user_id, filename, size_bytes))
+        self.commit()
+        return self.get_import(import_id) or {}
+
+    def update_import(self, import_id: str, **fields: Any) -> None:
+        allowed = {"status", "progress", "counts", "warnings", "error", "finished_at"}
+        sets, params = [], []
+        for key, value in fields.items():
+            if key not in allowed:
+                continue
+            if key in ("counts", "warnings") and not isinstance(value, str):
+                value = json.dumps(value, default=str)
+            sets.append(f"{key} = ?")
+            params.append(value)
+        if not sets:
+            return
+        sets.append("updated_at = ?")
+        params.append(iso(utc_now()))
+        params.append(import_id)
+        self.execute(f"UPDATE imports SET {', '.join(sets)} WHERE id = ?", tuple(params))
+        self.commit()
+
+    def get_import(self, import_id: str) -> dict | None:
+        row = self.execute("SELECT * FROM imports WHERE id = ?", (import_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_imports(self, user_id: str | None = None, limit: int = 50) -> list[dict]:
+        if user_id is not None:
+            rows = self.execute(
+                "SELECT * FROM imports WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+                (user_id, limit)).fetchall()
+        else:
+            rows = self.execute(
+                "SELECT * FROM imports ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_import(self, import_id: str, user_id: str | None = None) -> bool:
+        sql = "DELETE FROM imports WHERE id = ?"
+        params: list[Any] = [import_id]
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
+        cur = self.execute(sql, tuple(params))
+        self.commit()
+        return cur.rowcount > 0
+
+    # ---------------------------------------------------- routing events --
+
+    def log_routing_event(self, **fields: Any) -> None:
+        cols = ["correlation_id", "task_id", "user_id", "conversation_id", "kind",
+                "requested_model", "selected_model", "selected_node", "reason",
+                "candidates", "status", "attempt", "duration_ms", "error"]
+        values: list[Any] = []
+        for col in cols:
+            value = fields.get(col)
+            if col == "candidates" and value is not None and not isinstance(value, str):
+                value = json.dumps(value, default=str)[:8000]
+            values.append(value)
+        self.execute(
+            f"INSERT INTO routing_events ({', '.join(cols)}) "
+            f"VALUES ({', '.join('?' for _ in cols)})", tuple(values))
+        self.commit()
+
+    def list_routing_events(self, limit: int = 100, node: str | None = None,
+                            task_id: str | None = None) -> list[dict]:
+        clauses, params = [], []
+        if node:
+            clauses.append("selected_node = ?")
+            params.append(node)
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        rows = self.execute(
+            f"SELECT * FROM routing_events {where} ORDER BY id DESC LIMIT ?",
+            tuple(params)).fetchall()
+        return [dict(r) for r in rows]
+
+    def routing_summary(self, limit: int = 500) -> dict:
+        rows = self.execute(
+            "SELECT selected_node, status, COUNT(*) AS c FROM "
+            "(SELECT * FROM routing_events ORDER BY id DESC LIMIT ?) "
+            "GROUP BY selected_node, status", (limit,)).fetchall()
+        by_node: dict[str, dict] = {}
+        for r in rows:
+            node = r["selected_node"] or "?"
+            by_node.setdefault(node, {})[r["status"] or "?"] = r["c"]
+        return {"by_node": by_node, "samples": sum(
+            r["c"] for r in rows)}
 
 
 

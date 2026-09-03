@@ -963,7 +963,6 @@ UI_JS_CHAT = r"""
        history_turns: Number(document.getElementById("cfgHistory").value),
        agent_enabled: document.getElementById("cfgAgent").value === "true",
        agent_max_steps: Number(document.getElementById("cfgAgentSteps").value),
-       search_backend: document.getElementById("cfgSearchBackend").value,
        search_results: Number(document.getElementById("cfgSearchResults").value),
        tool_result_chars: Number(document.getElementById("cfgToolChars2").value ||
                                  document.getElementById("cfgToolChars").value),
@@ -995,6 +994,9 @@ UI_JS_CHAT = r"""
      try {
        var out = await fetchJSON("/api/health");
        var data = out.data;
+       // Non-admins never call loadConfig(), so take the context size (used by
+       // the context meter) from health instead.
+       if (typeof data.context_size === "number") contextSize = data.context_size;
        var msg = "Model: " + (data.model_status || "unknown");
        if (data.ui_build && data.ui_build !== "{{UI_BUILD}}") {
          msg = "STALE PAGE: server is build " + data.ui_build +

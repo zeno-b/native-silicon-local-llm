@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Literal
 
 from .core import *  # noqa: F401,F403
+from .obslog import *  # noqa: F401,F403
 from .config import *  # noqa: F401,F403
 from .database import *  # noqa: F401,F403
 from .ui import *  # noqa: F401,F403
@@ -140,8 +141,12 @@ def main() -> None:
     parser.add_argument("--add-task", metavar="JSON",
                         help='Create a task and exit, e.g. \'{"name": "n", "goal": "g", '
                              '"interval_seconds": 3600}\'')
-    parser.add_argument("--search-backend", default=os.environ.get("SEARCH_BACKEND", "ddg"),
-                        choices=["ddg", "brave", "tavily", "searxng"])
+    # The search provider is locked to DuckDuckGo Lite. The flag is kept for
+    # backward compatibility with existing scripts, but any value other than a
+    # DuckDuckGo-Lite alias is ignored (normalised in Config) rather than
+    # selecting a different engine.
+    parser.add_argument("--search-backend", default=os.environ.get("SEARCH_BACKEND", "duckduckgo_lite"),
+                        help="Locked to DuckDuckGo Lite; other values are ignored.")
     parser.add_argument("--search-results", type=int, default=int(os.environ.get("SEARCH_RESULTS", "5")))
     parser.add_argument("--list-tools", action="store_true", help="Print the tool catalogue and exit.")
     parser.add_argument("--tool-test", metavar="NAME", help="Run one tool directly and exit.")
@@ -251,6 +256,10 @@ def main() -> None:
         sys.exit("Refusing to serve a broken UI.")
 
     config = build_config(args)
+
+    # Upgrade the plain bootstrap logger into the structured, redacting,
+    # rotating pipeline now that we have the resolved configuration.
+    configure_logging(config, force=True)
 
     config.model_port = get_free_port(config.model_port)
     config.web_port = get_free_port(config.web_port, exclude={config.model_port})

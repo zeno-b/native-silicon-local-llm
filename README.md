@@ -1,495 +1,589 @@
-# Local LLM — self-hosted agent, trainer & feedback loop for Apple Silicon
----
+# Local LLM — self-hosted, multi-user agent for Apple Silicon
+
+A private, self-hosted LLM assistant that runs on your own Apple Silicon Macs.
+It combines a model server manager, a tool-using agent, a glass-box web chat UI,
+a feedback/LoRA training loop, and a task scheduler — and now adds
+**authentication and multi-user isolation**, **admin/non-admin roles**,
+**Microsoft Entra ID (OIDC) login**, **structured logging with correlation IDs
+and secret redaction**, **Claude conversation-history import**, and
+**automatic Mac Mini → Mac Studio routing and failover**.
+
+It stays true to its original constraint: fit big work into small RAM by
+splitting it into bounded steps, slowing down rather than crashing.
 
 ## Table of contents
 
-- [What it does](#what-it-does)
+- [Overview](#overview)
 - [Requirements](#requirements)
-- [Quick start](#quick-start)
-- [System architecture](#system-architecture)
-- [How a message is handled](#how-a-message-is-handled)
-- [Fitting big work into small RAM](#fitting-big-work-into-small-ram)
-- [RAM-aware auto-configuration](#ram-aware-auto-configuration)
-- [Resilience: never stop, never hang](#resilience-never-stop-never-hang)
-- [Tools](#tools)
-- [The web UI (glass box)](#the-web-ui-glass-box)
-- [Feedback and LoRA retraining](#feedback-and-lora-retraining)
-- [Tasks](#tasks)
-- [Branding](#branding)
-- [Configuration reference](#configuration-reference)
-- [Command-line reference](#command-line-reference)
-- [HTTP API](#http-api)
-- [Testing and diagnostics](#testing-and-diagnostics)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Authentication, users and roles](#authentication-users-and-roles)
+- [Microsoft Entra ID / OIDC](#microsoft-entra-id--oidc)
+- [Claude history import](#claude-history-import)
+- [Agents, knowledge and skills](#agents-knowledge-and-skills)
+- [Logging and debugging](#logging-and-debugging)
+- [Automatic Mac Mini / Mac Studio routing](#automatic-mac-mini--mac-studio-routing)
+- [Mac Mini deployment (primary)](#mac-mini-deployment-primary)
+- [Mac Studio deployment (secondary)](#mac-studio-deployment-secondary)
+- [Secure internet access](#secure-internet-access)
+- [Search provider](#search-provider)
+- [Testing](#testing)
 - [Troubleshooting](#troubleshooting)
 
 ---
 
-## What it does
+## Overview
 
-At a glance, the app combines several roles that usually live in separate tools:
+Two processes cooperate on each machine: the Python app (web server, agent, DB,
+trainer, router) and the `mlx-lm` model server it supervises. The browser talks
+only to the Python app.
 
-- **Model server manager.** Launches and supervises an `mlx-lm` server, with a watchdog that restarts it if it dies.
-- **Agent.** A reasoning-and-tools loop over the local model, driven by a model-as-router design rather than brittle keyword rules.
-- **Web chat UI.** A dark, single-page interface that renders the agent's work as a live "glass box" trace.
-- **Feedback store.** A SQLite database of conversations and thumbs-up/down ratings.
-- **Trainer.** LoRA fine-tuning on collected feedback, with adapter management and automatic backups.
-- **Scheduler.** Named tasks the agent can run on demand or on a timer.
+**Components**
 
-The defining constraint is memory. On 8 GB, a large prompt or a complex task will not fit in one pass, so the app is designed to **split work into bounded steps** — it slows down rather than crashing.
+- **Web server (FastAPI).** Serves the single-page UI and a JSON/SSE API. All
+  routes are authenticated and role-checked server-side.
+- **Auth layer.** Cookie-based sessions, scrypt password hashing, admin/non-admin
+  roles, first-run admin bootstrap, an optional test user, and Entra ID / OIDC
+  single sign-on. See [`local_llm/auth.py`](local_llm/auth.py).
+- **Agent.** A model-as-router reasoning-and-tools loop over the local model.
+- **Cluster router.** Classifies each request, picks the best node (Mac Mini
+  primary / Mac Studio secondary) on live load, health and model capability, and
+  fails over — no machine is ever chosen by the user. See
+  [`local_llm/cluster.py`](local_llm/cluster.py).
+- **SQLite database.** Conversations, feedback, memory, metrics, tasks, users,
+  sessions, imports and routing telemetry — every user-owned row carries an owner
+  so users are isolated. See [`local_llm/database.py`](local_llm/database.py).
+- **Structured logging.** JSON logs with a correlation id per request, secret
+  redaction, rotation and retention. See [`local_llm/obslog.py`](local_llm/obslog.py).
+- **Claude import.** An admin uploads a Claude data-export ZIP; it is validated,
+  safely extracted, parsed, de-duplicated, stored as browsable history and
+  indexed for retrieval. See [`local_llm/claude_import.py`](local_llm/claude_import.py).
+- **Trainer & scheduler.** LoRA fine-tuning from feedback, and named tasks the
+  agent runs on demand or a timer.
+
+**Architecture (two nodes)**
+
+```mermaid
+flowchart TB
+    User["Browser (any user)"] -->|HTTPS + cookie session| Proxy["Reverse proxy / VPN\n(TLS, identity-aware)"]
+    Proxy --> Mini
+
+    subgraph Mini["Mac Mini — PRIMARY"]
+      MApp["Local LLM app\nauth · RBAC · router · logging"]
+      MModel["mlx-lm server (127.0.0.1)"]
+      MDB[("SQLite\nusers · chats · routing")]
+      MApp --> MModel
+      MApp --> MDB
+    end
+
+    subgraph Studio["Mac Studio — SECONDARY (private)"]
+      SApp["Local LLM app\n/api/node/generate"]
+      SModel["mlx-lm server (127.0.0.1)"]
+      SApp --> SModel
+    end
+
+    MApp -->|"overload / large model / failover\n(NODE_TOKEN, private network)"| SApp
+```
+
+Everything works on a **single machine with auth disabled** exactly as before —
+the multi-user, multi-node and auth features are additive and off by default.
 
 ---
 
 ## Requirements
 
-- **Apple Silicon Mac** (M1 or later). The model backend is `mlx-lm`, which is Apple-Silicon only.
-- **Native arm64 Python** (3.10+). A `config.json`-style model is fetched from Hugging Face on first run.
-- Network access for model downloads and for the web search tool.
-
-The app installs nothing globally; point it at a virtual environment and run the file.
+- **Apple Silicon Mac(s)** (M1 or later). The backend is `mlx-lm`, Apple-Silicon
+  only. Two Macs (a Mini and a Studio) for the routing/failover setup; one is fine.
+- **Native arm64 Python 3.10+**. `--selftest`, `--doctor` and `--list-models`
+  also run on non-Apple hardware (without the model server).
+- **Dependencies** (installed automatically into `./.venv` on first run):
+  `mlx-lm`, `fastapi`, `uvicorn`, `httpx`, `pydantic`. Optional:
+  `python-multipart` (browser file uploads to the knowledge base),
+  `PyJWT`+`cryptography` (extra OIDC signature verification), `psutil` (memory-%
+  routing signal), `pytest` (test suite).
+- **Network**: model downloads (Hugging Face) and the DuckDuckGo Lite search tool.
+- **Microsoft**: an Entra ID app registration if you want org SSO (optional).
 
 ---
 
-## Quick start
+## Installation
 
 ```bash
-# Serve the model + web UI (auto-selects a model and context size for your RAM)
+git clone https://github.com/zeno-b/native-silicon-local-llm.git
+cd native-silicon-local-llm
+
+# 1. Configure (optional — sensible RAM-based defaults otherwise)
+cp .env.example .env
+# edit .env: set AUTH_ENABLED=1 and AUTH_ADMIN_PASSWORD for multi-user, etc.
+
+# 2. Run. First launch creates ./.venv, installs deps, downloads a model, and
+#    initialises the SQLite database (schema + migrations) automatically.
 python3 deploy.py
-
-# Seed a tiny demo conversation and exit
-python3 deploy.py --seed-demo
-
-# Run in agent mode with an explicit context and reply budget
-python3 deploy.py --agent --context-size 8192 --max-tokens 512
-
-# Pin a specific model (skips RAM-based selection)
-MODEL_ID="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit" python3 deploy.py
-
-# Brand it
-APP_NAME="TESTLab" APP_LOGO="AI" python3 deploy.py
 ```
 
-On start the app prints the detected RAM, the chosen model, and the chosen context window, then serves the UI on a free local port (printed to the log). Open that URL in a browser.
-
----
-
-## System architecture
-
-Two processes cooperate on one machine: the Python app (web server, agent, DB, trainer) and the `mlx-lm` model server it supervises. The browser talks only to the Python app.
-
-```mermaid
-flowchart TB
-    Browser["Browser<br/>(glass-box chat UI)"]
-
-    subgraph App["deploy.py (Python / FastAPI)"]
-        Web["Web server<br/>/api/chat/stream, /api/health, ..."]
-        Agent["Agent loop<br/>router + tools + reasoning"]
-        Registry["Tool registry"]
-        Trainer["LoRA trainer"]
-        Scheduler["Task scheduler"]
-        Watchdog["Model watchdog"]
-        DB[("SQLite<br/>feedback, memory,<br/>metrics, tasks")]
-    end
-
-    Model["mlx-lm server<br/>(local HTTP, OpenAI-style)"]
-    HF["Hugging Face<br/>(model download)"]
-    Search["Web search backend<br/>ddg / brave / tavily / searxng"]
-
-    Browser <-->|"SSE + JSON"| Web
-    Web --> Agent
-    Agent --> Registry
-    Agent -->|"completions"| Model
-    Registry -->|"fetch_url, web_search"| Search
-    Watchdog -.->|"start / restart"| Model
-    Model -.->|"first run"| HF
-    Agent --> DB
-    Trainer --> DB
-    Scheduler --> Agent
-    Trainer -.->|"adapter"| Model
-```
-
-Key components:
-
-- **Web server (FastAPI).** Serves the UI and a JSON/SSE API. Chat streams over Server-Sent Events.
-- **Model server manager + watchdog.** Owns the `mlx-lm` subprocess, probes its health, and restarts it on failure. Because the app and model share unified memory, an out-of-memory kill of the model process is treated as a transient error and recovered.
-- **Agent.** The core loop described in the next section.
-- **SQLite database.** Stores conversations, feedback ratings, agent memory/notes, run metrics, and task definitions. Persists across restarts.
-- **Trainer.** Exports feedback to a training set and runs LoRA fine-tuning, producing an adapter the model server can load.
-
----
-
-## How a message is handled
-
-Every substantive message flows through a layered decision. Cheap, unambiguous cases are handled deterministically; everything else is routed by the model itself, which returns a **structured decision** that generic code then executes. This is what keeps routing maintainable: adding a capability means registering a tool, not writing new rules.
-
-```mermaid
-flowchart TD
-    Msg["User message"] --> Trivial{"Greeting or<br/>one-liner?"}
-    Trivial -->|yes| Plain["Plain single reply"]
-    Trivial -->|no| Big{"Prompt larger than<br/>~60% of context?"}
-
-    Big -->|yes| Chunk["Chunk the input<br/>(map-reduce, see below)"]
-    Big -->|no| Quick{"Bare URL or<br/>pure arithmetic?"}
-
-    Quick -->|yes| Deterministic["fetch_url / calculator<br/>(no model call)"]
-    Quick -->|no| Code{"Code request?"}
-
-    Code -->|"self-contained"| Answer["Answer from the model"]
-    Code -->|"needs current info"| SearchCode["Search first,<br/>then write code"]
-    Code -->|no| Router["Model router<br/>(structured decision)"]
-
-    Router -->|"answer + analytical"| Reason["Incremental reasoning<br/>(decompose, see below)"]
-    Router -->|"answer"| Answer
-    Router -->|"web_search / weather / ..."| Tool["Run tool, seed result,<br/>synthesize"]
-
-    Tool --> Loop["Agent loop:<br/>more tools if needed"]
-    Answer --> Loop
-    SearchCode --> Loop
-    Loop --> Final["Final answer"]
-```
-
-The router is **registry-driven**. It offers the model a menu built from whatever tools are marked routable (each contributes a one-line description), and the model replies with a single JSON object such as `{"action":"weather","location":"Brussels","when":"tomorrow"}` or `{"action":"answer"}`. Generic code validates the decision, fills defaults, and executes it. On any malformed or unusable reply it falls back safely to a web search (or a direct answer when no search tool exists), so a lookup is never silently answered from stale training data.
-
-Deterministic lanes exist purely as cheap optimisations ahead of the router:
-
-- **Quick tools** — a bare URL goes straight to `fetch_url`; a pure arithmetic expression to `calculator`.
-- **Code intent** — "write/fix/refactor a script" is answered from the model's own knowledge, never sent to a search. If the code depends on current or external information (a recent API, a security-research topic), it searches first and then writes.
-
----
-
-## Fitting big work into small RAM
-
-The central design goal. Three distinct mechanisms keep the working set small so an 8 GB machine can handle inputs and tasks that would otherwise overflow. All of them **slow down rather than fail**.
-
-### 1. Large prompt → map-reduce chunking
-
-When the input itself is bigger than the machine can prefill in one pass, it is split into overlapping chunks; each chunk is read in its own bounded pass that extracts only what matters into short notes; then the notes are synthesised into the answer. Memory stays flat regardless of input size.
-
-```mermaid
-flowchart LR
-    In["Large pasted input<br/>(file / document)"] --> Split["Split into<br/>overlapping chunks"]
-    Split --> P1["Read part 1<br/>→ notes"]
-    P1 --> P2["Read part 2<br/>+ prior notes → notes"]
-    P2 --> Pn["Read part n<br/>+ prior notes → notes"]
-    Pn --> Synth["Synthesize answer<br/>from all notes"]
-    Synth --> Out["Answer (streamed)"]
-```
-
-The request instruction (usually at the very start or end of a big paste) is kept visible to every pass and to the synthesis. Trigger point and chunk size both derive from the context window, so they scale with RAM automatically.
-
-### 2. Complex question → incremental reasoning
-
-For a hard analytical question with no tool to call, the model plans a short list of sub-steps and works through them one at a time, carrying only compact conclusions forward. The chain of thought lives in the accumulating notes, not in one giant generation, so a small model can reason in depth without holding it all in memory.
-
-```mermaid
-flowchart LR
-    Q["Hard question"] --> Plan["Plan sub-steps"]
-    Plan --> S1["Step 1<br/>→ conclusion"]
-    S1 --> S2["Step 2<br/>+ notes → conclusion"]
-    S2 --> S3["Step 3<br/>+ notes → conclusion"]
-    S3 --> Reduce["Synthesize final answer"]
-```
-
-Each step streams live in the UI, so "thinking" is visible motion rather than a frozen label. A per-step wall-clock cap stops any single step from wedging the chain.
-
-### 3. Long tool task → bounded running summary
-
-When the agent's tool loop exhausts its ordinary step budget without finishing, it collapses progress into a compact running summary and continues in fresh batches (up to a hard cap), resetting the working set to just that summary each time. Constant memory, more steps.
-
-### Retrieval pipeline (why there are few domain tools)
-
-Rather than a tool per domain (weather, stocks, scores, ...), one generic pipeline answers most lookups: **search, then read a couple of the top result pages and compare them before answering**, since the answer is usually on the page even when the snippet omits it. Adding a new kind of lookup needs no new code.
-
-Crucially, the sources are read **one at a time**: each fetched page is capped, then processed in its own bounded, streamed pass that extracts only the findings relevant to the question into short notes. The notes (not the raw pages) are then handed to the model with a directive to compare the sources, note any agreement or conflict, and answer with citations. This keeps memory flat — only one page is ever in context at once, so two heavy pages can never coincide and OOM an 8 GB machine — while giving a genuine "look up a few, compare, then answer" flow that streams visibly as steps. The number of sources is `AUTO_FETCH_RESULTS` (default 2; set 1 for single-source speed, 0 for snippets only).
-
----
-
-## RAM-aware auto-configuration
-
-On import the app detects total RAM (via `sysctl hw.memsize`, with fallbacks) and uses it to choose a coding model, a context window, a per-step reasoning budget, and a fetched-page cap. Everything else — the chunking threshold, chunk size, and how much history is kept — derives from the context window, so a single signal tunes the whole stack. Explicit overrides (`MODEL_ID`, `CONTEXT_SIZE`, `REASONING_TOKENS`, `AUTO_FETCH_CHAR_CAP`) always win.
-
-| RAM        | Default model (coding)                  | Context window | Chunk trigger | Reasoning tokens/step | Fetched-page cap |
-|------------|-----------------------------------------|----------------|---------------|-----------------------|------------------|
-| < 14 GB    | `Qwen2.5-Coder-3B-Instruct-4bit`        | 4 096 tokens   | ~2 460 tokens | 256                   | 6 000 chars      |
-| 14–23 GB   | `Qwen2.5-Coder-7B-Instruct-4bit`        | 8 192 tokens   | ~4 915 tokens | 512                   | 10 000 chars     |
-| 24–47 GB   | `Qwen2.5-Coder-14B-Instruct-4bit`       | 16 384 tokens  | ~9 830 tokens | 768                   | 16 000 chars     |
-| ≥ 48 GB    | `Qwen2.5-Coder-32B-Instruct-4bit`       | 32 768 tokens  | ~19 660 tokens| 1 024                 | 24 000 chars     |
-
-So a larger machine reads more of each source, thinks in more depth per step, keeps more history, and chunks later — all from the one RAM signal, and all overridable. Model sizes are estimates of resident weights at 4-bit; the tiers are deliberately conservative because unified memory is shared with the OS and the GPU wired limit. The startup log states which model, context, reasoning budget, and fetch cap were chosen.
-
-> Note: the 7B and larger models are best treated as inference-only on their minimum-RAM tier. Fine-tuning adds optimizer state on top of the weights and is happiest on the 3B.
-
----
-
-## Resilience: never stop, never hang
-
-
-Two mechanisms ensure a turn never ends in a raw error or an indefinite hang.
-
-**Stall timeout.** If the model server sends nothing for `STALL_TIMEOUT` seconds mid-generation (a wedged or OOM-killed server), the request fails fast and feeds into the retry path instead of blocking for minutes.
-
-**Resilient retries that shrink the right thing.** On failure the turn retries, and critically it shrinks the **input** (re-assembling the prompt with a larger reserve, trimming the trace) as well as the output token budget. On a small machine an out-of-memory is almost always prefill of an oversized prompt, so shrinking the reply alone does nothing — shrinking the input does. After all retries, the turn degrades to a calm message, never a broken stream.
-
-**Readiness-aware waiting.** When the model server is OOM-killed, the watchdog restarts it, but reloading a model takes far longer than a fixed sleep. Instead of retrying into a still-loading server (which wastes the attempt), a retry polls the server's `/v1/models` endpoint until it responds, up to `READY_WAIT_TIMEOUT` seconds, then retries into a live server.
-
-**Honest labels.** The retry notice names what actually failed — a stall, a dropped connection (server likely restarting), a true out-of-memory, or a generic error — rather than blaming memory for everything.
-
-```mermaid
-flowchart TD
-    Gen["Generate step"] --> OK{"Succeeded?"}
-    OK -->|yes| Cont["Continue"]
-    OK -->|"no / stalled"| Partial{"Usable text<br/>already streamed?"}
-    Partial -->|yes| Keep["Keep partial, continue"]
-    Partial -->|no| Retry{"Retries left?"}
-    Retry -->|yes| Wait["Wait for server ready<br/>(poll /v1/models)"]
-    Wait --> Shrink["Shrink prompt + reply, retry"]
-    Shrink --> Gen
-    Retry -->|no| Degrade["Calm message<br/>(no raw error)"]
-```
-
-All of this is visible in the UI as amber "notice" lines with the real cause (for example "the model server dropped, likely out of memory and restarting; waiting for the server, then retrying smaller").
-
----
-
-## Configurable safeguards
-
-Every safeguard — memory caps, timeouts, retry counts, step limits, chunking thresholds, and the calculator's DoS bounds — is a named setting with an environment override and a valid range. Values are **clamped both at startup and on every live edit**, so a bad value (from an env var or the UI) is corrected rather than able to break the app; for example a chunk size can never exceed its own trigger. The most useful safeguards are editable **live from the Settings panel** with no restart. See the [configuration reference](#configuration-reference) for the full list.
-
----
-
-## Tools
-
-Tools are registered in a central registry. Each has a name, description, parameters, and optional routing metadata (whether the router may pick it, a one-line hint, whether its result is the final answer or should be summarised for the model). Adding a routable tool automatically makes it selectable by the router with no routing-code changes.
-
-Built-in tools include:
-
-| Tool | Purpose |
-|------|---------|
-| `web_search` | Search the web (backend configurable), returns titles/URLs/snippets. |
-| `fetch_url` | Fetch and extract a page's text (used by the retrieval pipeline). |
-| `weather` | Structured forecast via wttr.in — returns actual numbers, not snippets. |
-| `calculator` | Safe arithmetic evaluator (bounded against huge/DoS expressions). |
-| `current_time` | Current date/time. |
-| `remember` / `recall_memory` / `forget` | Persistent notes the agent stores across restarts. |
-| `recall_feedback` | Look back at prior rated exchanges. |
-| `read_file` / `write_file` / `edit_file` / `list_files` / `search_files` | Workspace file operations. |
-| `run_shell` / `run_python` | Execute commands/code — **off by default**, gated behind explicit flags. |
-| `final_answer` | Explicit answer signal inside the loop. |
-
-**Safety posture.** The server binds to localhost, CORS is pinned to loopback, and the shell/Python tools require `--allow-shell` / `--allow-python` (with a self-check that refuses to expose the shell tool without the flag). The URL fetcher validates against redirect-based SSRF. This closed, opt-in design is intentionally narrower than pulling in arbitrary third-party integrations.
-
----
-
-## The web UI (glass box)
-
-The interface renders each turn as a **live vertical trace** rather than a single opaque bubble, so you can always see what the agent is doing.
-
-```mermaid
-flowchart TD
-    subgraph Turn["One assistant turn (top-to-bottom timeline)"]
-        direction TB
-        R["router → chose tool"] --> T["tool node<br/>collapsible input/output · ok / failed pill"]
-        T --> N["notice<br/>retry · chunking · reasoning status"]
-        N --> RS["reasoning / chunk step<br/>(streams live)"]
-        RS --> A["answer node<br/>(streams)"]
-    end
-    A --> Act["Activity line, always visible:<br/>spinner + step label + ticking clock"]
-```
-
-- **Live trace.** The router's choice, each tool call, reasoning/chunk steps (streaming their tokens), notices, and the streamed answer, each a node on a timeline.
-- **Always-on progress.** A persistent activity line shows the current step and a clock that ticks four times a second — as long as it moves, the turn is alive. It turns amber if a single step runs long, so a genuine stall is obvious.
-- **Notices.** Retries, chunking, and step-by-step continuation surface as status lines instead of looking like a freeze.
-- **Hover tooltips.** Every control explains itself on hover and on keyboard focus.
-- **Views.** Chat, Tasks, and Models, plus a live Settings panel.
-
----
-
-## Feedback and LoRA retraining
-
-```mermaid
-flowchart LR
-    Chat["Chat"] --> Rate["👍 / 👎 feedback"]
-    Rate --> DB[("Feedback DB")]
-    DB --> Export["Export to training set"]
-    Export --> Train["LoRA fine-tune<br/>(mlx-lm)"]
-    Train --> Adapter["Adapter"]
-    Adapter --> Restart["Restart model<br/>with adapter"]
-    Restart --> Chat
-```
-
-- **Collecting.** Each assistant reply gets a feedback bar; ratings are stored with the conversation.
-- **Exporting.** Feedback is exported to a training set (JSONL or CSV).
-- **Training.** LoRA fine-tuning runs with configurable iterations, learning rate, sequence length, and layer count. Adapters are backed up before being replaced.
-- **Applying.** The model server can be restarted with a chosen adapter attached.
-- **Automation.** An auto-retrain threshold can trigger training once enough new approved samples accumulate.
-
-
----
-
-## Tasks
-
-Named jobs the agent runs on demand or on a schedule. Each task has a goal (the prompt), an optional tool allow-list, an optional per-task system prompt, and a history mode. Runs stream the same event types as chat and are viewable/replayable in the Tasks view. Concurrency is bounded by a configurable limit.
-
-Manage tasks from the UI or the CLI (`--add-task`, `--list-tasks`).
-
----
-
-## Branding
-
-Set two environment variables and restart:
-
-- `APP_NAME` — shown in the header and the browser tab title.
-- `APP_LOGO` — a URL or local path renders as an image; an emoji or short string renders inline; unset falls back to a neutral mark.
+The app prints the detected RAM, the chosen model and context window, and the URL
+to open (a free port is picked if the preferred one is busy). Environment
+variables from `.env` are read by your shell/process manager — either `export`
+them, use `env $(cat .env | xargs)`, or a process manager that loads `.env`.
+
+**Development mode** (single user, no login):
 
 ```bash
-APP_NAME="Acme Assistant" APP_LOGO="https://example.com/logo.png" python3 deploy.py
+python3 deploy.py --agent        # auth off by default
 ```
 
-### Model and context
+**Production / multi-user mode**:
 
-| Variable | Meaning |
-|----------|---------|
-| `MODEL_ID` | Model to load (overrides RAM-based choice). |
-| `MODEL_CATALOG` | Comma-separated list offered in the Models view. |
-| `CONTEXT_SIZE` | Working window in tokens (overrides RAM-based choice). |
-| `MAX_TOKENS` | Longest reply the model may generate. |
-| `TEMPERATURE` | Sampling randomness for replies. |
-| `HISTORY_TURNS` | Past messages carried into each request. |
-| `MAX_KV_SIZE`, `KV_BITS`, `KV_GROUP_SIZE`, `QUANTIZED_KV_START` | KV-cache sizing / quantisation passed to the model server. |
-| `REPETITION_PENALTY`, `REPETITION_CONTEXT_SIZE` | Anti-repetition sampling (helps small models avoid loops). |
+```bash
+AUTH_ENABLED=1 AUTH_ADMIN_USERNAME=admin AUTH_ADMIN_PASSWORD='choose-a-strong-one' \
+  python3 deploy.py
+```
 
-### Agent and routing
+**Admin creation.** On first start with `AUTH_ENABLED=1`, an admin is created from
+`AUTH_ADMIN_USERNAME`/`AUTH_ADMIN_PASSWORD`. If no password is set, a strong one is
+generated and printed to the log **once** — save it and change it after logging in.
+Re-running never resets an existing admin's password.
 
-| Variable | Meaning |
-|----------|---------|
-| `AGENT_ENABLED` | Whether new chats default to agent mode. |
-| `AGENT_MAX_STEPS` | Tool/reasoning steps per turn before answering. |
-| `AGENT_TOOLS` | Tool allow-list. |
-| `FAST_PATH` | Enable deterministic URL/arithmetic shortcuts. |
-| `KNOWLEDGE_TRIAGE` | Enable model routing for substantive questions. |
-| `INCREMENTAL_REASONING`, `REASONING_MAX_STEPS`, `REASONING_STEP_TIMEOUT` | Incremental reasoning behaviour and per-step wall-clock cap. |
-| `REASONING_TOKENS` | Token budget for each reasoning, chunk, and source-extraction pass. RAM-scaled default. |
-| `CHUNK_LARGE_PROMPTS` | Enable map-reduce chunking of oversized prompts. |
-| `CHUNK_TRIGGER_RATIO`, `CHUNK_SIZE_RATIO` | Fraction of context above which a prompt is chunked, and the fraction each chunk targets. |
-| `AUTO_FETCH_RESULTS` | Sources read and compared after a search (default 2; 1 = single source, 0 = snippets only). |
-| `AUTO_FETCH_CHAR_CAP` | Hard char cap on a fetched page entering the prompt. RAM-scaled default. |
+**Test user** (optional, for dev): set `AUTH_ALLOW_TEST_USER=1` and
+`AUTH_TEST_PASSWORD=…`. It is a normal non-admin account, not a backdoor. Remove
+it for production by setting `AUTH_ALLOW_TEST_USER=0` (it will not be recreated) or
+deleting it from the admin **Users** panel.
 
-### Resilience and memory
-
-| Variable | Meaning |
-|----------|---------|
-| `STALL_TIMEOUT` | Seconds of silence before a generation is treated as stalled. |
-| `READY_WAIT_TIMEOUT` | Seconds a retry waits for a restarting model server to become ready before giving up on that attempt. |
-| `RESILIENT_RETRIES` | Retry attempts on generation failure. |
-| `MIN_MAX_TOKENS` | Floor the reply budget shrinks to on retry. |
-| `HARD_STEP_CAP` | Ceiling for summarize-and-continue on big tasks. |
-| `SUMMARISE_TOOL_RESULTS`, `SUMMARISE_OVER_CHARS`, `TOOL_RESULT_CHARS`, `TOOL_RAW_CHARS` | Tool-result summarisation and size limits. |
-| `STABLE_PREFIX` | Keep prompt prefix stable for cache reuse. |
-| `DISABLE_THINKING` | Skip the model's hidden reasoning phase. |
-| `TOOL_TEMPERATURE`, `TOOL_TIMEOUT` | Tool-selection temperature and tool execution timeout. |
-
-### Search
-
-| Variable | Meaning |
-|----------|---------|
-| `SEARCH_BACKEND` | `ddg` (no key), `brave`, `tavily`, or `searxng`. |
-| `SEARCH_RESULTS` | Results per query. |
-| `BRAVE_API_KEY`, `TAVILY_API_KEY`, `SEARXNG_URL` | Backend credentials/endpoint. |
-
-### Training and tasks
-
-| Variable | Meaning |
-|----------|---------|
-| `TRAIN_ITERS`, `TRAIN_LR`, `TRAIN_SEQ_LEN`, `TRAIN_NUM_LAYERS` | LoRA hyperparameters. |
-| `TRAIN_ON_TOOL_CALLS`, `TRAIN_TOOL_EXAMPLES` | Include tool-call examples in training. |
-| `AUTO_RETRAIN_THRESHOLD` | Approved-sample count that triggers auto-retrain. |
-| `MAX_CONCURRENT_TASKS`, `TASK_POLL_SECONDS`, `CHAT_IDLE_SECONDS` | Scheduler concurrency and timing. |
-
-### Tools and safety
-
-| Variable | Meaning |
-|----------|---------|
-| `ALLOW_SHELL`, `ALLOW_PYTHON`, `ALLOW_LOCAL_FETCH` | Opt-in flags for the powerful tools. |
-| `CALC_MAX_RESULT_BITS`, `CALC_MAX_FACTORIAL` | Calculator DoS bounds (largest result width and factorial input). Raising them re-opens the memory-exhaustion surface they exist to close. |
-
-### Ports, cache, branding
-
-| Variable | Meaning |
-|----------|---------|
-| `WEB_PORT`, `MODEL_PORT` | Preferred ports (a free one is chosen if taken). |
-| `HF_HOME`, `HF_HUB_CACHE`, `PROMPT_CACHE_DIR` | Model/cache locations. |
-| `APP_NAME`, `APP_LOGO` | Branding. |
+**Database.** SQLite at `data/feedback.db`, created and migrated on startup. The
+migration is additive and idempotent: existing single-user data is backfilled to a
+`local` owner, so upgrading in place keeps every conversation.
 
 ---
 
-## Command-line reference
+## Configuration
 
-Most environment variables have a matching flag. Highlights:
+All configuration is centralized in [`local_llm/config.py`](local_llm/config.py)
+and driven by environment variables; [`.env.example`](.env.example) documents
+every variable with placeholders. Highlights:
 
-```text
-Serving:      --agent  --context-size  --max-tokens  --temperature  --history-turns
-              --model  --model-catalog  --system-prompt  --web-port  --model-port
-              --agent-max-steps  --agent-tools  --search-backend  --search-results
-              --max-kv-size  --allow-shell  --allow-python  --allow-local-fetch
+| Group | Variables |
+|-------|-----------|
+| Model/core | `MODEL_ID`, `CONTEXT_SIZE`, `MAX_TOKENS`, `TEMPERATURE`, `HISTORY_TURNS`, `WEB_PORT`, `MODEL_PORT` |
+| Logging | `LOG_LEVEL`, `LOG_FORMAT`, `LOG_DIR`, `LOG_CHAT_CONTENT`, `LOG_MAX_BYTES`, `LOG_BACKUP_COUNT`, `LOG_RETENTION_DAYS` |
+| Auth | `AUTH_ENABLED`, `AUTH_ADMIN_USERNAME`, `AUTH_ADMIN_PASSWORD`, `AUTH_SESSION_TTL_HOURS`, `AUTH_COOKIE_SECURE`, `AUTH_ALLOW_TEST_USER`, `AUTH_TEST_USERNAME`, `AUTH_TEST_PASSWORD` |
+| Entra/OIDC | `OIDC_ENABLED`, `OIDC_TENANT_ID`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI`, `OIDC_ADMIN_EMAILS`, `OIDC_ADMIN_GROUPS`, `OIDC_ADMIN_ROLES`, `OIDC_DEFAULT_ROLE` |
+| Cluster/routing | `NODE_ROLE`, `NODE_NAME`, `STUDIO_NODE_URL`, `PRIMARY_NODE_URL`, `NODE_TOKEN`, `ROUTE_MAX_ACTIVE`, `ROUTE_QUEUE_DEPTH`, `ROUTE_CPU_PCT`, `ROUTE_MEM_PCT`, `ROUTE_SLA_MS`, `LARGE_MODEL_MARKERS`, `HEARTBEAT_INTERVAL`, `HEARTBEAT_TIMEOUT` |
+| Import | `IMPORT_MAX_ZIP_BYTES`, `IMPORT_MAX_FILES`, `IMPORT_MAX_UNCOMPRESSED_BYTES`, `IMPORT_MAX_FILE_BYTES` |
+| Search | `SEARCH_RESULTS` (provider is locked to DuckDuckGo Lite) |
+| Networking | `ALLOWED_ORIGINS` (extra CORS origins behind a proxy) |
 
-Feedback:     --list-feedback  --export-only  --export-format {jsonl,csv}
-Training:     --retrain-now  --auto-retrain-threshold
-              --train-iters  --train-lr  --train-seq-len
-Models:       --list-models  --adapter
-Tasks:        --add-task  --list-tasks
-Tools:        --list-tools  --tool-test <name>  --tool-args '<json>'
-Utility:      --seed-demo  --selftest  --doctor  --bench  --bench-save
-```
+Secrets (`AUTH_ADMIN_PASSWORD`, `OIDC_CLIENT_SECRET`, `NODE_TOKEN`,
+`AUTH_TEST_PASSWORD`) are never returned by the API or written to logs — the
+config endpoint reports only whether each is set.
 
-Run without flags to serve normally. Use `--selftest` to validate routing, the safe calculator, JSON extraction, chunking, and other invariants without a running model.
-
----
-
-## HTTP API
-
-The browser UI is a client of this local API. Selected endpoints:
-
-```text
-GET  /                              Web UI
-GET  /api/health                    Status: model, RAM, context, tasks, feedback stats
-POST /api/chat/stream               Chat (Server-Sent Events)
-POST /api/chat                      Chat (non-streaming)
-GET  /api/config     POST /api/config    Read / update live settings
-GET  /api/models     POST /api/models/select   List / choose model
-GET  /api/adapters                  Available LoRA adapters
-POST /api/model/restart             Restart the model server
-POST /api/retrain                   Kick off LoRA training
-GET  /api/feedback   POST /api/feedback   List / submit ratings
-GET  /api/memory     POST /api/memory     DELETE /api/memory/{key}   Agent notes
-GET  /api/tasks      POST /api/tasks      ...   Task CRUD, run, cancel, stream
-GET  /api/metrics    /api/metrics/summary  /api/metrics/run/{id}     Timings
-GET  /api/tools      /api/tools/call  /api/tools/calls               Tool inventory / invoke / log
-GET  /api/logs/{name}               Server logs
-```
-
-Chat events streamed to the client include: `start`, `phase`, `context`, `step`, `token`, `tool_call`, `tool_result`, `reason_step` / `reason_token` / `reason_done`, `notice`, `usage`, `final`, `cancelled`, `error`.
+Admins can change most safe settings live from **Settings** (or `POST /api/config`)
+without a restart, including `LOG_LEVEL`, `LOG_CHAT_CONTENT` and the routing
+thresholds. Secrets and `AUTH_ENABLED` require a restart.
 
 ---
 
-## Testing and diagnostics
+## Authentication, users and roles
 
-- **`python3 deploy.py --selftest`** — runs built-in assertions: deterministic routing, the safe calculator's DoS bounds, the router's JSON extraction, code-vs-lookup classification, reasoning triggers, chunking, prompt-prefix stability, and more. No model required.
-- **`python3 deploy.py --doctor`** — environment checks.
-- **`python3 deploy.py --bench`** — a quick performance benchmark (add `--bench-save` to record it).
-- **`python3 deploy.py --tool-test web_search --tool-args '{"query":"mlx lora"}'`** — exercise a single tool in isolation.
-- The **startup log** prints detected RAM, the chosen model, and the chosen context with the chunk threshold, so the memory profile selected for the machine is visible at a glance.
+- **Sessions are cookies.** Login sets an HttpOnly, SameSite=Lax cookie holding an
+  opaque token; only its SHA-256 is stored, so a database leak yields no usable
+  tokens. Cookies ride along with fetch, live SSE streams and file downloads
+  alike. Set `AUTH_COOKIE_SECURE=1` when served over HTTPS.
+- **API clients** may authenticate with `Authorization: Bearer <token>` instead.
+- **Passwords** are hashed with `hashlib.scrypt` (memory-hard, standard library).
+- **Roles.**
+  - *Admin* sees everything: Settings, model/routing config, system status,
+    telemetry, logs, user administration, Claude import, advanced agent functions,
+    system management.
+  - *Non-admin* sees a simplified UI: Chat, their own conversations, available
+    agents, and normal user features. They cannot reach system settings, infra
+    config, detailed telemetry, debug logs, admin functions or internal routing
+    controls.
+- **RBAC is enforced server-side** on every route (FastAPI dependencies), not just
+  hidden in the UI. Direct API requests to admin endpoints from a non-admin return
+  `403`; unauthenticated requests return `401`.
+- **User administration.** Admins manage accounts in the **Users** panel or via
+  `GET/POST /api/users`, `POST /api/users/{id}` (role/disable/reset password),
+  `DELETE /api/users/{id}`. The last admin cannot be demoted, disabled or deleted.
+  A role change, disable or password reset invalidates that user's sessions.
+- **Data isolation.** Conversations, memory notes, imported history, feedback,
+  and per-user knowledge are scoped to their owner; one user can never read
+  another's data by guessing an id. Verified by the test suite (including a
+  concurrency test).
+
+---
+
+## Microsoft Entra ID / OIDC
+
+Standard OpenID Connect authorization-code flow. The ID token is fetched directly
+from the tenant's token endpoint over TLS (confidential client), so its claims are
+trusted per the OIDC spec; if `PyJWT`+`cryptography` are installed, the signature
+is additionally verified against the tenant JWKS.
+
+**1. Register an app in Entra ID (Azure portal → App registrations):**
+
+- Redirect URI (Web): `https://YOUR-DOMAIN/api/auth/oidc/callback`
+- Create a client secret (Certificates & secrets).
+- Note the **Application (client) ID** and **Directory (tenant) ID**.
+- To grant admin by group, add a **groups** claim (Token configuration) or, for
+  large orgs, define an **App role** (e.g. `Admin`) and assign it — app roles are
+  the recommended, overage-proof mechanism.
+
+**2. Configure the app:**
+
+```bash
+OIDC_ENABLED=1
+OIDC_TENANT_ID=<tenant-guid>
+OIDC_CLIENT_ID=<client-guid>
+OIDC_CLIENT_SECRET=<secret>
+OIDC_REDIRECT_URI=https://YOUR-DOMAIN/api/auth/oidc/callback
+OIDC_ADMIN_ROLES=Admin           # or OIDC_ADMIN_EMAILS / OIDC_ADMIN_GROUPS
+OIDC_DEFAULT_ROLE=user
+```
+
+**3. Use it.** The login screen shows **Sign in with Microsoft** when OIDC is
+configured. On first login a local user record is created and linked to the Entra
+subject; role is (re)mapped from the token on every login (the IdP is the source
+of truth). Local admin login still works alongside SSO, so you are never locked
+out if the IdP is unavailable. Logout clears the local session (it does not
+perform a full Entra single-logout).
+
+Local development does not require Entra — leave `OIDC_ENABLED=0` and use local
+login.
+
+---
+
+## Claude history import
+
+Admins can import a Claude data export (the ZIP from Claude's *Export data*
+feature: a README, `conversations.json`, `projects.json`, `users.json` and any
+supporting files).
+
+**UI:** **Models** (admin) view → **Import Claude history** panel. Choose the
+`.zip`, click **Import**, and watch live status/progress/counts. Failed imports
+can be retried; imports can be removed (which also deletes the conversations and
+knowledge they created).
+
+**Pipeline:** upload → validate → safe extraction → discover/classify files →
+parse Claude format → normalize → de-duplicate → store & index. It runs in the
+background; status is tracked in the `imports` table and shown in the UI.
+
+**Security (the ZIP is untrusted):** enforced size cap on the upload, per-file and
+total-uncompressed caps and a compression-ratio guard (zip-bomb defence), entry
+count limit, symlink rejection, and path-traversal / zip-slip rejection (every
+entry is resolved and confirmed to stay inside the per-import staging directory).
+Limits are configurable (`IMPORT_MAX_*`).
+
+**What gets imported, and how it is used (retrieval, not prompt-stuffing):**
+
+- **Historical conversations** → stored as real conversations you can browse and
+  reopen in **History** (titled `[imported] …`, owned by you).
+- **Reusable knowledge / historical context** → each conversation and project
+  document is indexed into your knowledge base. The existing BM25 retrieval then
+  surfaces only the passages relevant to a new question, with citations — history
+  is **never** dumped wholesale into a prompt.
+- **Reusable skills / instructions** → project instructions become saved prompts.
+- **Inferred preferences** → explicit preferences become durable memory notes.
+- **Files / artifacts** → text artifacts are indexed into the knowledge base.
+
+**Privacy scope:** imported data is private to the importing user (owner-scoped),
+retrievable only in that user's chats.
+
+**Removal:** the **Remove** button (or `DELETE /api/imports/{id}`) deletes the
+import record, its imported conversations and its knowledge-base documents.
+
+**Troubleshooting:** if an import shows *failed*, open its row for the reason
+(e.g. "path traversal blocked", "exceeds the uncompressed limit"). Oversized
+uploads are rejected before processing; raise `IMPORT_MAX_*` if a legitimate
+export is larger than the defaults.
+
+---
+
+## Agents, knowledge and skills
+
+The agent is a model-as-router loop: cheap deterministic shortcuts (a bare URL →
+fetch, arithmetic → calculator) run first, then the model returns a structured
+routing decision that generic code executes. Adding a capability means registering
+a tool, not writing routing rules.
+
+- **Knowledge base (RAG).** Indexed documents are searched on every question
+  (SQLite FTS5 / BM25 — no embedding model, no extra memory), and the best
+  passages are prepended with their source path. Retrieval is scoped to the acting
+  user's own documents plus shared ones. Admins manage the shared knowledge base
+  (index files/URLs, upload, clear, scope) in the **Models** view.
+- **Skills / prompts.** A prompt library (Prompts) and, from imports, saved
+  project instructions.
+- **Memory.** The `remember`/`recall`/`forget` tools store durable notes,
+  isolated per user.
+- **Tasks.** Named jobs (admin) the agent runs on demand or a timer; runs stream
+  the same event types as chat.
+
+---
+
+## Logging and debugging
+
+Structured, aggregation-ready logging lives in
+[`local_llm/obslog.py`](local_llm/obslog.py).
+
+- **Format & storage.** JSON (default) or text; written to `logs/app.log` with
+  size-based rotation (`LOG_MAX_BYTES` × `LOG_BACKUP_COUNT`) and startup pruning of
+  rotations older than `LOG_RETENTION_DAYS`. The raw mlx server output stays in
+  `logs/model_server.log`.
+- **Correlation IDs.** Every request is tagged with a correlation id (returned as
+  the `X-Correlation-ID` response header and included in 500 bodies). Filter a
+  whole request's lifecycle across chat, tool, model and routing logs by that id:
+
+  ```bash
+  grep '"correlation_id":"<id>"' logs/app.log
+  ```
+
+- **Domains.** Records carry an `event` and a `logger` domain
+  (`request`, `chat`, `tool`, `model`, `routing`, `auth`, `import`).
+- **Levels.** `ERROR` / `WARN` / `INFO` / `DEBUG` / `TRACE`. Set with `LOG_LEVEL`,
+  or live from the admin **Settings** (applies immediately).
+- **Chat-content logging.** `LOG_CHAT_CONTENT` = `disabled` (no content),
+  `metadata` (length + fingerprint only — the production default), or `full`
+  (redacted, truncated text). Change it live to `disabled` to stop content logging.
+- **Secret redaction.** A redaction filter scrubs authorization headers, API keys,
+  bearer/JWT tokens, passwords and cookies from log messages **and** structured
+  fields; tool args/results are redacted before they are stored.
+- **Routing decisions.** Every node-selection decision is logged and persisted to
+  the `routing_events` table (`GET /api/routing/events`, `GET /api/cluster/nodes`)
+  — see the next section.
+- **Reading routing/model failures.** Model errors are labelled honestly (stall,
+  dropped connection, out-of-memory, generic); failovers appear as
+  `model.failover` events with the from-node and reason.
+
+Read logs in the UI (admin **Models** → *Model server log*, or
+`GET /api/logs/{model|train|tasks}`) or on disk under `logs/`.
+
+---
+
+## Automatic Mac Mini / Mac Studio routing
+
+**The Mac Mini is the primary node; the Mac Studio is the secondary /
+high-performance / fallback node. Users never choose a machine.** With no
+`STUDIO_NODE_URL` configured the router has a single node and behaves exactly like
+the original single-machine app.
+
+**Routing pipeline** (a real scheduler, [`local_llm/cluster.py`](local_llm/cluster.py),
+not `if machine == …`):
+
+```
+incoming request → classify → evaluate node load/health → check model capability
+→ select node (record reason) → execute → fail over / retry on failure
+```
+
+**When the Studio is used** (any of):
+
+- the Mini is overloaded (in-flight generations ≥ `ROUTE_MAX_ACTIVE`, CPU ≥
+  `ROUTE_CPU_PCT`, memory ≥ `ROUTE_MEM_PCT`, or latency past `ROUTE_SLA_MS`),
+- the request needs a **larger model** (the requested model matches
+  `LARGE_MODEL_MARKERS`, e.g. a 32B) which only the high-memory Studio advertises,
+- the Mini is unavailable.
+
+Work returns to the Mini automatically once it is healthy and within capacity.
+A failed Studio never breaks the Mini (it is simply skipped); a failed Mini shifts
+eligible work to the Studio.
+
+**Health monitoring.** A background heartbeat probes each node on
+`HEARTBEAT_INTERVAL` and moves it between `healthy` / `degraded` / `overloaded` /
+`starting` / `draining` / `unavailable`. The Mini reads its own model-server status
+plus CPU/memory; it probes the Studio via the Studio's `GET /api/node/health`
+(authenticated with `NODE_TOKEN`).
+
+**No duplicated work.** Each generation carries a unique task id; failover retries
+the same id on the next node, and the router refuses to double-dispatch an id that
+is already in flight. Model generation itself is side-effect-free; the conversation
+is committed once, after the generation returns.
+
+**Observability (admins only).** `GET /api/cluster/nodes` shows every node's live
+state, load and model; `GET /api/routing/events` shows, per decision, which
+user/agent/model/machine handled it, why that machine was chosen, the load at the
+time, failovers, duration and outcome. Example — debug why something ran on the
+Studio:
+
+```bash
+curl -s -b cookies.txt http://127.0.0.1:8000/api/routing/events | python3 -m json.tool | head -40
+# each event: {selected_node, reason, requested_model, status, attempt, duration_ms, candidates:[…live loads…]}
+```
+
+**Tuning.** All factors are environment/live-configurable (`ROUTE_*`,
+`HEARTBEAT_*`, `LARGE_MODEL_MARKERS`) — there are no arbitrary fixed thresholds.
+
+**How the Studio serves work securely.** The Mini calls the Studio app's
+`POST /api/node/generate` (OpenAI-shaped, `NODE_TOKEN`-authenticated), which runs
+the generation on the Studio's *local* mlx server. The Studio's model port is
+never exposed to the network.
+
+---
+
+## Mac Mini deployment (primary)
+
+1. Install prerequisites: native arm64 Python 3.10+, then clone the repo.
+2. Create `.env` from `.env.example`. Set:
+   ```bash
+   NODE_ROLE=primary
+   NODE_NAME=mac-mini
+   AUTH_ENABLED=1
+   AUTH_ADMIN_USERNAME=admin
+   AUTH_ADMIN_PASSWORD='strong-password'
+   NODE_TOKEN='a-long-random-shared-secret'      # same on both nodes
+   STUDIO_NODE_URL=http://studio.local:8000        # the Studio's app URL (private network)
+   MODEL_ID=mlx-community/Qwen2.5-Coder-7B-Instruct-4bit   # the Mini's everyday model
+   ```
+3. First run downloads the model and initialises the DB:
+   ```bash
+   python3 deploy.py
+   ```
+4. Health-check locally: open the printed URL, log in as admin, and check
+   **Models** view → node status (or `curl -s -b cookies.txt http://127.0.0.1:8000/api/cluster/nodes`).
+5. Make it the primary: it is, by `NODE_ROLE=primary`. Keep it always-on (a
+   `launchd` LaunchAgent or a process manager that loads `.env`).
+6. Test from another machine (via the reverse proxy / VPN, see below): log in and
+   send a chat.
+
+## Mac Studio deployment (secondary)
+
+1. Same install steps on the Studio.
+2. `.env`:
+   ```bash
+   NODE_ROLE=secondary
+   NODE_NAME=mac-studio
+   NODE_TOKEN='a-long-random-shared-secret'      # identical to the Mini's
+   PRIMARY_NODE_URL=http://mini.local:8000         # informational
+   MODEL_ID=mlx-community/Qwen2.5-Coder-32B-Instruct-4bit   # the big model the Mini offloads
+   AUTH_ENABLED=1                                    # its own admin; users log in on the Mini
+   # Do NOT set STUDIO_NODE_URL here (a secondary has no secondary).
+   ```
+3. Start it: `python3 deploy.py`. Confirm it loads its model.
+4. Health-check from the Mini:
+   ```bash
+   curl -s -H "Authorization: Bearer $NODE_TOKEN" http://studio.local:8000/api/node/health
+   ```
+5. Configure as fallback / high-capacity: nothing more to do — the Mini's
+   `STUDIO_NODE_URL` + `NODE_TOKEN` enable it. The Studio advertises the
+   `large_model` / `high_memory` capabilities automatically.
+6. Test failover: on the Mini, temporarily stop the Studio and send a chat (it
+   stays on the Mini, no error); start the Studio and send a request for a large
+   model (it routes to the Studio). Watch `GET /api/routing/events`.
+
+**Keep the Studio private.** Bind it to the private network only (a Tailscale/VPN
+interface or a LAN behind the firewall). Only the Mini needs to reach the Studio,
+authenticated by `NODE_TOKEN`. Never expose the Studio (or either mlx model port)
+to the public internet.
+
+---
+
+## Secure internet access
+
+**Do not port-forward the app or the model ports directly.** Put an
+identity-aware layer in front. Recommended architecture:
+
+**Option A — Tailscale (simplest, private):** put both Macs on a Tailscale
+tailnet. Users access the Mini over Tailscale (or via *Tailscale Funnel* for
+public HTTPS). The Studio is reachable only from the Mini over the tailnet. No
+public ports, automatic TLS with Funnel, device identity from Tailscale.
+
+**Option B — Cloudflare Tunnel + Entra:** run `cloudflared` on the Mini pointing
+at `http://127.0.0.1:8000`; Cloudflare terminates TLS on your domain and can add
+an identity-aware Access policy in front. The origin is never publicly exposed.
+
+**Option C — Reverse proxy (Caddy) + the app's Entra SSO:** Caddy on the Mini
+provides automatic HTTPS and forwards to the app, which enforces auth (Entra):
+
+```caddyfile
+llm.example.com {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:8000
+}
+```
+Then set `AUTH_ENABLED=1`, `AUTH_COOKIE_SECURE=1`,
+`OIDC_REDIRECT_URI=https://llm.example.com/api/auth/oidc/callback`, and
+`ALLOWED_ORIGINS=https://llm.example.com`.
+
+**In all cases:**
+
+- **TLS/HTTPS** terminated at the proxy/tunnel; set `AUTH_COOKIE_SECURE=1`.
+- **Firewall**: allow only the proxy/tunnel inbound; block the app port (8000) and
+  both model ports (8080) from the public internet.
+- **Auth at the edge and in the app**: keep the app's own auth on even behind an
+  identity-aware proxy (defence in depth).
+- **Protect admin endpoints**: they are already `403` for non-admins; optionally
+  add an Access policy restricting `/api/config`, `/api/logs`, `/api/users`,
+  `/api/routing`, `/api/import` further at the proxy.
+- **Mini ↔ Studio**: private network only, authenticated with `NODE_TOKEN` (a long
+  random secret, rotated by changing it on both nodes and restarting).
+- **Verify** external access with the browser and `curl -I https://llm.example.com`.
+- **Revoke** access by disabling the user (admin **Users** panel — this also kills
+  their sessions), rotating `NODE_TOKEN`, or removing the tunnel/Access policy.
+
+---
+
+## Search provider
+
+Web search uses **DuckDuckGo Lite exclusively** (`https://lite.duckduckgo.com/lite/`).
+This is a hard constraint, enforced in the search backend, the tool layer,
+configuration (there is no variable to select another engine — `SEARCH_BACKEND` is
+accepted only as a DuckDuckGo-Lite alias and anything else is ignored), and the
+test suite. No Google/Bing/Brave/Tavily/SearXNG or any other provider is reachable.
+Only `SEARCH_RESULTS` (count) is configurable.
+
+---
+
+## Testing
+
+Two complementary suites, both runnable without a model server:
+
+```bash
+# Offline invariants (no dependencies needed): routing, calculator, chunking,
+# auth hashing/sessions/RBAC, multi-user isolation, logging redaction, cluster
+# routing decisions, Claude-import security, the DuckDuckGo-Lite lock, and more.
+python3 deploy.py --selftest
+
+# HTTP integration tests (auth flows, RBAC blocking, cross-user isolation,
+# import, node-token gating, concurrency, backward-compatible auth-off).
+python3 tests/test_app.py            # standalone runner
+# or, with pytest installed:
+python3 -m pip install pytest && python3 -m pytest tests/ -q
+```
+
+Other diagnostics: `python3 deploy.py --doctor` (ports), `--bench` (throughput),
+`--print-config`, `--dump-prompt`, `--list-models`, `--tool-test <name>`.
 
 ---
 
 ## Troubleshooting
 
-**A big page or prompt still OOMs on a roomy Mac.** The RAM tiers are estimates; a large context plus a large model can press memory on borderline machines. Set `CONTEXT_SIZE` down explicitly (it overrides the auto value), or lower `AUTO_FETCH_RESULTS` to 0 to use snippets only.
-
-**"Thinking" looks stuck.** With reasoning or chunking, watch the trace: streaming tokens mean it is working, a frozen node with a moving clock means the model call itself is slow, and a frozen node with a stalled amber clock means a real wedge. A genuinely slow single generation on 8 GB is a hardware/model-size limit — the lighter model or a smaller context is the remedy, not more retries.
-
-**"Connection dropped / server ran low on memory."** The OS out-of-memory killer took a process. Reduce `CONTEXT_SIZE`, `AUTO_FETCH_RESULTS`, or `MAX_TOKENS`. The input-shrinking retries and page caps make this rare, but 8 GB is a hard ceiling.
-
-**Lookups return irrelevant results or refuse.** Ensure the agent path is engaged (routing runs there). The router biases toward searching when unsure; if a specific phrasing misroutes, it is a model-quality limit, not a rules bug — the lighter-touch fix is a clearer prompt.
-
-**Stale UI after an update.** The header warns when the served build differs from the loaded tab; hard-reload.
-
----
+- **App won't start / "Refusing to serve a broken UI".** A malformed embedded UI;
+  run `python3 deploy.py --selftest` for the specific problem.
+- **Can't log in / locked out.** Local admin always works even if Entra is down.
+  If you lost the admin password, set `AUTH_ADMIN_PASSWORD` and restart — but note
+  it only creates the admin when none exists; to reset an existing one, use the
+  admin Users panel from another admin, or (last resort) delete the `users`/`sessions`
+  rows for that account in `data/feedback.db`.
+- **Entra login fails.** Check `OIDC_REDIRECT_URI` matches the app registration
+  exactly, the client secret is valid, and the callback host is HTTPS. The login
+  page shows the specific (redacted) error.
+- **Claude import fails.** Open the import row for the reason; raise `IMPORT_MAX_*`
+  for a large legitimate export; a "traversal"/"zip bomb" message means the archive
+  was rejected for safety.
+- **Model unavailable / OOM.** Reduce `CONTEXT_SIZE`, `AUTO_FETCH_RESULTS` or
+  `MAX_TOKENS`; the input-shrinking retries make this rare. In a cluster, an
+  overloaded Mini offloads to the Studio automatically.
+- **Studio unavailable.** The Mini keeps serving on its own; check
+  `GET /api/cluster/nodes` and the Studio's `/api/node/health`, and confirm
+  `NODE_TOKEN` matches on both nodes and the private network is reachable.
+- **Routing looks wrong.** Read `GET /api/routing/events` — each event records the
+  reason and the live node loads at decision time. Tune `ROUTE_*` /
+  `LARGE_MODEL_MARKERS`.
+- **Heartbeat failures.** A node shows `unavailable`/`degraded`: verify the URL,
+  `NODE_TOKEN`, and that the Studio app is running.
+- **A non-admin sees an admin control.** They should not; if a direct API call
+  slips through it still returns `403`. File it as a bug — server-side RBAC is the
+  gate, the UI hiding is cosmetic.
+- **Disk filling with logs/caches.** Logs rotate and prune automatically; tune
+  `LOG_MAX_BYTES`/`LOG_BACKUP_COUNT`/`LOG_RETENTION_DAYS`. Runtime dirs
+  (`logs/`, `data/`, `adapters/`, caches) are gitignored.
+- **Git tracking runtime files.** They are ignored via `.gitignore`; if something
+  slipped in earlier, `git rm --cached <path>` (the file stays on disk).
+```

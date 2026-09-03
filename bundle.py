@@ -16,13 +16,14 @@ import ast
 from pathlib import Path
 
 ORDER = [
-    "core", "database", "sysutil",
+    "core", "obslog", "database", "sysutil",
     # UI parts must precede ui.py, which assembles HTML_PAGE from them.
     "ui_styles", "ui_markup", "ui_script_chat", "ui_script_views",
-    "ui_script_tasks", "ui_script_models", "ui_script_panels",
+    "ui_script_tasks", "ui_script_models", "ui_script_auth", "ui_script_panels",
     "ui", "config", "model_server", "training",
     "websearch", "calculator", "tools", "llm", "model_client", "textutil",
-    "agent", "tasks", "api", "diagnostics", "selftest", "cli",
+    "agent", "tasks", "auth", "cluster", "claude_import", "api",
+    "diagnostics", "selftest", "cli",
 ]
 
 PKG = Path(__file__).resolve().parent / "local_llm"

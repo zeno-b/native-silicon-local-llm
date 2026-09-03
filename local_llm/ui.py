@@ -45,6 +45,7 @@ from .ui_script_models import UI_JS_MODELS
 from .ui_script_panels import UI_JS_PANELS
 from .ui_script_tasks import UI_JS_TASKS
 from .ui_script_views import UI_JS_VIEWS
+from .ui_script_auth import UI_JS_AUTH
 
 
 def render_ui() -> str:
@@ -187,6 +188,7 @@ HTML_PAGE = (
     + "\n" + UI_JS_VIEWS
     + "\n" + UI_JS_TASKS
     + "\n" + UI_JS_MODELS
+    + "\n" + UI_JS_AUTH
     + "\n" + UI_JS_PANELS
     + UI_TAIL
 )

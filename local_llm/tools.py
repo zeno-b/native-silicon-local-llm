@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Literal
 
 from .core import *  # noqa: F401,F403
+from .obslog import *  # noqa: F401,F403
 from .config import *  # noqa: F401,F403
 from .database import *  # noqa: F401,F403
 from .websearch import *  # noqa: F401,F403
@@ -1045,7 +1046,9 @@ class ToolRegistry:
         key = str(key).strip()[:120]
         if not key:
             raise ValueError("key must not be empty")
-        self.db.remember(key, str(value), self.conversation_id)
+        # Scope the note to the acting user (contextvar) so it is private to them.
+        self.db.remember(key, str(value), self.conversation_id,
+                         user_id=get_acting_user())
         return f"Stored under {key}."
 
     def _recall_memory(self, query: str = "", limit: Any = 10) -> str:
@@ -1055,7 +1058,7 @@ class ToolRegistry:
             count = min(50, max(1, int(limit)))
         except (TypeError, ValueError):
             count = 10
-        rows = self.db.recall(query or None, count)
+        rows = self.db.recall(query or None, count, user_id=get_acting_user())
         if not rows:
             return "No stored notes." if not query else f"No stored notes matching {query!r}."
         return "\n".join(f"{row['key']}: {row['value']}" for row in rows)
@@ -1063,7 +1066,9 @@ class ToolRegistry:
     def _forget(self, key: str) -> str:
         if self.db is None:
             return "Memory store unavailable."
-        return f"Deleted {key}." if self.db.forget(str(key)) else f"No note called {key}."
+        return (f"Deleted {key}."
+                if self.db.forget(str(key), user_id=get_acting_user())
+                else f"No note called {key}.")
 
     def _exec(self, cmd, shell: bool = False) -> str:
         """Run a command in the project root and return captured, capped output.
@@ -1173,7 +1178,8 @@ class ToolRegistry:
         if tool is None:
             error = f"Unknown tool: {name}. Available: {', '.join(self.names())}"
             if self.db:
-                self.db.log_tool_call(conversation_id, name, args, "", 0.0, error)
+                self.db.log_tool_call(conversation_id, name, args, "", 0.0, error,
+                                      user_id=get_acting_user())
             return error, error
 
         normalised = self.normalise_args(tool, args)
@@ -1186,7 +1192,8 @@ class ToolRegistry:
             error = (f"Missing required argument(s) for {name}: {', '.join(missing)}. "
                      f"Expected arguments: {expected}")
             if self.db:
-                self.db.log_tool_call(conversation_id, name, args, "", 0.0, error)
+                self.db.log_tool_call(conversation_id, name, args, "", 0.0, error,
+                                      user_id=get_acting_user())
             return error, error
 
         clean = self.normalise_args(tool, args)
@@ -1201,7 +1208,8 @@ class ToolRegistry:
         # of it is worth spending context on, after a summarisation pass.
         result = result[:self.config.tool_raw_chars]
         if self.db:
-            self.db.log_tool_call(conversation_id, name, clean, result, duration, error)
+            self.db.log_tool_call(conversation_id, name, clean, result, duration, error,
+                                  user_id=get_acting_user())
         return result, error
 
 

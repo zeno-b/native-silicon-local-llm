@@ -492,9 +492,6 @@ UI_JS_PANELS = r"""   // ---------------------------------------------------- hi
      }
    }
 
-   loadConfig();
-   loadMemory();
-   loadPerf();
    wireDropZone();
 
    // Restore the saved colour scheme before anything renders.
@@ -538,8 +535,9 @@ UI_JS_PANELS = r"""   // ---------------------------------------------------- hi
      if (e.target === _palOverlay) closePalette();
    });
 
-   setInterval(refreshHealth, 3000);
-   refreshHealth();
+   // Resolve auth, show the login screen if required, then load the data that
+   // suits the signed-in user's role. Defined in the auth script part.
+   authBoot();
  """
 
 __all__ = ["UI_JS_PANELS"]

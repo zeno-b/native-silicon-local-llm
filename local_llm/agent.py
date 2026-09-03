@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Literal
 
 from .core import *  # noqa: F401,F403
+from .obslog import *  # noqa: F401,F403
 from .config import *  # noqa: F401,F403
 from .database import *  # noqa: F401,F403
 from .tools import *  # noqa: F401,F403
@@ -170,8 +171,10 @@ class Agent:
             return user_message
         try:
             scope = [p.strip() for p in (self.config.rag_scope or "").split(",") if p.strip()]
+            # Scope retrieval to the acting user's own + shared documents so one
+            # user's imported history never surfaces in another's answers.
             hits = db.search_documents(user_message, limit=self.config.rag_passages,
-                                       only=scope or None)
+                                       only=scope or None, user_id=get_acting_user())
         except Exception as exc:
             log(f"knowledge-base lookup skipped: {exc}", logging.DEBUG)
             return user_message

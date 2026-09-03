@@ -517,6 +517,37 @@ UI_CSS = r"""
    .panel { max-width: 760px; padding: 16px; overflow-y: auto; flex: 1; }
    .panel h3 { margin: 18px 0 8px; font-size: 14px; }
    .panel h3:first-child { margin-top: 0; }
+
+   /* --- Auth: login overlay, role gating, user chip, import panel --- */
+   #loginOverlay {
+     position: fixed; inset: 0; background: var(--bg);
+     display: none; align-items: center; justify-content: center; z-index: 100;
+   }
+   body.locked #loginOverlay { display: flex; }
+   /* When not signed in, hide the whole app so only the login box shows. */
+   body.locked > header,
+   body.locked > #main,
+   body.locked > #composer { display: none; }
+   #loginBox {
+     width: 320px; max-width: 90vw; background: var(--surface);
+     border: 1px solid var(--border); border-radius: 12px; padding: 22px;
+     display: flex; flex-direction: column;
+   }
+   #loginBox input {
+     width: 100%; padding: 9px 10px; border-radius: 8px; box-sizing: border-box;
+     border: 1px solid var(--border); background: var(--panel-bg); color: var(--text);
+   }
+   .login-error { color: #ff6b6b; font-size: 12px; min-height: 16px; margin-top: 8px; }
+   .user-chip { font-size: 12px; color: #999; align-self: center; padding: 0 6px; }
+   /* Role gating is UX only; the server enforces RBAC on every route. */
+   body:not([data-role="admin"]) .admin-only { display: none !important; }
+   .import-row { border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-top: 8px; }
+   .import-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+   .import-detail { font-size: 12px; color: #999; margin-top: 4px; }
+   .import-actions { margin-top: 8px; display: flex; gap: 6px; }
+   .import-badge { font-size: 11px; padding: 2px 7px; border-radius: 10px; background: var(--panel-bg); border: 1px solid var(--border); }
+   .import-completed { color: #3fb950; }
+   .import-failed { color: #ff6b6b; }
  """
 
 __all__ = ["UI_CSS"]

@@ -40,8 +40,12 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Literal
 
 from .core import *  # noqa: F401,F403
+from .obslog import *  # noqa: F401,F403
 from .config import *  # noqa: F401,F403
 from .database import *  # noqa: F401,F403
+from .auth import *  # noqa: F401,F403
+from .cluster import *  # noqa: F401,F403
+from .claude_import import *  # noqa: F401,F403
 from .ui import *  # noqa: F401,F403
 from .tools import *  # noqa: F401,F403
 from .llm import *  # noqa: F401,F403
@@ -106,9 +110,10 @@ def selftest() -> int:
     # has no modules to import, and that is fine.
     _pkg_dir = Path(__file__).resolve().parent
     _expected = set() if not __package__ else {
-        "core", "database", "sysutil", "ui", "config", "model_server", "training",
-        "websearch", "calculator", "tools", "llm", "model_client", "textutil",
-        "agent", "tasks", "api", "diagnostics", "selftest", "cli",
+        "core", "obslog", "database", "sysutil", "ui", "config", "model_server",
+        "training", "websearch", "calculator", "tools", "llm", "model_client",
+        "textutil", "agent", "tasks", "auth", "cluster", "claude_import", "api",
+        "diagnostics", "selftest", "cli",
     }
     _found = {p.stem for p in _pkg_dir.glob("*.py")} - {"__init__", "__main__"}
     if _missing := sorted(_expected - _found):
@@ -1124,6 +1129,306 @@ def selftest() -> int:
         if safeguard not in Config.MUTABLE:
             failures.append(f"safeguard {safeguard} is not live-editable")
 
+    # ===================================================================== #
+    # Search engine constraint: DuckDuckGo Lite, and ONLY DuckDuckGo Lite.
+    # ===================================================================== #
+    if SearchBackend.PROVIDER != "duckduckgo_lite":
+        failures.append(f"search provider is {SearchBackend.PROVIDER!r}, not duckduckgo_lite")
+    if tuple(SearchBackend.ENDPOINTS) != ("https://lite.duckduckgo.com/lite/",):
+        failures.append(f"search endpoints are not lite-only: {SearchBackend.ENDPOINTS}")
+    for _ep in SearchBackend.ENDPOINTS:
+        if "lite.duckduckgo.com" not in _ep:
+            failures.append(f"search endpoint is not DuckDuckGo Lite: {_ep}")
+    # The websearch module must not name any other provider anywhere. Only
+    # checkable in the split package; the single-file bundle has no such file.
+    _ws_file = Path(__file__).resolve().parent / "websearch.py"
+    if __package__ and _ws_file.exists():
+        _ws_src = _ws_file.read_text(encoding="utf-8")
+        for _banned in ("google.com/search", "bing.com", "brave", "tavily", "searxng",
+                        "html.duckduckgo.com"):
+            if _banned in _ws_src:
+                failures.append(f"websearch.py still references a non-Lite provider: {_banned}")
+    if Config().search_backend != "duckduckgo_lite":
+        failures.append("default search_backend is not duckduckgo_lite")
+    for _other in ("google", "bing", "brave", "tavily", "searxng", "kagi"):
+        if Config(search_backend=_other).search_backend != "duckduckgo_lite":
+            failures.append(f"Config accepted a non-Lite backend: {_other}")
+        if _normalize_search_backend(_other) != "duckduckgo_lite":
+            failures.append(f"_normalize_search_backend accepted {_other}")
+    for _alias in ("ddg", "duckduckgo", "lite", "ddg-lite", ""):
+        if _normalize_search_backend(_alias) != "duckduckgo_lite":
+            failures.append(f"_normalize_search_backend rejected the alias {_alias!r}")
+    if "search_backend" in Config.MUTABLE:
+        failures.append("search_backend must not be runtime-mutable (would allow provider swap)")
+    _c = Config()
+    _c.apply({"search_backend": "google"})
+    if _c.search_backend != "duckduckgo_lite":
+        failures.append("apply() let search_backend change away from DuckDuckGo Lite")
+    # The lite parser must unwrap a DDG redirect link and skip DDG's own nav.
+    _lite_html = ('<a rel="nofollow" class="result-link" '
+                  'href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage&rut=x">Example</a>'
+                  '<td class="result-snippet">A snippet.</td>'
+                  '<a href="//duckduckgo.com/settings">Settings</a>')
+    _res = SearchBackend._parse_lite(_lite_html, 5)
+    if not _res or _res[0].url != "https://example.com/page":
+        failures.append(f"DDG lite parser did not unwrap the redirect link: {_res}")
+    if any("duckduckgo.com" in r.url for r in _res):
+        failures.append("DDG lite parser returned a duckduckgo.com nav link")
+
+    # ===================================================================== #
+    # Authentication: hashing, sessions, bootstrap, OIDC role mapping.
+    # ===================================================================== #
+    _h1 = hash_password("hunter2")
+    _h2 = hash_password("hunter2")
+    if _h1 == _h2:
+        failures.append("password hashes are not salted (identical for same input)")
+    if not _h1.startswith("scrypt$"):
+        failures.append("password hash is not scrypt")
+    if not verify_password("hunter2", _h1):
+        failures.append("verify_password rejected the correct password")
+    if verify_password("wrong", _h1) or verify_password("hunter2", None):
+        failures.append("verify_password accepted a wrong/empty credential")
+    with tempfile.TemporaryDirectory() as _atmp:
+        _adb = Database(Path(_atmp) / "auth.db")
+        _acfg = Config(auth_enabled=True, admin_username="root", admin_password="rootpw123",
+                       allow_test_user=True, test_username="t", test_password="tpw12345")
+        _auth = Auth(_acfg, _adb)
+        _auth.bootstrap()
+        if _adb.count_users(role="admin") != 1:
+            failures.append("bootstrap did not create exactly one admin")
+        if _auth.authenticate_local("root", "rootpw123") is None:
+            failures.append("admin cannot authenticate with the bootstrapped password")
+        if _auth.authenticate_local("root", "nope") is not None:
+            failures.append("admin authenticated with the wrong password")
+        _tu = _adb.get_user_by_username("t")
+        if not _tu or _tu["role"] != "user":
+            failures.append("test user was not created as a non-admin")
+        _admin = _adb.get_user_by_username("root")
+        _tok = _auth.create_session(_admin)
+        if not _auth.resolve_token(_tok) or _auth.resolve_token(_tok)["id"] != _admin["id"]:
+            failures.append("session token did not resolve to its user")
+        _auth.logout(_tok)
+        if _auth.resolve_token(_tok) is not None:
+            failures.append("session survived logout")
+        if _auth.resolve_token("bogus-token") is not None:
+            failures.append("a bogus token resolved to a user")
+        # bootstrap must never reset an existing admin's password.
+        _auth.bootstrap()
+        if _auth.authenticate_local("root", "rootpw123") is None:
+            failures.append("re-running bootstrap reset the admin password")
+        # Auth disabled -> synthetic local admin.
+        _off = Auth(Config(auth_enabled=False), _adb)
+        if _off.user_for_request(None) is None or _off.user_for_request(None)["role"] != "admin":
+            failures.append("auth-disabled did not yield a synthetic local admin")
+        # OIDC role mapping by email and by app role.
+        _ocfg = Config(oidc_admin_emails="boss@corp.com", oidc_admin_roles="Admins")
+        _oauth = Auth(_ocfg, _adb)
+        if _oauth.role_for_oidc({"email": "boss@corp.com"}) != "admin":
+            failures.append("OIDC admin-by-email mapping failed")
+        if _oauth.role_for_oidc({"roles": ["Admins"]}) != "admin":
+            failures.append("OIDC admin-by-role mapping failed")
+        if _oauth.role_for_oidc({"email": "nobody@corp.com"}) != "user":
+            failures.append("OIDC default role should be user")
+
+    # RBAC dependency: require_admin blocks a non-admin, allows an admin.
+    class _FakeReq:
+        def __init__(self, user):
+            self._user = user
+            self.cookies = {}
+            self.headers = {}
+            self.client = type("C", (), {"host": "127.0.0.1"})()
+            self.state = type("S", (), {})()
+
+    with tempfile.TemporaryDirectory() as _rtmp:
+        _rdb = Database(Path(_rtmp) / "rbac.db")
+        _rauth = Auth(Config(auth_enabled=True), _rdb)
+        _admin_u = {"id": "a1", "username": "a", "role": "admin"}
+        _user_u = {"id": "u1", "username": "u", "role": "user"}
+        # Resolve the acting user straight from the fake request's fixed user.
+        def _fixed_user(req):
+            return req._user
+
+        def _no_user(req):
+            return None
+
+        _orig = _rauth.user_for_request
+        _rauth.user_for_request = _fixed_user  # type: ignore
+        import asyncio as _aio
+        try:
+            _ok = _aio.run(_rauth.require_admin(_FakeReq(_admin_u)))
+            if _ok["role"] != "admin":
+                failures.append("require_admin rejected an admin")
+            _denied = False
+            try:
+                _aio.run(_rauth.require_admin(_FakeReq(_user_u)))
+            except Exception as _exc:
+                _denied = getattr(_exc, "status_code", None) == 403
+            if not _denied:
+                failures.append("require_admin did not 403 a non-admin")
+            _unauth = False
+            _rauth.user_for_request = _no_user  # type: ignore
+            try:
+                _aio.run(_rauth.require_user(_FakeReq(None)))
+            except Exception as _exc:
+                _unauth = getattr(_exc, "status_code", None) == 401
+            if not _unauth:
+                failures.append("require_user did not 401 an anonymous request")
+        finally:
+            _rauth.user_for_request = _orig
+
+    # ===================================================================== #
+    # Multi-user data isolation at the database layer.
+    # ===================================================================== #
+    with tempfile.TemporaryDirectory() as _itmp:
+        _idb = Database(Path(_itmp) / "iso.db")
+        _idb.add_message("cA", "user", "alice private", user_id="alice")
+        _idb.add_message("cB", "user", "bob private", user_id="bob")
+        if [c["conversation_id"] for c in _idb.list_conversations(user_id="alice")] != ["cA"]:
+            failures.append("conversation list is not user-scoped")
+        if _idb.get_messages("cA", user_id="bob"):
+            failures.append("a user could read another user's conversation by id")
+        if _idb.can_access_conversation("cA", "bob"):
+            failures.append("can_access_conversation allowed a cross-user read")
+        if not _idb.can_access_conversation("cA", "alice"):
+            failures.append("can_access_conversation denied the owner")
+        if not _idb.can_access_conversation("brand-new", "bob"):
+            failures.append("a new conversation should be claimable by any user")
+        _idb.remember("k", "alice-val", user_id="alice")
+        _idb.remember("k", "bob-val", user_id="bob")
+        if {m["value"] for m in _idb.recall("k", user_id="alice")} != {"alice-val"}:
+            failures.append("per-user memory leaked across users")
+        if getattr(_idb, "fts_enabled", False):
+            _idb.index_document("a.md", "alpha zulu", user_id="alice")
+            _idb.index_document("s.md", "shared zulu", user_id=SHARED_OWNER)
+            _bob_hits = {h["path"] for h in _idb.search_documents("zulu", user_id="bob")}
+            if _bob_hits != {"s.md"}:
+                failures.append(f"knowledge base not user-scoped (bob saw {_bob_hits})")
+            _alice_hits = {h["path"] for h in _idb.search_documents("zulu", user_id="alice")}
+            if _alice_hits != {"a.md", "s.md"}:
+                failures.append(f"owner+shared retrieval wrong (alice saw {_alice_hits})")
+
+    # ===================================================================== #
+    # Structured logging: redaction (message + fields + objects), levels.
+    # ===================================================================== #
+    _red = redact_text("Authorization: Bearer sk-abcdef1234567890abcd key api_key=SECRETVALUE123456")
+    if "sk-abcdef" in _red or "SECRETVALUE" in _red or "Bearer sk" in _red:
+        failures.append(f"redact_text leaked a secret: {_red}")
+    _robj = redact_obj({"password": "hunter2", "note": "token=abcdefghijklmnop12345", "n": 3})
+    if _robj.get("password") == "hunter2" or "abcdefghijklmnop" in str(_robj.get("note")):
+        failures.append(f"redact_obj leaked a secret: {_robj}")
+    if _robj.get("n") != 3:
+        failures.append("redact_obj mangled a non-secret value")
+    _pub = Config(oidc_client_secret="topsecret", node_token="ntok").public()
+    if _pub.get("oidc_client_secret") == "topsecret" or _pub.get("node_token") == "ntok":
+        failures.append("Config.public() leaked a secret field")
+    if _pub.get("oidc_client_secret") != "***set***":
+        failures.append("Config.public() did not mark a set secret")
+    configure_logging(Config(log_chat_content="disabled"), force=True)
+    if content_for_log("hello") is not None:
+        failures.append("content logging disabled still returned content")
+    configure_logging(Config(log_chat_content="metadata"), force=True)
+    _meta = content_for_log("hello world")
+    if not isinstance(_meta, dict) or "chars" not in _meta or "hello" in str(_meta):
+        failures.append("metadata content logging returned the raw text")
+    configure_logging(Config(log_chat_content="full"), force=True)
+    if content_for_log("password=hunter2 hi") is None or "hunter2" in content_for_log("password=hunter2 hi"):
+        failures.append("full content logging did not redact")
+    configure_logging(Config(), force=True)  # restore defaults
+    _cid = set_correlation_id(None)
+    if not _cid or get_correlation_id() != _cid:
+        failures.append("correlation id did not round-trip")
+    set_acting_user("u9")
+    if get_acting_user() != "u9":
+        failures.append("acting-user contextvar did not round-trip")
+    set_acting_user(None)
+
+    # ===================================================================== #
+    # Cluster routing: node selection, overload/failover, large-model, dedup.
+    # ===================================================================== #
+    _rcfg = Config(studio_node_url="http://studio.local:8080", route_max_active_per_node=2)
+    _reg = NodeRegistry(_rcfg)
+    if not _reg.multi_node or len(_reg.nodes) != 2:
+        failures.append("cluster did not build a two-node registry from STUDIO_NODE_URL")
+    _crouter = ClusterRouter(_rcfg, _reg)
+    _prim = _reg.local_node()
+    _sec = next(n for n in _reg.nodes if not n.is_local)
+    _reg.update(_prim.name, state=HEALTHY)
+    _reg.update(_sec.name, state=HEALTHY)
+    if _crouter.select(_crouter.classify(model="Qwen2.5-Coder-7B")).primary_choice.name != _prim.name:
+        failures.append("router did not prefer a healthy primary")
+    _reg.update(_prim.name, active=2)  # overloaded
+    if _crouter.select(_crouter.classify(model="Qwen2.5-Coder-7B")).primary_choice.name != _sec.name:
+        failures.append("router did not offload an overloaded primary to the secondary")
+    _reg.update(_prim.name, active=0, state=UNAVAILABLE)
+    if _crouter.select(_crouter.classify(model="x")).primary_choice.name != _sec.name:
+        failures.append("router did not fail over an unavailable primary")
+    _reg.update(_prim.name, state=HEALTHY)
+    _big = _crouter.select(_crouter.classify(model="Qwen2.5-Coder-32B-Instruct"))
+    if _big.primary_choice.name != _sec.name or [n.name for n in _big.candidates] != [_sec.name]:
+        failures.append("large model was not pinned to the high-memory secondary")
+    _reg.update(_sec.name, state=UNAVAILABLE)
+    if _crouter.select(_crouter.classify(model="Qwen2.5-Coder-32B")).primary_choice is None:
+        failures.append("router gave no best-effort node when the secondary was down")
+    # Single-node: exactly one candidate, and it is local.
+    _sreg = NodeRegistry(Config())
+    _srouter = ClusterRouter(Config(), _sreg)
+    _sd = _srouter.select(_srouter.classify())
+    if _sreg.multi_node or len(_sd.candidates) != 1 or not _sd.candidates[0].is_local:
+        failures.append("single-node routing is not a local no-op")
+    # Idempotent claim.
+    if not _crouter.claim("task-x") or _crouter.claim("task-x"):
+        failures.append("router.claim did not detect a duplicate task")
+    _crouter.release("task-x")
+    if not _crouter.claim("task-x"):
+        failures.append("router.release did not free a task id")
+
+    # ===================================================================== #
+    # Claude history import: zip-slip blocked, real export parses, dedup.
+    # ===================================================================== #
+    import io as _io
+    import zipfile as _zip
+    with tempfile.TemporaryDirectory() as _imtmp:
+        _imdb = Database(Path(_imtmp) / "imp.db")
+        _mgr = ImportManager(Config(), _imdb)
+        # Point the staging dir at the temp tree so the test leaves no litter.
+        _stage_base = Path(_imtmp)
+
+        def _stage(iid):
+            return _stage_base / iid
+
+        _mgr._staging = _stage  # type: ignore
+        # zip-slip must be refused.
+        _evil = _io.BytesIO()
+        with _zip.ZipFile(_evil, "w") as _z:
+            _z.writestr("../../evil.txt", "pwned")
+        _eid = _mgr.stage_upload("alice", "evil.zip", _evil.getvalue())
+        _mgr.process(_eid, "alice")
+        if (_imdb.get_import(_eid) or {}).get("status") != "failed":
+            failures.append("zip-slip archive was not rejected")
+        # A real Claude export imports conversations + knowledge, isolated per user.
+        _conv = [{"uuid": "u1", "name": "Rust", "chat_messages": [
+            {"sender": "human", "text": "read a file in rust"},
+            {"sender": "assistant", "text": "std::fs::read_to_string"}]}]
+        _good = _io.BytesIO()
+        with _zip.ZipFile(_good, "w") as _z:
+            _z.writestr("conversations.json", json.dumps(_conv))
+            _z.writestr("projects.json", json.dumps(
+                [{"name": "P", "prompt_template": "Be terse."}]))
+        _gid = _mgr.stage_upload("alice", "export.zip", _good.getvalue())
+        _counts = _mgr.process(_gid, "alice")
+        if _counts["conversations"] != 1 or _counts["messages"] != 2:
+            failures.append(f"import did not store the conversation: {_counts}")
+        if _counts["skills"] < 1:
+            failures.append("import did not save the project instruction as a skill")
+        if not _imdb.get_messages("claude-u1", user_id="alice"):
+            failures.append("imported conversation is not owned by the importer")
+        if _imdb.list_conversations(user_id="bob"):
+            failures.append("another user can see an imported conversation")
+        # Re-import is de-duplicated.
+        _c2 = _mgr.process(_mgr.stage_upload("alice", "export.zip", _good.getvalue()), "alice")
+        if _c2["duplicates"] < 1 or _c2["conversations"] != 0:
+            failures.append(f"re-import was not de-duplicated: {_c2}")
+
     if failures:
         for failure in failures:
             print(f"FAIL  {failure}")
@@ -1137,6 +1442,12 @@ def selftest() -> int:
     print("PASS  model swapping keeps mismatched adapters out of the server")
     print("PASS  reasoning stripping, fast path, prefix reuse, token accounting")
     print("PASS  context trimming and runtime config guardrails")
+    print("PASS  search engine locked to DuckDuckGo Lite only")
+    print("PASS  auth: password hashing, sessions, bootstrap, OIDC roles, RBAC deps")
+    print("PASS  multi-user data isolation (conversations, memory, knowledge base)")
+    print("PASS  structured logging: secret redaction and content-log levels")
+    print("PASS  cluster routing: selection, overload/failover, large-model, dedup")
+    print("PASS  Claude import: zip-slip blocked, export parsed, de-duplicated")
     return 0
 
 

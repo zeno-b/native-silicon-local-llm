@@ -126,6 +126,9 @@ class TaskManager:
         self.model_manager = model_manager
         self.retrain_manager = retrain_manager
         self.client = client
+        # Cluster router, set by create_app so per-run model clients route and
+        # fail over across nodes exactly like interactive chat. None = single node.
+        self.cluster = getattr(client, "cluster", None)
         self.active: dict[str, TaskRun] = {}
         self.by_task: dict[str, TaskRun] = {}
         self.recent: dict[str, TaskRun] = {}
@@ -285,7 +288,8 @@ class TaskManager:
 
                 task_config = self._task_config(task)
                 registry = ToolRegistry(task_config, self.db)
-                agent = Agent(task_config, registry, ModelClient(task_config))
+                agent = Agent(task_config, registry,
+                              ModelClient(task_config, cluster=self.cluster))
 
                 history: list[dict] = []
                 if task.get("use_history"):

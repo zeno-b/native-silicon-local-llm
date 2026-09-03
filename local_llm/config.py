@@ -41,6 +41,32 @@ from .core import *  # noqa: F401,F403
 from .sysutil import *  # noqa: F401,F403
 
 
+# The search provider is locked to DuckDuckGo Lite (see websearch.SearchBackend).
+# These are the only spellings accepted for the SEARCH_BACKEND env var / CLI flag;
+# every one of them resolves to the same single provider. Anything else is a
+# request for a different engine and is refused.
+_DDG_LITE_ALIASES = {
+    "duckduckgo_lite", "duckduckgo-lite", "duckduckgo", "ddg", "ddg-lite",
+    "ddg_lite", "ddglite", "lite", "",
+}
+
+
+def _normalize_search_backend(value: str | None) -> str:
+    """Force the search provider to DuckDuckGo Lite.
+
+    Historical aliases (ddg, duckduckgo, lite, ...) are accepted silently; a
+    value that names any other engine (google, bing, brave, tavily, searxng, ...)
+    is warned about once and still normalised to duckduckgo_lite. This is the
+    config-layer enforcement of the "DuckDuckGo Lite only" constraint: no other
+    provider can be selected here, so nothing downstream ever has to choose one.
+    """
+    name = str(value or "").strip().lower()
+    if name and name not in _DDG_LITE_ALIASES:
+        log(f"Search provider is locked to DuckDuckGo Lite; ignoring requested "
+            f"backend {value!r}.", logging.WARNING)
+    return "duckduckgo_lite"
+
+
 @dataclass
 class Config:
     model: str = DEFAULT_MODEL
@@ -253,7 +279,11 @@ class Config:
     prompt_cache_dir: str = field(default_factory=lambda: os.environ.get("PROMPT_CACHE_DIR", ""))
 
     # Tools
-    search_backend: str = field(default_factory=lambda: os.environ.get("SEARCH_BACKEND", "ddg"))
+    # Search provider is LOCKED to DuckDuckGo Lite. SEARCH_BACKEND is honoured
+    # only insofar as it names a DuckDuckGo-Lite alias; any request for another
+    # engine is ignored (with a warning) and normalised back to duckduckgo_lite.
+    search_backend: str = field(default_factory=lambda: _normalize_search_backend(
+        os.environ.get("SEARCH_BACKEND", "duckduckgo_lite")))
     search_results: int = field(default_factory=lambda: int(os.environ.get("SEARCH_RESULTS", "5")))
     tool_timeout: int = field(default_factory=lambda: int(os.environ.get("TOOL_TIMEOUT", "30")))
     # Two different caps, and the difference matters.
@@ -274,11 +304,111 @@ class Config:
     summarise_tool_results: bool = field(default_factory=lambda: os.environ.get("SUMMARISE_TOOL_RESULTS", "1") == "1")
     summarise_over_chars: int = field(default_factory=lambda: int(os.environ.get("SUMMARISE_OVER_CHARS", "2500")))
 
+    # ----------------------------------------------------------------- #
+    # Structured logging (see obslog.py). All env-overridable.
+    # ----------------------------------------------------------------- #
+    log_level: str = field(default_factory=lambda: os.environ.get("LOG_LEVEL", "INFO"))
+    # json for aggregation (Loki/ELK/Datadog), text for local reading.
+    log_format: str = field(default_factory=lambda: os.environ.get("LOG_FORMAT", "json"))
+    # Override the log directory; empty uses ./logs under the project root.
+    log_dir: str = field(default_factory=lambda: os.environ.get("LOG_DIR", "").strip())
+    # How much chat content is written: disabled | metadata (length+fingerprint,
+    # never the text) | full (redacted, truncated). Production default: metadata.
+    log_chat_content: str = field(default_factory=lambda: os.environ.get("LOG_CHAT_CONTENT", "metadata"))
+    log_max_bytes: int = field(default_factory=lambda: int(os.environ.get("LOG_MAX_BYTES", str(10 * 1024 * 1024))))
+    log_backup_count: int = field(default_factory=lambda: int(os.environ.get("LOG_BACKUP_COUNT", "10")))
+    log_retention_days: int = field(default_factory=lambda: int(os.environ.get("LOG_RETENTION_DAYS", "14")))
+
+    # ----------------------------------------------------------------- #
+    # Authentication and multi-user (see auth.py). OFF by default so a
+    # single-user local install behaves exactly as before (a synthetic
+    # 'local' admin owns everything). Turn on with AUTH_ENABLED=1.
+    # ----------------------------------------------------------------- #
+    auth_enabled: bool = field(default_factory=lambda: os.environ.get("AUTH_ENABLED", "0") == "1")
+    auth_session_ttl_hours: int = field(default_factory=lambda: int(os.environ.get("AUTH_SESSION_TTL_HOURS", "168")))
+    auth_cookie_name: str = field(default_factory=lambda: os.environ.get("AUTH_COOKIE_NAME", "llm_session"))
+    # Set 1 when served over HTTPS (behind a reverse proxy) so the cookie is
+    # marked Secure. Leave 0 for plain-HTTP local dev or the cookie won't be set.
+    auth_cookie_secure: bool = field(default_factory=lambda: os.environ.get("AUTH_COOKIE_SECURE", "0") == "1")
+    # First-run admin bootstrap. The password is used ONCE to create the admin
+    # then must not persist; it is never stored in the DB in plaintext and is
+    # redacted from any config dump. If unset and no admin exists, the app prints
+    # a one-time generated password to the log at startup.
+    admin_username: str = field(default_factory=lambda: os.environ.get("AUTH_ADMIN_USERNAME", "admin").strip())
+    admin_password: str = field(default_factory=lambda: os.environ.get("AUTH_ADMIN_PASSWORD", ""))
+    # A convenience non-admin account for dev/testing. NOT a backdoor: it exists
+    # only when explicitly enabled and with an explicit password, and the README
+    # documents removing it for production.
+    allow_test_user: bool = field(default_factory=lambda: os.environ.get("AUTH_ALLOW_TEST_USER", "0") == "1")
+    test_username: str = field(default_factory=lambda: os.environ.get("AUTH_TEST_USERNAME", "test").strip())
+    test_password: str = field(default_factory=lambda: os.environ.get("AUTH_TEST_PASSWORD", ""))
+
+    # ----------------------------------------------------------------- #
+    # Microsoft Entra ID / OpenID Connect (authorization-code flow).
+    # ----------------------------------------------------------------- #
+    oidc_enabled: bool = field(default_factory=lambda: os.environ.get("OIDC_ENABLED", "0") == "1")
+    oidc_tenant_id: str = field(default_factory=lambda: os.environ.get("OIDC_TENANT_ID", "").strip())
+    oidc_client_id: str = field(default_factory=lambda: os.environ.get("OIDC_CLIENT_ID", "").strip())
+    oidc_client_secret: str = field(default_factory=lambda: os.environ.get("OIDC_CLIENT_SECRET", ""))
+    oidc_redirect_uri: str = field(default_factory=lambda: os.environ.get("OIDC_REDIRECT_URI", "").strip())
+    # Defaults to https://login.microsoftonline.com/{tenant}/v2.0 when empty.
+    oidc_authority: str = field(default_factory=lambda: os.environ.get("OIDC_AUTHORITY", "").strip())
+    oidc_scopes: str = field(default_factory=lambda: os.environ.get("OIDC_SCOPES", "openid profile email").strip())
+    # Role mapping. Any of these that matches an incoming token grants admin.
+    oidc_admin_emails: str = field(default_factory=lambda: os.environ.get("OIDC_ADMIN_EMAILS", "").strip())
+    oidc_admin_groups: str = field(default_factory=lambda: os.environ.get("OIDC_ADMIN_GROUPS", "").strip())
+    oidc_admin_roles: str = field(default_factory=lambda: os.environ.get("OIDC_ADMIN_ROLES", "").strip())
+    oidc_default_role: str = field(default_factory=lambda: os.environ.get("OIDC_DEFAULT_ROLE", "user").strip())
+
+    # ----------------------------------------------------------------- #
+    # Mac Mini (primary) / Mac Studio (secondary) cluster + routing
+    # (see cluster.py). Single-node by default: with no STUDIO_NODE_URL the
+    # router has one node (the local model server) and behaves as before.
+    # ----------------------------------------------------------------- #
+    node_role: str = field(default_factory=lambda: os.environ.get("NODE_ROLE", "primary").strip().lower())
+    node_name: str = field(default_factory=lambda: os.environ.get("NODE_NAME", "").strip())
+    # The Studio's OpenAI-compatible generation base URL, e.g.
+    # http://studio.local:8080 . Empty disables the secondary node entirely.
+    studio_node_url: str = field(default_factory=lambda: os.environ.get("STUDIO_NODE_URL", "").strip())
+    # A secondary advertises where its router/primary is (used for heartbeats).
+    primary_node_url: str = field(default_factory=lambda: os.environ.get("PRIMARY_NODE_URL", "").strip())
+    # Shared secret for inter-node calls (sent as a bearer token). SECRET.
+    node_token: str = field(default_factory=lambda: os.environ.get("NODE_TOKEN", ""))
+    # Configurable routing factors. No arbitrary hard-coded thresholds.
+    route_max_active_per_node: int = field(default_factory=lambda: int(os.environ.get("ROUTE_MAX_ACTIVE", "2")))
+    route_queue_depth: int = field(default_factory=lambda: int(os.environ.get("ROUTE_QUEUE_DEPTH", "4")))
+    route_cpu_pct: float = field(default_factory=lambda: float(os.environ.get("ROUTE_CPU_PCT", "85")))
+    route_mem_pct: float = field(default_factory=lambda: float(os.environ.get("ROUTE_MEM_PCT", "85")))
+    # If the primary's recent latency exceeds this SLA (ms), eligible work spills
+    # to the Studio. 0 disables the SLA factor.
+    route_sla_ms: int = field(default_factory=lambda: int(os.environ.get("ROUTE_SLA_MS", "0")))
+    # Substrings that mark a model as "large" (needs the high-memory Studio).
+    large_model_markers: str = field(default_factory=lambda: os.environ.get(
+        "LARGE_MODEL_MARKERS", "14B,32B,70B,72B").strip())
+    heartbeat_interval: float = field(default_factory=lambda: float(os.environ.get("HEARTBEAT_INTERVAL", "10")))
+    heartbeat_timeout: float = field(default_factory=lambda: float(os.environ.get("HEARTBEAT_TIMEOUT", "30")))
+    # Timeout for a node health probe / heartbeat request.
+    node_probe_timeout: float = field(default_factory=lambda: float(os.environ.get("NODE_PROBE_TIMEOUT", "8")))
+
+    # ----------------------------------------------------------------- #
+    # Claude-history ZIP import limits (see claude_import.py). The upload is
+    # untrusted: these bound the damage a hostile archive can do.
+    # ----------------------------------------------------------------- #
+    import_max_zip_bytes: int = field(default_factory=lambda: int(os.environ.get("IMPORT_MAX_ZIP_BYTES", str(200 * 1024 * 1024))))
+    import_max_files: int = field(default_factory=lambda: int(os.environ.get("IMPORT_MAX_FILES", "20000")))
+    import_max_uncompressed_bytes: int = field(default_factory=lambda: int(os.environ.get("IMPORT_MAX_UNCOMPRESSED_BYTES", str(1024 * 1024 * 1024))))
+    import_max_file_bytes: int = field(default_factory=lambda: int(os.environ.get("IMPORT_MAX_FILE_BYTES", str(50 * 1024 * 1024))))
+
     seed_demo: bool = False
     retrain_now: bool = False
     export_only: bool = False
     list_feedback: bool = False
     export_format: Literal["jsonl", "csv"] = "jsonl"
+
+    # Fields whose value must never be returned by public() or written to a log.
+    SECRET_FIELDS = (
+        "admin_password", "test_password", "oidc_client_secret", "node_token",
+    )
 
     # Settings the web UI is allowed to change at runtime. Anything not listed
     # here needs a process restart and is rejected by /api/config.
@@ -288,7 +418,9 @@ class Config:
         "max_tokens", "temperature", "repetition_penalty",
         "repetition_context_size", "repetition_penalty_enabled", "context_size",
         "history_turns", "agent_enabled", "agent_max_steps",
-        "search_backend", "search_results", "tool_result_chars", "tool_raw_chars", "auto_fetch_results",
+        # search_backend is intentionally NOT mutable: the provider is locked to
+        # DuckDuckGo Lite and cannot be changed from the UI or the API.
+        "search_results", "tool_result_chars", "tool_raw_chars", "auto_fetch_results",
         "disable_thinking", "reasoning_visible", "tool_temperature", "fast_path", "stable_prefix", "knowledge_triage",
         "summarise_tool_results", "summarise_over_chars",
         # Safeguards, all tunable live so a machine can be dialled in without a
@@ -299,9 +431,18 @@ class Config:
         "resilient_retries", "min_max_tokens", "hard_step_cap",
         "show_internals", "retrieval_deadline", "exec_backend", "docker_image",
         "test_command", "auto_iterate_rounds",
+        # Logging: enabling DEBUG/TRACE and disabling content logs at runtime.
+        "log_level", "log_format", "log_chat_content",
+        # Routing factors, tunable live so a two-Mac cluster can be dialled in.
+        # (studio_node_url is NOT here: adding/removing a node is a topology
+        # change that rebuilds the registry, so it needs a restart.)
+        "route_max_active_per_node", "route_queue_depth", "route_cpu_pct",
+        "route_mem_pct", "route_sla_ms", "large_model_markers",
+        "heartbeat_interval", "heartbeat_timeout",
     )
 
-    SEARCH_BACKENDS = ("ddg", "brave", "tavily", "searxng")
+    # The only supported search provider. DuckDuckGo Lite, exclusively.
+    SEARCH_BACKENDS = ("duckduckgo_lite",)
 
     @property
     def system_prompt_with_identity(self) -> str:
@@ -318,6 +459,11 @@ class Config:
 
     def public(self) -> dict:
         data = {k: v for k, v in asdict(self).items()}
+        # Never expose secrets through the API/UI or a config dump: report only
+        # whether each is set. This is what makes GET /api/config safe to serve.
+        for secret in self.SECRET_FIELDS:
+            if secret in data:
+                data[secret] = "***set***" if data.get(secret) else ""
         data["mutable"] = list(self.MUTABLE)
         return data
 
@@ -347,11 +493,6 @@ class Config:
                 # rather than crash the whole settings update.
                 log(f"Ignoring invalid value for {key}: {value!r}", logging.WARNING)
                 continue
-            if key == "search_backend":
-                value = str(value).lower()
-                if value not in self.SEARCH_BACKENDS:
-                    log(f"Ignoring unknown search backend: {value}", logging.WARNING)
-                    continue
             if value != current:
                 setattr(self, key, value)
                 changed.append(key)
@@ -393,6 +534,49 @@ class Config:
         self.search_results = min(10, max(1, self.search_results))
         self.tool_result_chars = min(40000, max(200, self.tool_result_chars))
         self.tool_raw_chars = min(200000, max(self.tool_result_chars, self.tool_raw_chars))
+        # The search provider is immutable: whatever arrived (env, CLI, a stale
+        # constructor value), it is forced back to DuckDuckGo Lite here.
+        self.search_backend = _normalize_search_backend(self.search_backend)
+
+        # --- Logging -------------------------------------------------------- #
+        self.log_level = str(self.log_level or "INFO").strip().upper() or "INFO"
+        if str(self.log_format).strip().lower() not in ("json", "text"):
+            self.log_format = "json"
+        else:
+            self.log_format = str(self.log_format).strip().lower()
+        if str(self.log_chat_content).strip().lower() not in ("disabled", "metadata", "full"):
+            self.log_chat_content = "metadata"
+        else:
+            self.log_chat_content = str(self.log_chat_content).strip().lower()
+        self.log_max_bytes = max(0, self.log_max_bytes)
+        self.log_backup_count = min(1000, max(0, self.log_backup_count))
+        self.log_retention_days = min(3650, max(0, self.log_retention_days))
+
+        # --- Auth ----------------------------------------------------------- #
+        self.auth_session_ttl_hours = min(8760, max(1, self.auth_session_ttl_hours))
+        if str(self.oidc_default_role).strip().lower() not in ("user", "admin"):
+            self.oidc_default_role = "user"
+
+        # --- Cluster / routing ---------------------------------------------- #
+        if str(self.node_role).strip().lower() not in ("primary", "secondary"):
+            self.node_role = "primary"
+        else:
+            self.node_role = str(self.node_role).strip().lower()
+        self.route_max_active_per_node = min(256, max(1, self.route_max_active_per_node))
+        self.route_queue_depth = min(100000, max(0, self.route_queue_depth))
+        self.route_cpu_pct = min(100.0, max(1.0, self.route_cpu_pct))
+        self.route_mem_pct = min(100.0, max(1.0, self.route_mem_pct))
+        self.route_sla_ms = min(3600000, max(0, self.route_sla_ms))
+        self.heartbeat_interval = min(3600.0, max(1.0, self.heartbeat_interval))
+        self.heartbeat_timeout = min(86400.0, max(2.0, self.heartbeat_timeout))
+        self.node_probe_timeout = min(120.0, max(1.0, self.node_probe_timeout))
+
+        # --- Import limits -------------------------------------------------- #
+        self.import_max_zip_bytes = max(1024, self.import_max_zip_bytes)
+        self.import_max_files = min(10_000_000, max(1, self.import_max_files))
+        self.import_max_uncompressed_bytes = max(1024, self.import_max_uncompressed_bytes)
+        self.import_max_file_bytes = max(1024, self.import_max_file_bytes)
+
         for name, old in before.items():
             if getattr(self, name) != old and name not in changed:
                 changed.append(name)
@@ -404,4 +588,6 @@ class Config:
 # helpers (leading underscore) must cross module boundaries too.
 __all__ = [
     'Config',
+    '_DDG_LITE_ALIASES',
+    '_normalize_search_backend',
 ]

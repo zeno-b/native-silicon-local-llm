@@ -183,6 +183,15 @@ UI_BUILD = "2026-08-07.9-glass"
 APP_NAME = os.environ.get("APP_NAME", "Local LLM")
 APP_LOGO = os.environ.get("APP_LOGO", "")
 
+# The owner id assigned to all data created before multi-user existed, and the
+# identity of the synthetic single administrator used when AUTH_ENABLED=0. Every
+# pre-existing row is backfilled to this id by the DB migration, so a single-user
+# install keeps seeing exactly its own data with auth turned off.
+SENTINEL_LOCAL_USER = "local"
+# Owner value for globally-shared knowledge (e.g. admin-indexed project docs)
+# that every user may retrieve from, distinct from a specific user's imports.
+SHARED_OWNER = "shared"
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -414,6 +423,8 @@ __all__ = [
     'REQUIRED_MODULES',
     'REQUIRED_PACKAGES',
     'ROOT',
+    'SENTINEL_LOCAL_USER',
+    'SHARED_OWNER',
     'SFT_DIR',
     'TOOL_PROTOCOL',
     'TOTAL_RAM_GB',

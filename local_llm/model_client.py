@@ -38,23 +38,70 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Literal
 
 from .core import *  # noqa: F401,F403
+from .obslog import *  # noqa: F401,F403
 from .config import *  # noqa: F401,F403
 from .llm import *  # noqa: F401,F403
 
 
 class ModelClient:
-    """Thin async client for the local OpenAI-compatible model server."""
+    """Async client for the OpenAI-compatible model backend.
 
-    def __init__(self, config: Config):
+    When a cluster (ClusterRouter) is attached it becomes node-aware: each
+    generation is routed to the best node (Mac Mini primary / Mac Studio
+    secondary) and fails over to the next candidate on a connection failure,
+    recording every decision. With no cluster, or a single-node cluster, it
+    targets the local mlx server exactly as before.
+    """
+
+    def __init__(self, config: Config, cluster: Any = None):
         self.config = config
+        self.cluster = cluster
+
+    def _local_chat_url(self) -> str:
+        return f"http://127.0.0.1:{self.config.model_port}/v1/chat/completions"
 
     @property
     def url(self) -> str:
-        return f"http://127.0.0.1:{self.config.model_port}/v1/chat/completions"
+        return self._local_chat_url()
 
     @property
     def models_url(self) -> str:
         return f"http://127.0.0.1:{self.config.model_port}/v1/models"
+
+    def _targets(self, kind: str = "chat"):
+        """Ordered list of (node, chat_url, headers, decision) to try.
+
+        A single-node / no-cluster client yields exactly one local target, so the
+        generation path is byte-for-byte the old behaviour.
+        """
+        cluster = self.cluster
+        if cluster is None or not getattr(cluster.registry, "multi_node", False):
+            return [(None, self._local_chat_url(), {}, None)]
+        req = cluster.classify(model=self.config.model, kind=kind)
+        decision = cluster.select(req)
+        targets = []
+        for node in decision.candidates:
+            if node.is_local:
+                targets.append((node, self._local_chat_url(), {}, decision))
+            else:
+                headers = {}
+                if self.config.node_token:
+                    headers["Authorization"] = f"Bearer {self.config.node_token}"
+                url = node.remote_url.rstrip("/") + "/api/node/generate"
+                targets.append((node, url, headers, decision))
+        return targets
+
+    @staticmethod
+    def _is_connection_error(exc: Exception) -> bool:
+        """True for failures where trying another node is the right move."""
+        import httpx
+        if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout,
+                            httpx.RemoteProtocolError, httpx.ReadTimeout,
+                            httpx.PoolTimeout)):
+            return True
+        text = str(exc).lower()
+        return any(s in text for s in ("connection", "refused", "reset",
+                                       "timed out", "unreachable"))
 
     async def wait_until_ready(self, timeout: float = 40.0) -> bool:
         """Wait until the server can actually GENERATE, or until timeout.
@@ -180,21 +227,57 @@ class ModelClient:
         messages: list[dict],
         max_tokens: int | None = None,
         temperature: float | None = None,
+        kind: str = "chat",
+        conversation_id: str | None = None,
     ) -> tuple[str, GenerationStats]:
         import httpx
-        started = time.time()
-        timeout = httpx.Timeout(self.config.stall_timeout, connect=15.0, pool=15.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(self.url, json=self.payload(messages, False, max_tokens, temperature))
-            if resp.status_code != 200:
-                fallback = self.payload(messages, False, max_tokens, temperature)
-                fallback.pop("max_tokens", None)
-                resp = await client.post(self.url, json=fallback)
-            if resp.status_code != 200:
-                raise RuntimeError(f"model server returned {resp.status_code}: {resp.text[:300]}")
-            data = resp.json()
-            text = data["choices"][0]["message"]["content"]
-            return text, self._stats_from_usage(data.get("usage"), messages, text, started, None)
+        import uuid as _uuid
+        targets = self._targets(kind)
+        task_id = _uuid.uuid4().hex[:16]
+        cid = get_correlation_id()
+        last_error: Exception | None = None
+        for attempt, (node, url, headers, decision) in enumerate(targets):
+            started = time.time()
+            if self.cluster is not None and node is not None:
+                self.cluster.begin(node)
+            try:
+                timeout = httpx.Timeout(self.config.stall_timeout, connect=15.0, pool=15.0)
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(url, headers=headers,
+                                             json=self.payload(messages, False, max_tokens, temperature))
+                    if resp.status_code != 200:
+                        fallback = self.payload(messages, False, max_tokens, temperature)
+                        fallback.pop("max_tokens", None)
+                        resp = await client.post(url, headers=headers, json=fallback)
+                    if resp.status_code != 200:
+                        raise RuntimeError(f"model server returned {resp.status_code}: {resp.text[:300]}")
+                    data = resp.json()
+                    text = data["choices"][0]["message"]["content"]
+                    stats = self._stats_from_usage(data.get("usage"), messages, text, started, None)
+                    dur = (time.time() - started) * 1000
+                    if self.cluster is not None and node is not None:
+                        self.cluster.end(node, True, dur)
+                        self.cluster.record(decision, node,
+                                            status=("ok" if attempt == 0 else "failover_ok"),
+                                            attempt=attempt, duration_ms=dur,
+                                            correlation_id=cid, task_id=task_id,
+                                            conversation_id=conversation_id)
+                    return text, stats
+            except Exception as exc:
+                last_error = exc
+                if self.cluster is not None and node is not None:
+                    self.cluster.end(node, False)
+                    self.cluster.record(decision, node, status="failed", attempt=attempt,
+                                        error=self.classify_error(exc), correlation_id=cid,
+                                        task_id=task_id, conversation_id=conversation_id)
+                if (node is not None and attempt + 1 < len(targets)
+                        and self._is_connection_error(exc)):
+                    log_event(get_logger("model"), 30, "model.failover",
+                              from_node=node.name, error=self.classify_error(exc),
+                              correlation_id=cid, task_id=task_id)
+                    continue
+                raise
+        raise last_error or RuntimeError("no model node available")
 
     async def stream(
         self,
@@ -202,49 +285,105 @@ class ModelClient:
         max_tokens: int | None = None,
         temperature: float | None = None,
         stats: GenerationStats | None = None,
+        kind: str = "chat",
+        conversation_id: str | None = None,
     ) -> AsyncGenerator[str, None]:
         """Yield content deltas. When `stats` is passed it is filled in place.
 
         In place rather than returned because this is an async generator and the
-        caller needs the numbers even when it breaks out of the loop early,
-        which the agent does on every completed tool call.
+        caller needs the numbers even when it breaks out of the loop early, which
+        the agent does on every completed tool call. Fails over to another node
+        only before the first token arrives (never mid-stream).
         """
         import httpx
+        import uuid as _uuid
+        targets = self._targets(kind)
+        task_id = _uuid.uuid4().hex[:16]
+        cid = get_correlation_id()
         started = time.time()
         first_token_at: float | None = None
         usage: dict | None = None
         text_len = 0
+        last_error: Exception | None = None
+        active_node = None
+        node_ended = True
+        streaming_started = False
         try:
-            timeout = httpx.Timeout(self.config.stall_timeout, connect=15.0, pool=15.0)
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream(
-                    "POST", self.url, json=self.payload(messages, True, max_tokens, temperature)
-                ) as resp:
-                    if resp.status_code != 200:
-                        body = (await resp.aread()).decode("utf-8", "replace")
-                        raise RuntimeError(f"model server returned {resp.status_code}: {body[:300]}")
-                    async for line in resp.aiter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        chunk = line[6:]
-                        if chunk.strip() == "[DONE]":
-                            return
-                        try:
-                            data = json.loads(chunk)
-                        except Exception:
-                            continue
-                        if data.get("usage"):
-                            usage = data["usage"]
-                        choices = data.get("choices") or []
-                        if not choices:
-                            continue
-                        delta = (choices[0].get("delta") or {}).get("content", "")
-                        if delta:
-                            if first_token_at is None:
-                                first_token_at = time.time()
-                            text_len += len(delta)
-                            yield delta
+            for attempt, (node, url, headers, decision) in enumerate(targets):
+                started = time.time()
+                first_token_at = None
+                usage = None
+                text_len = 0
+                streaming_started = False
+                active_node, node_ended = node, False
+                if self.cluster is not None and node is not None:
+                    self.cluster.begin(node)
+                try:
+                    timeout = httpx.Timeout(self.config.stall_timeout, connect=15.0, pool=15.0)
+                    async with httpx.AsyncClient(timeout=timeout) as client:
+                        async with client.stream(
+                            "POST", url, headers=headers,
+                            json=self.payload(messages, True, max_tokens, temperature)
+                        ) as resp:
+                            if resp.status_code != 200:
+                                body = (await resp.aread()).decode("utf-8", "replace")
+                                raise RuntimeError(f"model server returned {resp.status_code}: {body[:300]}")
+                            async for line in resp.aiter_lines():
+                                if not line.startswith("data: "):
+                                    continue
+                                chunk = line[6:]
+                                if chunk.strip() == "[DONE]":
+                                    break
+                                try:
+                                    data = json.loads(chunk)
+                                except Exception:
+                                    continue
+                                if data.get("usage"):
+                                    usage = data["usage"]
+                                choices = data.get("choices") or []
+                                if not choices:
+                                    continue
+                                delta = (choices[0].get("delta") or {}).get("content", "")
+                                if delta:
+                                    if first_token_at is None:
+                                        first_token_at = time.time()
+                                        streaming_started = True
+                                    text_len += len(delta)
+                                    yield delta
+                    # Completed this node successfully.
+                    if self.cluster is not None and node is not None:
+                        self.cluster.end(node, True, (time.time() - started) * 1000)
+                        node_ended = True
+                        self.cluster.record(decision, node,
+                                            status=("ok" if attempt == 0 else "failover_ok"),
+                                            attempt=attempt, duration_ms=(time.time() - started) * 1000,
+                                            correlation_id=cid, task_id=task_id,
+                                            conversation_id=conversation_id)
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    if self.cluster is not None and node is not None:
+                        self.cluster.end(node, False)
+                        node_ended = True
+                        self.cluster.record(decision, node, status="failed", attempt=attempt,
+                                            error=self.classify_error(exc), correlation_id=cid,
+                                            task_id=task_id, conversation_id=conversation_id)
+                    if (node is not None and not streaming_started
+                            and attempt + 1 < len(targets) and self._is_connection_error(exc)):
+                        log_event(get_logger("model"), 30, "model.failover",
+                                  from_node=node.name, error=self.classify_error(exc),
+                                  correlation_id=cid, task_id=task_id)
+                        continue
+                    raise
+            if last_error:
+                raise last_error
         finally:
+            # Safety net for early consumer close (GeneratorExit): decrement the
+            # active count so a node is never left "busy" after the agent stops
+            # reading, and still fill stats for the caller.
+            if (self.cluster is not None and active_node is not None and not node_ended):
+                self.cluster.end(active_node, streaming_started,
+                                 (time.time() - started) * 1000)
             if stats is not None:
                 measured = self._stats_from_usage(
                     usage, messages, "x" * text_len, started, first_token_at

@@ -1,0 +1,513 @@
+"""Automatic Mac Mini (primary) / Mac Studio (secondary) routing and failover.
+
+This is a real scheduler/router subsystem, not an ``if machine == ...`` switch.
+Users never pick a machine; work is classified, nodes are evaluated on live
+load/health/capability, one is selected with a recorded reason, and execution
+fails over to another node without re-running committed work.
+
+Pieces
+------
+* :class:`Node` — one execution target (the local mlx server, or a remote peer),
+  with capabilities, capacity and live health state.
+* :class:`NodeRegistry` — builds the node set from config: the primary is always
+  the local model server; a secondary (Studio) exists only when ``STUDIO_NODE_URL``
+  is set. With no secondary the registry has one node and routing is a no-op.
+* :class:`ClusterRouter` — classifies a task, scores candidate nodes against
+  configurable factors (active requests, queue depth, CPU/memory, node health,
+  model capability, SLA), selects an ordered candidate list with a human reason,
+  and records every decision to ``routing_events`` for admin observability.
+* :class:`HealthMonitor` — a background heartbeat loop that probes each node and
+  moves it between healthy / degraded / overloaded / draining / unavailable /
+  starting, so a failed Studio never breaks the Mini and eligible Mini work
+  shifts to the Studio when it is overloaded or down.
+
+The router is exercised offline by the self-test with injected node snapshots and
+a fake executor: overloaded-primary, unavailable-primary, large-model,
+unavailable-secondary and recovery all have deterministic outcomes.
+"""
+
+from __future__ import annotations
+
+import os
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+from .core import *  # noqa: F401,F403
+from .obslog import *  # noqa: F401,F403
+from .config import *  # noqa: F401,F403
+
+
+_cluster_log = get_logger("routing")
+
+# Node health states, from best to worst for scheduling.
+HEALTHY = "healthy"
+DEGRADED = "degraded"       # responding but slow / recent failures
+OVERLOADED = "overloaded"   # at/over capacity; avoid unless nothing else
+DRAINING = "draining"       # finishing in-flight work, take no new work
+STARTING = "starting"       # coming up (loading weights)
+UNAVAILABLE = "unavailable"  # not reachable / failing
+
+# Order used when otherwise-equal: lower is preferred.
+_STATE_RANK = {HEALTHY: 0, DEGRADED: 1, OVERLOADED: 2, STARTING: 3,
+               DRAINING: 4, UNAVAILABLE: 5}
+
+
+@dataclass
+class Node:
+    """One routable execution target."""
+    name: str
+    role: str                    # "primary" | "secondary"
+    is_local: bool               # local mlx server vs a remote peer app
+    capabilities: set[str] = field(default_factory=set)
+    remote_url: str = ""         # base URL for a remote node (empty if local)
+    # Live state (guarded by the registry lock).
+    state: str = STARTING
+    active: int = 0              # in-flight generations dispatched here
+    last_latency_ms: float | None = None
+    consecutive_failures: int = 0
+    last_heartbeat: float = 0.0
+    cpu_pct: float | None = None
+    mem_pct: float | None = None
+    model: str | None = None
+    detail: str = ""
+
+    def can_serve(self, requirements: "Requirements") -> bool:
+        if requirements.needs_large_model and "large_model" not in self.capabilities:
+            return False
+        for cap in requirements.required_capabilities:
+            if cap not in self.capabilities:
+                return False
+        return True
+
+    def snapshot(self) -> dict:
+        return {
+            "name": self.name, "role": self.role, "is_local": self.is_local,
+            "state": self.state, "active": self.active,
+            "capabilities": sorted(self.capabilities),
+            "last_latency_ms": self.last_latency_ms,
+            "consecutive_failures": self.consecutive_failures,
+            "cpu_pct": self.cpu_pct, "mem_pct": self.mem_pct,
+            "model": self.model, "detail": self.detail,
+            "last_heartbeat_age_s": (round(time.time() - self.last_heartbeat, 1)
+                                     if self.last_heartbeat else None),
+        }
+
+
+@dataclass
+class Requirements:
+    """What a task needs, derived by classification."""
+    kind: str = "chat"                       # chat | reasoning | code | task
+    needs_large_model: bool = False
+    required_capabilities: tuple[str, ...] = ()
+    requested_model: str | None = None
+    complexity: str = "normal"               # low | normal | high
+
+
+@dataclass
+class RoutingDecision:
+    """The result of a selection: an ordered candidate list plus the why."""
+    candidates: list[Node]
+    reason: str
+    requirements: Requirements
+    snapshot: list[dict]
+
+    @property
+    def primary_choice(self) -> Node | None:
+        return self.candidates[0] if self.candidates else None
+
+
+def sample_local_load() -> tuple[float | None, float | None]:
+    """Best-effort (cpu_pct, mem_pct) for this machine.
+
+    Uses load average (normalised by CPU count) for CPU, and psutil for memory
+    when available. Either may be None; the router simply skips a factor it
+    cannot measure rather than guessing.
+    """
+    cpu_pct = None
+    try:
+        load1 = os.getloadavg()[0]
+        cores = os.cpu_count() or 1
+        cpu_pct = min(100.0, round(load1 / cores * 100.0, 1))
+    except (OSError, AttributeError):
+        pass
+    mem_pct = None
+    try:
+        import psutil  # optional
+        mem_pct = float(psutil.virtual_memory().percent)
+    except Exception:
+        pass
+    return cpu_pct, mem_pct
+
+
+class NodeRegistry:
+    """The set of nodes, built from config, with thread-safe state updates."""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self._lock = threading.RLock()
+        self.nodes: list[Node] = []
+        self._build()
+
+    def _capabilities(self, raw: str, extra: set[str]) -> set[str]:
+        caps = {c.strip() for c in (raw or "").split(",") if c.strip()}
+        return (caps or {"chat", "code", "default"}) | extra
+
+    def _build(self) -> None:
+        cfg = self.config
+        primary = Node(
+            name=(cfg.node_name or "mac-mini") if cfg.node_role == "primary" else "primary",
+            role="primary", is_local=True,
+            capabilities={"chat", "code", "default"},
+            state=STARTING,
+        )
+        self.nodes = [primary]
+        if cfg.studio_node_url:
+            studio = Node(
+                name="mac-studio", role="secondary", is_local=False,
+                remote_url=cfg.studio_node_url.rstrip("/"),
+                # The Studio is a superset: everything the Mini does, plus the
+                # high-memory / large-model / deep-reasoning capabilities.
+                capabilities={"chat", "code", "default", "large_model",
+                              "high_memory", "reasoning"},
+                state=STARTING,
+            )
+            self.nodes.append(studio)
+
+    @property
+    def multi_node(self) -> bool:
+        return len(self.nodes) > 1
+
+    def local_node(self) -> Node:
+        for node in self.nodes:
+            if node.is_local:
+                return node
+        return self.nodes[0]
+
+    def by_name(self, name: str) -> Node | None:
+        for node in self.nodes:
+            if node.name == name:
+                return node
+        return None
+
+    def update(self, name: str, **fields: Any) -> None:
+        with self._lock:
+            node = self.by_name(name)
+            if not node:
+                return
+            for key, value in fields.items():
+                if hasattr(node, key):
+                    setattr(node, key, value)
+
+    def begin(self, node: Node) -> None:
+        with self._lock:
+            node.active += 1
+
+    def end(self, node: Node, ok: bool, latency_ms: float | None = None) -> None:
+        with self._lock:
+            node.active = max(0, node.active - 1)
+            if ok:
+                node.consecutive_failures = 0
+                if latency_ms is not None:
+                    node.last_latency_ms = round(latency_ms, 1)
+                if node.state in (UNAVAILABLE, STARTING, DEGRADED):
+                    node.state = HEALTHY
+            else:
+                node.consecutive_failures += 1
+                if node.consecutive_failures >= 2:
+                    node.state = UNAVAILABLE
+                elif node.state == HEALTHY:
+                    node.state = DEGRADED
+
+    def snapshot(self) -> list[dict]:
+        with self._lock:
+            return [n.snapshot() for n in self.nodes]
+
+
+class ClusterRouter:
+    """Classify a task, pick nodes, record the decision, and fail over."""
+
+    def __init__(self, config: Config, registry: NodeRegistry, db: Any = None):
+        self.config = config
+        self.registry = registry
+        self.db = db
+        # In-flight task ids, so an accidental re-dispatch of the same unit of
+        # work is detected rather than silently duplicated.
+        self._inflight: set[str] = set()
+        self._inflight_lock = threading.Lock()
+
+    # ---- classification --------------------------------------------------- #
+    def classify(self, *, model: str | None = None, kind: str = "chat",
+                 complexity: str = "normal") -> Requirements:
+        model = model or self.config.model
+        markers = [m.strip().lower() for m in
+                   (self.config.large_model_markers or "").split(",") if m.strip()]
+        needs_large = any(m in (model or "").lower() for m in markers)
+        req_caps: tuple[str, ...] = ()
+        if kind == "reasoning" or complexity == "high":
+            # Deep reasoning is eligible for (not required on) the Studio; it is
+            # not a hard capability requirement unless the model is large.
+            req_caps = ()
+        return Requirements(kind=kind, needs_large_model=needs_large,
+                            required_capabilities=req_caps,
+                            requested_model=model, complexity=complexity)
+
+    # ---- capacity / health helpers --------------------------------------- #
+    def _is_overloaded(self, node: Node) -> tuple[bool, str]:
+        cfg = self.config
+        if node.active >= cfg.route_max_active_per_node:
+            return True, f"active {node.active}>={cfg.route_max_active_per_node}"
+        if node.cpu_pct is not None and node.cpu_pct >= cfg.route_cpu_pct:
+            return True, f"cpu {node.cpu_pct}%>={cfg.route_cpu_pct}%"
+        if node.mem_pct is not None and node.mem_pct >= cfg.route_mem_pct:
+            return True, f"mem {node.mem_pct}%>={cfg.route_mem_pct}%"
+        if (cfg.route_sla_ms and node.last_latency_ms is not None
+                and node.last_latency_ms >= cfg.route_sla_ms):
+            return True, f"latency {node.last_latency_ms}ms>=SLA {cfg.route_sla_ms}ms"
+        return False, ""
+
+    def _eligible(self, node: Node, req: Requirements) -> bool:
+        return node.state not in (UNAVAILABLE, DRAINING) and node.can_serve(req)
+
+    # ---- selection -------------------------------------------------------- #
+    def select(self, req: Requirements) -> RoutingDecision:
+        """Return an ordered candidate list (best first) and the reason."""
+        nodes = self.registry.nodes
+        snapshot = self.registry.snapshot()
+
+        # Single-node install: the local node is the only answer.
+        if len(nodes) == 1:
+            only = nodes[0]
+            reason = "single node (no secondary configured)"
+            if not only.can_serve(req):
+                reason = ("single node cannot meet requirement "
+                          f"(needs_large_model={req.needs_large_model}); using it anyway")
+            return RoutingDecision([only], reason, req, snapshot)
+
+        primary = self.registry.local_node()
+        secondary = next((n for n in nodes if not n.is_local), None)
+
+        eligible = [n for n in nodes if self._eligible(n, req)]
+        reasons: list[str] = []
+
+        # Hard capability need (large model): only capable nodes qualify.
+        if req.needs_large_model:
+            capable = [n for n in eligible if "large_model" in n.capabilities]
+            if capable:
+                capable.sort(key=lambda n: (_STATE_RANK.get(n.state, 9), n.active))
+                order = capable + [n for n in eligible if n not in capable]
+                reasons.append(f"large model {req.requested_model!r} requires "
+                               "high-memory node")
+                return RoutingDecision(order, "; ".join(reasons), req, snapshot)
+            # No capable node up: fall through to best-effort below.
+            reasons.append("no high-memory node available for large model; best effort")
+
+        # Ordinary case: prefer the primary unless it is unfit.
+        order: list[Node] = []
+        if primary in eligible:
+            over, why = self._is_overloaded(primary)
+            if not over:
+                order = [primary] + [n for n in eligible if n is not primary]
+                reasons.append("primary healthy and within capacity")
+                return RoutingDecision(order, "; ".join(reasons), req, snapshot)
+            reasons.append(f"primary overloaded ({why})")
+            # Offload to the secondary if it can take it.
+            if secondary in eligible:
+                sec_over, _ = self._is_overloaded(secondary)
+                if not sec_over:
+                    reasons.append("secondary has capacity -> offload")
+                    return RoutingDecision([secondary, primary],
+                                           "; ".join(reasons), req, snapshot)
+                reasons.append("secondary also loaded; keep on primary")
+                return RoutingDecision([primary, secondary],
+                                       "; ".join(reasons), req, snapshot)
+            reasons.append("secondary unavailable; keep on primary")
+            return RoutingDecision([primary], "; ".join(reasons), req, snapshot)
+
+        # Primary not eligible (down/incapable): use the secondary.
+        if secondary in eligible:
+            reasons.append("primary unavailable -> secondary")
+            return RoutingDecision([secondary], "; ".join(reasons), req, snapshot)
+
+        # Nothing eligible: return the least-bad node so the caller degrades
+        # honestly rather than 500ing with no target.
+        fallback = sorted(nodes, key=lambda n: (_STATE_RANK.get(n.state, 9), n.active))
+        reasons.append("no healthy node; best-effort fallback")
+        return RoutingDecision(fallback, "; ".join(reasons), req, snapshot)
+
+    # ---- observability ---------------------------------------------------- #
+    def record(self, decision: RoutingDecision, node: Node, *, status: str,
+               attempt: int = 0, duration_ms: float | None = None,
+               error: str | None = None, correlation_id: str | None = None,
+               task_id: str | None = None, user_id: str | None = None,
+               conversation_id: str | None = None) -> None:
+        log_event(_cluster_log, 20, "routing.decision",
+                  node=node.name, status=status, attempt=attempt,
+                  kind=decision.requirements.kind,
+                  needs_large_model=decision.requirements.needs_large_model,
+                  requested_model=decision.requirements.requested_model,
+                  reason=decision.reason, duration_ms=duration_ms,
+                  correlation_id=correlation_id, task_id=task_id)
+        if self.db is not None:
+            try:
+                self.db.log_routing_event(
+                    correlation_id=correlation_id, task_id=task_id, user_id=user_id,
+                    conversation_id=conversation_id, kind=decision.requirements.kind,
+                    requested_model=decision.requirements.requested_model,
+                    selected_model=node.model or decision.requirements.requested_model,
+                    selected_node=node.name, reason=decision.reason,
+                    candidates=decision.snapshot, status=status, attempt=attempt,
+                    duration_ms=duration_ms, error=error)
+            except Exception as exc:  # never let telemetry break a request
+                log_event(_cluster_log, 30, "routing.record_failed", error=str(exc))
+
+    # ---- idempotency ------------------------------------------------------ #
+    def claim(self, task_id: str) -> bool:
+        """Register a unit of work. False if it is already in flight (a dup)."""
+        if not task_id:
+            return True
+        with self._inflight_lock:
+            if task_id in self._inflight:
+                return False
+            self._inflight.add(task_id)
+            return True
+
+    def release(self, task_id: str) -> None:
+        if not task_id:
+            return
+        with self._inflight_lock:
+            self._inflight.discard(task_id)
+
+
+class HealthMonitor:
+    """Background heartbeat loop that keeps node states current."""
+
+    def __init__(self, config: Config, registry: NodeRegistry,
+                 local_status: Callable[[], dict] | None = None):
+        self.config = config
+        self.registry = registry
+        # Callable returning {"status": <mlx status>, "model": <id>} for the
+        # local model server (wired to ModelServerManager in create_app).
+        self.local_status = local_status
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="cluster-heartbeat")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=2)
+
+    def _loop(self) -> None:
+        # Probe once promptly, then on the configured interval.
+        while True:
+            try:
+                self.tick()
+            except Exception as exc:  # never let the monitor thread die
+                log_event(_cluster_log, 40, "heartbeat.error", error=str(exc))
+            if self._stop.wait(max(1.0, self.config.heartbeat_interval)):
+                return
+
+    def tick(self) -> None:
+        """One heartbeat pass over every node."""
+        cpu_pct, mem_pct = sample_local_load()
+        for node in list(self.registry.nodes):
+            if node.is_local:
+                self._probe_local(node, cpu_pct, mem_pct)
+            else:
+                self._probe_remote(node)
+
+    def _probe_local(self, node: Node, cpu_pct, mem_pct) -> None:
+        state = HEALTHY
+        detail = ""
+        model = node.model
+        if self.local_status is not None:
+            try:
+                info = self.local_status() or {}
+                status = str(info.get("status", ""))
+                model = info.get("model") or model
+                if status == "ready":
+                    state = HEALTHY
+                elif status in ("loading", "starting", "restarting"):
+                    state = STARTING
+                elif status == "stopped":
+                    state = UNAVAILABLE
+                else:
+                    state = DEGRADED
+                    detail = status
+            except Exception as exc:
+                state, detail = DEGRADED, str(exc)
+        # Capacity pressure downgrades an otherwise-healthy node.
+        if state == HEALTHY:
+            over_cpu = cpu_pct is not None and cpu_pct >= self.config.route_cpu_pct
+            over_mem = mem_pct is not None and mem_pct >= self.config.route_mem_pct
+            over_active = node.active >= self.config.route_max_active_per_node
+            if over_cpu or over_mem or over_active:
+                state = OVERLOADED
+        self.registry.update(node.name, state=state, cpu_pct=cpu_pct,
+                             mem_pct=mem_pct, model=model, detail=detail,
+                             last_heartbeat=time.time())
+
+    def _probe_remote(self, node: Node) -> None:
+        import httpx
+        url = node.remote_url.rstrip("/") + "/api/node/health"
+        headers = {}
+        if self.config.node_token:
+            headers["Authorization"] = f"Bearer {self.config.node_token}"
+        started = time.time()
+        try:
+            with httpx.Client(timeout=self.config.node_probe_timeout) as client:
+                resp = client.get(url, headers=headers)
+            latency = (time.time() - started) * 1000
+            if resp.status_code == 200:
+                info = resp.json()
+                remote_state = str(info.get("state") or info.get("model_status") or "")
+                model = info.get("model")
+                cpu = info.get("cpu_pct")
+                mem = info.get("mem_pct")
+                state = HEALTHY
+                if remote_state in ("loading", "starting", "restarting"):
+                    state = STARTING
+                elif remote_state in ("stopped", "unavailable"):
+                    state = UNAVAILABLE
+                elif remote_state in ("overloaded",):
+                    state = OVERLOADED
+                self.registry.update(node.name, state=state, model=model,
+                                     cpu_pct=cpu, mem_pct=mem,
+                                     last_latency_ms=round(latency, 1),
+                                     consecutive_failures=0,
+                                     last_heartbeat=time.time(), detail="")
+            else:
+                self._mark_unreachable(node, f"health {resp.status_code}")
+        except Exception as exc:
+            self._mark_unreachable(node, str(exc))
+
+    def _mark_unreachable(self, node: Node, detail: str) -> None:
+        failures = node.consecutive_failures + 1
+        state = UNAVAILABLE if failures >= 2 else DEGRADED
+        self.registry.update(node.name, state=state,
+                             consecutive_failures=failures,
+                             last_heartbeat=time.time(), detail=detail[:200])
+        log_event(_cluster_log, 30, "heartbeat.node_unreachable",
+                  node=node.name, detail=detail[:200], state=state)
+
+
+__all__ = [
+    "Node",
+    "NodeRegistry",
+    "Requirements",
+    "RoutingDecision",
+    "ClusterRouter",
+    "HealthMonitor",
+    "sample_local_load",
+    "HEALTHY", "DEGRADED", "OVERLOADED", "DRAINING", "STARTING", "UNAVAILABLE",
+]

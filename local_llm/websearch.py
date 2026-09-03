@@ -1,7 +1,11 @@
 """Web search backend, URL guards, and HTML stripping.
 
-No API keys are required. Search uses DuckDuckGo's public HTML endpoint with
-the lite endpoint as a fallback.
+No API keys are required. Search uses DuckDuckGo Lite EXCLUSIVELY
+(https://lite.duckduckgo.com/lite/). This is a hard project constraint, not a
+default: there is no configuration, environment variable or code path that can
+point web search at Google, Bing, Brave, Tavily, SearXNG or any other engine.
+The single allowed endpoint lives in SearchBackend.ENDPOINT and the invariant is
+covered by the self-test suite.
 
 Split out of the original single-file deploy.py; public names are kept
 compatible with the original module.
@@ -146,22 +150,27 @@ class SearchResult:
 
 
 class SearchBackend:
-    """API-key-free web search.
+    """API-key-free web search, DuckDuckGo Lite ONLY.
 
-    DuckDuckGo's public HTML endpoint is the primary backend. Its lightweight
-    endpoint is used as a fallback when the primary endpoint changes or fails.
-
-    The old Brave/Tavily API-key configuration is intentionally no longer
-    supported.
+    DuckDuckGo Lite is the sole search provider for this project, by design and
+    policy. There is deliberately no switch for Google, Bing, Brave, Tavily,
+    SearXNG or any other engine: `ENDPOINT` below is the only URL this class will
+    ever contact, and it is the single place the constraint is expressed. The
+    self-test asserts that the provider is Lite and that no other host is
+    reachable from here.
     """
 
-    ENDPOINTS = (
-        "https://html.duckduckgo.com/html/",
-        "https://lite.duckduckgo.com/lite/",
-    )
+    PROVIDER = "duckduckgo_lite"
+    ENDPOINT = "https://lite.duckduckgo.com/lite/"
+    # One-element tuple, kept so any caller that iterates endpoints still works
+    # and so "only DuckDuckGo Lite" is verifiable in exactly one location.
+    ENDPOINTS = (ENDPOINT,)
 
     def __init__(self, config: Config):
         self.config = config
+        # A Config must never carry a non-Lite backend; even if a stale value
+        # somehow arrives, this class still only ever contacts ENDPOINT.
+        self.provider = self.PROVIDER
 
     def search(
         self,
@@ -174,7 +183,7 @@ class SearchBackend:
         count = num_results or self.config.search_results
         count = max(1, min(count, 50))
 
-        return self._ddg(query.strip(), count)
+        return self._search_lite(query.strip(), count)
 
     def _client(self):
         import httpx
@@ -185,85 +194,47 @@ class SearchBackend:
             headers={"User-Agent": USER_AGENT},
         )
 
-    def _ddg(self, query: str, count: int) -> list[SearchResult]:
-        last_error = "no response"
-
+    def _search_lite(self, query: str, count: int) -> list[SearchResult]:
+        """POST the query to DuckDuckGo Lite and parse its results table."""
         with self._client() as client:
-            for endpoint in self.ENDPOINTS:
-                try:
-                    response = client.post(
-                        endpoint,
-                        data={
-                            "q": query,
-                            "kl": "wt-wt",
-                        },
-                    )
-                    response.raise_for_status()
-                except Exception as exc:
-                    last_error = str(exc)
-                    continue
+            try:
+                response = client.post(
+                    self.ENDPOINT,
+                    data={"q": query, "kl": "wt-wt"},
+                )
+                response.raise_for_status()
+            except Exception as exc:
+                raise RuntimeError(f"DuckDuckGo Lite search failed: {exc}") from exc
 
-                results = self._parse_ddg(response.text, count)
-
-                if results:
-                    return results
-
-                last_error = "no parsable results"
-
-        raise RuntimeError(
-            f"DuckDuckGo search failed: {last_error}"
-        )
+            return self._parse_lite(response.text, count)
 
     @staticmethod
-    def _parse_ddg(page: str, count: int) -> list[SearchResult]:
-        """Parse both DDG HTML and lite result formats."""
+    def _parse_lite(page: str, count: int) -> list[SearchResult]:
+        """Parse the DuckDuckGo Lite results page.
+
+        Lite links are DDG redirect anchors (``//duckduckgo.com/l/?uddg=...``)
+        or, occasionally, direct URLs. The earlier ``href="http...`` regex missed
+        the protocol-relative redirect form entirely, which would have returned
+        no results once Lite is the only endpoint. This unwraps every anchor and
+        keeps the ones that resolve to a real external page, pairing each with the
+        snippet cell that follows it.
+        """
         results: list[SearchResult] = []
+        seen: set[str] = set()
 
-        # Standard DDG HTML endpoint.
-        pattern = re.compile(
-            r"""
-            <a
-                [^>]*?
-                class=["'][^"']*\bresult__a\b[^"']*["']
-                [^>]*?
-                href=["']([^"']+)["']
-                [^>]*?
-            >
-                (.*?)
-            </a>
-            """,
-            re.IGNORECASE | re.DOTALL | re.VERBOSE,
-        )
-
-        for match in pattern.finditer(page):
-            url = _ddg_unwrap(html.unescape(match.group(1)))
-            title = strip_html(match.group(2))
-
-            if not url or not title:
-                continue
-
-            snippet = SearchBackend._find_ddg_snippet(
+        # Snippet cells, in document order, to pair with the result links.
+        snippets = [
+            strip_html(m)
+            for m in re.findall(
+                r'''class=["'][^"']*\bresult-snippet\b[^"']*["'][^>]*>(.*?)</td''',
                 page,
-                match.end(),
+                re.IGNORECASE | re.DOTALL,
             )
+        ]
+        snippet_idx = 0
 
-            results.append(
-                SearchResult(
-                    title=title,
-                    url=url,
-                    snippet=snippet,
-                )
-            )
-
-            if len(results) >= count:
-                return results
-
-        if results:
-            return results
-
-        # DDG lite fallback.
         for match in re.finditer(
-            r'<a[^>]+href=["\'](http[^"\']+)["\'][^>]*>(.*?)</a>',
+            r'<a\b[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
             page,
             re.IGNORECASE | re.DOTALL,
         ):
@@ -272,46 +243,25 @@ class SearchBackend:
 
             if not url or not title:
                 continue
-
-            parsed = urllib.parse.urlparse(url)
-
-            # Avoid returning DDG's own navigation links.
-            if parsed.netloc.endswith("duckduckgo.com"):
+            if not url.lower().startswith(("http://", "https://")):
                 continue
 
-            results.append(
-                SearchResult(
-                    title=title,
-                    url=url,
-                    snippet="",
-                )
-            )
+            parsed = urllib.parse.urlparse(url)
+            # Skip DuckDuckGo's own navigation/help/settings links.
+            if parsed.netloc.endswith("duckduckgo.com"):
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
 
+            snippet = snippets[snippet_idx] if snippet_idx < len(snippets) else ""
+            snippet_idx += 1
+
+            results.append(SearchResult(title=title, url=url, snippet=snippet))
             if len(results) >= count:
                 break
 
         return results
-
-    @staticmethod
-    def _find_ddg_snippet(page: str, start: int) -> str:
-        """Extract the next standard DDG result snippet, if present."""
-        remaining = page[start:]
-
-        match = re.search(
-            r"""
-            class=["'][^"']*\bresult__snippet\b[^"']*["']
-            [^>]*>
-            (.*?)
-            </(?:a|div)
-            """,
-            remaining,
-            re.IGNORECASE | re.DOTALL | re.VERBOSE,
-        )
-
-        if not match:
-            return ""
-
-        return strip_html(match.group(1))
 
 
 # Explicitly preserve the original flat-module exports.

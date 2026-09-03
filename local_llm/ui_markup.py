@@ -24,9 +24,9 @@ UI_BODY = r"""</style>
    <div id="status">Starting...</div>
    <nav class="views">
      <button id="navChat" class="active" onclick="showView('chat')" data-tip-below data-tip="Talk to the model. Ask questions, paste code or documents, run tools." title="Chat view">Chat</button>
-     <button id="navTasks" onclick="showView('tasks')" data-tip-below data-tip="Scheduled or saved jobs the agent runs on demand or on a timer." title="Tasks view">Tasks</button>
+     <button id="navTasks" class="admin-only" onclick="showView('tasks')" data-tip-below data-tip="Scheduled or saved jobs the agent runs on demand or on a timer." title="Tasks view">Tasks</button>
      <button id="navHistory" onclick="showView('history')" data-tip-below data-tip="Browse, search, reopen and manage past conversations." title="History view">History</button>
-     <button id="navModels" onclick="showView('models')" data-tip-below data-tip="Pick or download a model, and attach a fine-tuned adapter." title="Models view">Models</button>
+     <button id="navModels" class="admin-only" onclick="showView('models')" data-tip-below data-tip="Models, knowledge base, training data, imports and system settings." title="Admin view">Models</button>
    </nav>
    <div class="actions">
      <button onclick="newChat()" data-tip-below data-tip="Start a fresh conversation. Clears the current thread from view." title="New chat">New chat</button>
@@ -35,10 +35,26 @@ UI_BODY = r"""</style>
      <button onclick="exportChat()" data-tip-below data-tip="Download this conversation as Markdown." title="Export conversation">Export</button>
      <button onclick="togglePrompts()" data-tip-below data-tip="Save and reuse prompts you type often." title="Prompt library">Prompts</button>
      <button id="themeBtn" onclick="toggleTheme()" data-tip-below data-tip="Switch between the dark and light colour scheme." title="Toggle theme">Light</button>
-     <button onclick="retrain()" data-tip-below data-tip="Fine-tune the model on your thumbs-up/down feedback so far (LoRA)." title="Retrain on feedback">Retrain</button>
-     <button onclick="toggleSettings()" data-tip-below data-tip="Model, tools, generation and memory settings you can change live." title="Open settings">Settings</button>
+     <button class="admin-only" onclick="retrain()" data-tip-below data-tip="Fine-tune the model on your thumbs-up/down feedback so far (LoRA)." title="Retrain on feedback">Retrain</button>
+     <button class="admin-only" onclick="toggleSettings()" data-tip-below data-tip="Model, tools, generation and memory settings you can change live." title="Open settings">Settings</button>
+     <span id="userChip" class="user-chip" title="Signed-in user"></span>
+     <button id="logoutBtn" onclick="doLogout()" style="display:none" data-tip-below data-tip="End your session and return to the login screen." title="Log out">Log out</button>
    </div>
  </header>
+
+ <div id="loginOverlay">
+   <div id="loginBox">
+     <div class="brand" style="justify-content:center;margin-bottom:4px"><span class="brand-slot">{{APP_LOGO}}</span><strong>{{APP_NAME}}</strong></div>
+     <div class="hint" style="text-align:center;margin-bottom:12px">Sign in to continue.</div>
+     <label style="font-size:12px;color:#999">Username</label>
+     <input id="loginUser" type="text" autocomplete="username" onkeydown="loginKey(event)" placeholder="username">
+     <label style="font-size:12px;color:#999;margin-top:8px">Password</label>
+     <input id="loginPass" type="password" autocomplete="current-password" onkeydown="loginKey(event)" placeholder="password">
+     <div id="loginError" class="login-error"></div>
+     <button class="primary" style="width:100%;margin-top:12px" onclick="doLogin()">Sign in</button>
+     <button id="oidcBtn" style="width:100%;margin-top:8px;display:none" onclick="oidcLogin()">Sign in with Microsoft</button>
+   </div>
+ </div>
 
  <div id="main">
    <div id="chatView" class="view"><div id="chat"></div></div>
@@ -139,6 +155,24 @@ UI_BODY = r"""</style>
    </div>
 
    <div id="modelsView" class="view hidden">
+     <div class="panel">
+       <h3 data-tip="Import a Claude data export (.zip): conversations, projects and files.">Import Claude history</h3>
+       <div class="hint">
+         Upload a Claude &ldquo;Export data&rdquo; .zip. Conversations become browsable
+         history, their text is indexed into your knowledge base for retrieval, and
+         project instructions are saved as reusable prompts. The archive is validated
+         and sandboxed (path-traversal, zip-bomb and size limits). Nothing is dumped
+         into every prompt &mdash; retrieval surfaces only relevant passages. Admin
+         only; imported data is private to your account.
+       </div>
+       <div class="row" style="margin-top:10px">
+         <div><input id="importFile" type="file" accept=".zip,application/zip"></div>
+         <div style="flex:0 0 auto"><button class="primary" onclick="startImport()" data-tip="Upload and process the selected Claude export." title="Import">Import</button></div>
+         <div style="flex:0 0 auto"><button onclick="loadImports()" title="Refresh import list">Refresh</button></div>
+       </div>
+       <div id="importStatus" class="hint" style="margin-top:8px"></div>
+       <div id="importList" style="margin-top:10px">loading...</div>
+     </div>
      <div class="panel">
        <h3>Current</h3>
        <div id="modelCurrent" class="logbox" style="max-height:none">loading...</div>
@@ -333,12 +367,9 @@ UI_BODY = r"""</style>
      </div>
      <div class="row">
        <div>
-         <label data-tip="Which web search provider the search tool uses. ddg needs no key; brave/tavily/searxng may need one.">Search backend</label>
-         <select id="cfgSearchBackend">
-           <option value="ddg">ddg</option>
-           <option value="brave">brave</option>
-           <option value="tavily">tavily</option>
-           <option value="searxng">searxng</option>
+         <label data-tip="The web search provider is locked to DuckDuckGo Lite. There is no other provider and it cannot be changed.">Search provider (locked)</label>
+         <select id="cfgSearchBackend" disabled title="Locked to DuckDuckGo Lite">
+           <option value="duckduckgo_lite">DuckDuckGo Lite</option>
          </select>
        </div>
        <div>
