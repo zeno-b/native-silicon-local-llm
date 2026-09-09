@@ -2,11 +2,13 @@
 
 A private, self-hosted LLM assistant that runs on your own Apple Silicon Macs.
 It combines a model server manager, a tool-using agent, a glass-box web chat UI,
-a feedback/LoRA training loop, and a task scheduler — and now adds
+a feedback/LoRA training loop, and a task scheduler — and adds
 **authentication and multi-user isolation**, **admin/non-admin roles**,
 **Microsoft Entra ID (OIDC) login**, **structured logging with correlation IDs
-and secret redaction**, **Claude conversation-history import**, and
-**automatic Mac Mini → Mac Studio routing and failover**.
+and secret redaction**, **conversation-history import from Claude, ChatGPT,
+DeepSeek and xAI**, **named agent profiles with per-agent capabilities**
+(including Office 365 over Microsoft Graph), and **automatic Mac Mini → Mac
+Studio routing and failover**.
 
 It stays true to its original constraint: fit big work into small RAM by
 splitting it into bounded steps, slowing down rather than crashing.
@@ -19,14 +21,18 @@ splitting it into bounded steps, slowing down rather than crashing.
 - [Configuration](#configuration)
 - [Authentication, users and roles](#authentication-users-and-roles)
 - [Microsoft Entra ID / OIDC](#microsoft-entra-id--oidc)
-- [Claude history import](#claude-history-import)
+- [Conversation history import](#conversation-history-import)
 - [Agents, knowledge and skills](#agents-knowledge-and-skills)
+- [Agent profiles and capabilities](#agent-profiles-and-capabilities)
+- [Office 365 (Microsoft Graph)](#office-365-microsoft-graph)
+- [Performance and resource limits](#performance-and-resource-limits)
 - [Logging and debugging](#logging-and-debugging)
 - [Automatic Mac Mini / Mac Studio routing](#automatic-mac-mini--mac-studio-routing)
 - [Mac Mini deployment (primary)](#mac-mini-deployment-primary)
 - [Mac Studio deployment (secondary)](#mac-studio-deployment-secondary)
 - [Secure internet access](#secure-internet-access)
 - [Search provider](#search-provider)
+- [Production hardening checklist](#production-hardening-checklist)
 - [Testing](#testing)
 - [Troubleshooting](#troubleshooting)
 
@@ -55,11 +61,21 @@ only to the Python app.
   so users are isolated. See [`local_llm/database.py`](local_llm/database.py).
 - **Structured logging.** JSON logs with a correlation id per request, secret
   redaction, rotation and retention. See [`local_llm/obslog.py`](local_llm/obslog.py).
-- **Claude import.** An admin uploads a Claude data-export ZIP; it is validated,
-  safely extracted, parsed, de-duplicated, stored as browsable history and
-  indexed for retrieval. See [`local_llm/claude_import.py`](local_llm/claude_import.py).
+- **History import.** An admin uploads a chat-export ZIP from Claude, ChatGPT,
+  DeepSeek or xAI; it is validated, safely extracted, parsed, de-duplicated,
+  stored as browsable history and indexed for retrieval. See
+  [`local_llm/claude_import.py`](local_llm/claude_import.py).
+- **Agent profiles.** Named agents, each with an explicit capability set that
+  becomes a concrete tool allowlist; several can answer one prompt in parallel
+  and have their answers merged.
 - **Trainer & scheduler.** LoRA fine-tuning from feedback, and named tasks the
   agent runs on demand or a timer.
+- **Web UI.** One embedded single-page app (no build step, no bundler) in the
+  `local_llm/ui_*.py` modules, assembled once at import. Every option lives under
+  **Settings**, grouped into collapsible sections (Appearance, Generation, Agent,
+  Models & training, Performance, Memory, Tools); admin-only panels are split into
+  sub-tabs so the screen stays uncrowded. Light and dark themes are both first
+  class.
 
 **Architecture (two nodes)**
 
@@ -102,6 +118,8 @@ the multi-user, multi-node and auth features are additive and off by default.
   `PyJWT`+`cryptography` (extra OIDC signature verification), `psutil` (memory-%
   routing signal), `pytest` (test suite).
 - **Network**: model downloads (Hugging Face) and the DuckDuckGo Lite search tool.
+  The UI also requests its heading font from Google Fonts; if that is blocked the
+  page falls back to the system font stack and everything else works unchanged.
 - **Microsoft**: an Entra ID app registration if you want org SSO (optional).
 
 ---
@@ -165,16 +183,24 @@ every variable with placeholders. Highlights:
 |-------|-----------|
 | Model/core | `MODEL_ID`, `CONTEXT_SIZE`, `MAX_TOKENS`, `TEMPERATURE`, `HISTORY_TURNS`, `WEB_PORT`, `MODEL_PORT` |
 | Logging | `LOG_LEVEL`, `LOG_FORMAT`, `LOG_DIR`, `LOG_CHAT_CONTENT`, `LOG_MAX_BYTES`, `LOG_BACKUP_COUNT`, `LOG_RETENTION_DAYS` |
-| Auth | `AUTH_ENABLED`, `AUTH_ADMIN_USERNAME`, `AUTH_ADMIN_PASSWORD`, `AUTH_SESSION_TTL_HOURS`, `AUTH_COOKIE_SECURE`, `AUTH_ALLOW_TEST_USER`, `AUTH_TEST_USERNAME`, `AUTH_TEST_PASSWORD` |
+| Auth | `AUTH_ENABLED`, `AUTH_ADMIN_USERNAME`, `AUTH_ADMIN_PASSWORD`, `AUTH_SESSION_TTL_HOURS`, `AUTH_COOKIE_SECURE`, `AUTH_ALLOW_TEST_USER`, `AUTH_TEST_USERNAME`, `AUTH_TEST_PASSWORD`, `LOGIN_MAX_FAILURES`, `LOGIN_WINDOW_S` |
 | Entra/OIDC | `OIDC_ENABLED`, `OIDC_TENANT_ID`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI`, `OIDC_ADMIN_EMAILS`, `OIDC_ADMIN_GROUPS`, `OIDC_ADMIN_ROLES`, `OIDC_DEFAULT_ROLE` |
-| Cluster/routing | `NODE_ROLE`, `NODE_NAME`, `STUDIO_NODE_URL`, `PRIMARY_NODE_URL`, `NODE_TOKEN`, `ROUTE_MAX_ACTIVE`, `ROUTE_QUEUE_DEPTH`, `ROUTE_CPU_PCT`, `ROUTE_MEM_PCT`, `ROUTE_SLA_MS`, `LARGE_MODEL_MARKERS`, `HEARTBEAT_INTERVAL`, `HEARTBEAT_TIMEOUT` |
+| Office 365 | `O365_TENANT_ID`, `O365_CLIENT_ID`, `O365_CLIENT_SECRET`, `O365_SCOPES` |
+| Cluster/routing | `NODE_ROLE`, `NODE_NAME`, `STUDIO_NODE_URL`, `NODE_TOKEN`, `ROUTE_MAX_ACTIVE`, `ROUTE_QUEUE_DEPTH`, `ROUTE_CPU_PCT`, `ROUTE_LOAD_RATIO`, `ROUTE_MEM_PCT`, `ROUTE_SLA_MS`, `ROUTE_COOLDOWN_S`, `LARGE_MODEL_MARKERS`, `HEARTBEAT_INTERVAL`, `HEARTBEAT_TIMEOUT`, `NODE_PROBE_TIMEOUT` |
+| Admission control | `MAX_CONCURRENT_GENERATIONS`, `GENERATION_QUEUE_DEPTH`, `MAX_CONCURRENT_TASKS`, `AGENT_RUN_TIMEOUT` |
+| Agent/tools | `AGENT_ENABLED`, `AGENT_MAX_STEPS`, `AGENT_TOOLS`, `CODE_MAX_TOKENS`, `PROJECT_DIR`, `ALLOW_SHELL`, `ALLOW_PYTHON` |
 | Import | `IMPORT_MAX_ZIP_BYTES`, `IMPORT_MAX_FILES`, `IMPORT_MAX_UNCOMPRESSED_BYTES`, `IMPORT_MAX_FILE_BYTES` |
 | Search | `SEARCH_RESULTS` (provider is locked to DuckDuckGo Lite) |
-| Networking | `ALLOWED_ORIGINS` (extra CORS origins behind a proxy) |
+| Networking | `ALLOWED_ORIGINS` (extra CORS origins behind a proxy; `*` is refused) |
 
-Secrets (`AUTH_ADMIN_PASSWORD`, `OIDC_CLIENT_SECRET`, `NODE_TOKEN`,
-`AUTH_TEST_PASSWORD`) are never returned by the API or written to logs — the
-config endpoint reports only whether each is set.
+Secrets (`AUTH_ADMIN_PASSWORD`, `OIDC_CLIENT_SECRET`, `O365_CLIENT_SECRET`,
+`NODE_TOKEN`, `AUTH_TEST_PASSWORD`) are never returned by the API or written to
+logs — the config endpoint reports only whether each is set.
+
+Most defaults are derived from the machine's RAM rather than hard-coded, so an
+8GB MacBook and a 64GB Studio each get a sensible model, context window,
+reasoning budget, fetch cap and generation concurrency without configuration.
+`python3 deploy.py --print-config` prints the resolved values.
 
 Admins can change most safe settings live from **Settings** (or `POST /api/config`)
 without a restart, including `LOG_LEVEL`, `LOG_CHAT_CONTENT` and the routing
@@ -190,6 +216,13 @@ thresholds. Secrets and `AUTH_ENABLED` require a restart.
   alike. Set `AUTH_COOKIE_SECURE=1` when served over HTTPS.
 - **API clients** may authenticate with `Authorization: Bearer <token>` instead.
 - **Passwords** are hashed with `hashlib.scrypt` (memory-hard, standard library).
+- **Failed logins are throttled.** After `LOGIN_MAX_FAILURES` (default 8) failures
+  for one client IP + username inside `LOGIN_WINDOW_S` (default 300s), the endpoint
+  answers `429` with `Retry-After` and does no password verification at all; a
+  separate ceiling of three times that per client IP stops a spray across many
+  usernames. A successful login clears both counters, so mistyping and then
+  getting it right never locks anyone out. Because scrypt is deliberately slow,
+  this protects CPU and memory as much as it protects credentials.
 - **Roles.**
   - *Admin* sees everything: Settings, model/routing config, system status,
     telemetry, logs, user administration, Claude import, advanced agent functions,
@@ -252,20 +285,28 @@ login.
 
 ---
 
-## Claude history import
+## Conversation history import
 
-Admins can import a Claude data export (the ZIP from Claude's *Export data*
-feature: a README, `conversations.json`, `projects.json`, `users.json` and any
-supporting files).
+Admins can import a chat history export from **Claude, ChatGPT/OpenAI, DeepSeek
+or xAI (Grok)** — the ZIP each of them produces from its *Export data* feature.
 
-**UI:** **Models** (admin) view → **Import Claude history** panel. Choose the
+The parser is provider-agnostic rather than four separate importers: it accepts
+the message shapes these exports actually use (a flat `messages` list, a
+`chat_messages` list, or OpenAI's `mapping` conversation graph, which is
+flattened by walking parent links), reads the role from whichever of `sender`,
+`role` or `author.role` is present, and joins content given as a string, a list
+of typed blocks, or a `{"parts": […]}` object. System and tool frames are
+skipped. A new export format usually needs no code change; if it does, it is one
+shape in [`local_llm/claude_import.py`](local_llm/claude_import.py).
+
+**UI:** **Models** (admin) view → **Import chat history** panel. Choose the
 `.zip`, click **Import**, and watch live status/progress/counts. Failed imports
 can be retried; imports can be removed (which also deletes the conversations and
 knowledge they created).
 
 **Pipeline:** upload → validate → safe extraction → discover/classify files →
-parse Claude format → normalize → de-duplicate → store & index. It runs in the
-background; status is tracked in the `imports` table and shown in the UI.
+parse → normalize → de-duplicate → store & index. It runs in the background;
+status is tracked in the `imports` table and shown in the UI.
 
 **Security (the ZIP is untrusted):** enforced size cap on the upload, per-file and
 total-uncompressed caps and a compression-ratio guard (zip-bomb defence), entry
@@ -316,6 +357,104 @@ a tool, not writing routing rules.
   isolated per user.
 - **Tasks.** Named jobs (admin) the agent runs on demand or a timer; runs stream
   the same event types as chat.
+- **Profiles.** Named agents with explicit capability sets — see
+  [Agent profiles and capabilities](#agent-profiles-and-capabilities). The agent
+  on/off switch and the active profile live under **Settings → Agent**, not in
+  the chat bar.
+
+---
+
+## Agent profiles and capabilities
+
+A **profile** is a named agent with an explicit capability set. Capabilities are
+the user-facing unit; each one expands to a concrete tool allowlist, so an agent
+can only call what its capabilities grant — enforced when the agent is built, not
+by prompting.
+
+| Capability | Grants |
+|------------|--------|
+| `file_ops` | `read_file`, `write_file`, `edit_file`, `list_files`, `search_files`, `file_info` |
+| `code_exec` | `run_shell`, `run_python`, `run_tests` (still subject to `ALLOW_SHELL` / `ALLOW_PYTHON` on the server) |
+| `web_api` | `web_search`, `fetch_url` (DuckDuckGo Lite only) |
+| `knowledge` | Retrieval from the acting user's indexed documents (RAG) |
+| `memory` | `remember`, `recall_memory`, `forget`, `recall_feedback` |
+| `office365` | `o365_mail`, `o365_files`, `o365_calendar` (see below) |
+
+Each run gets a **copy** of the config with `agent_tools` and `rag_enabled`
+narrowed to the profile, so concurrent runs with different capabilities never
+clobber one another.
+
+**Endpoints**
+
+| Method & path | Role | Purpose |
+|---------------|------|---------|
+| `GET /api/agents/capabilities` | user | The capability catalogue with labels and descriptions |
+| `GET /api/agents` | user | List profiles |
+| `POST /api/agents` | admin | Create a profile |
+| `POST /api/agents/{id}` | admin | Update a profile |
+| `DELETE /api/agents/{id}` | admin | Delete a profile |
+| `POST /api/agents/run` | user | Run several profiles on one prompt and merge their answers |
+
+`/api/agents/run` fans out concurrently. Each agent is bounded by
+`AGENT_RUN_TIMEOUT` (default 300s) and takes a slot from the generation gate, so
+a wedged model server or a large fan-out cannot hold the request open or start an
+unbounded number of generations; an agent that times out or is refused a slot
+reports that as its own result and the others still return.
+
+Non-admins can list and run profiles but not create, change or delete them.
+
+---
+
+## Office 365 (Microsoft Graph)
+
+The `office365` capability adds mail, files and calendar tools backed by
+Microsoft Graph. Supply an Azure AD app registration with application
+permissions:
+
+```bash
+O365_TENANT_ID=<tenant-guid>
+O365_CLIENT_ID=<client-guid>
+O365_CLIENT_SECRET=<secret>          # never commit
+O365_SCOPES=https://graph.microsoft.com/.default
+```
+
+These tools are **registered only when the credentials are configured**. Left
+unset, they are absent from the tool list rather than present-and-failing: the
+model never sees them, which also saves roughly 130 tokens of prefill on every
+agent step. `O365_CLIENT_SECRET` is redacted everywhere, like every other secret.
+
+---
+
+## Performance and resource limits
+
+The design constraint throughout is a machine with shared unified memory, where
+the model, the KV cache and the web process compete for the same RAM.
+
+- **Admission control on generations.** `MAX_CONCURRENT_GENERATIONS` (default 2
+  on 8-16GB, 3 on 24-32GB, 4 on 48GB+) run at once; up to
+  `GENERATION_QUEUE_DEPTH` times that may wait. Anything beyond gets an immediate
+  `503` with `Retry-After` instead of a request that quietly times out minutes
+  later. Every in-flight generation holds its own KV cache, so this is a memory
+  limit as much as a fairness one. Chat, streaming chat and each agent in a
+  fan-out all draw from the same pool.
+- **One pooled HTTP client.** All generations share a single keep-alive
+  connection pool to the model backend rather than opening a fresh TCP
+  connection per request, which matters most on multi-step agent runs.
+- **Bounded fetches.** `fetch_url` decides from the response headers what it will
+  keep, then stops reading there: an unsupported content type is rejected without
+  downloading a byte, HTML and JSON stop at the character cap the prompt can
+  actually use, and only PDFs are allowed the full 2MB ceiling.
+- **Cheap status polling.** The UI polls `/api/health` every few seconds; its
+  model probe is cached, its counters are single-pass SQL, and all its SQLite work
+  runs on a worker thread so it never stutters an in-flight token stream.
+- **Batched history queries.** Listing conversations and searching them use joins
+  and batched lookups rather than per-row queries (listing 50 conversations costs
+  3 queries, not 101).
+- **Context fitting, not truncation.** Oversized prompts are chunked and
+  summarised in bounded steps; if trimming would empty the history entirely, an
+  abbreviated tail is kept with an explicit marker rather than silently dropped.
+  Replies that hit the token ceiling are labelled in the answer instead of just
+  stopping mid-sentence.
 
 ---
 
@@ -376,7 +515,8 @@ incoming request → classify → evaluate node load/health → check model capa
 **When the Studio is used** (any of):
 
 - the Mini is overloaded (in-flight generations ≥ `ROUTE_MAX_ACTIVE`, CPU ≥
-  `ROUTE_CPU_PCT`, memory ≥ `ROUTE_MEM_PCT`, or latency past `ROUTE_SLA_MS`),
+  `ROUTE_CPU_PCT`, memory ≥ `ROUTE_MEM_PCT`, load average **per core** ≥
+  `ROUTE_LOAD_RATIO`, or latency past `ROUTE_SLA_MS`),
 - the request needs a **larger model** (the requested model matches
   `LARGE_MODEL_MARKERS`, e.g. a 32B) which only the high-memory Studio advertises,
 - the Mini is unavailable.
@@ -390,6 +530,19 @@ eligible work to the Studio.
 `starting` / `draining` / `unavailable`. The Mini reads its own model-server status
 plus CPU/memory; it probes the Studio via the Studio's `GET /api/node/health`
 (authenticated with `NODE_TOKEN`).
+
+Load signals are reported honestly or not at all: without `psutil` a node reports
+CPU and memory as *unmeasured* rather than substituting a plausible number, and
+the load average is compared per core as a ratio, never mistaken for a
+percentage. A node's name and its advertised capabilities are derived from the
+machine itself (`hw.model` and physical RAM), so a MacBook does not inherit the
+Mini's identity or claim `high_memory` — only machines with 32GB or more
+advertise `high_memory`, `large_model` and `reasoning`.
+
+**Circuit breaker.** A node that fails is skipped for `ROUTE_COOLDOWN_S` before
+one half-open trial is allowed through, so a node that is down does not cost
+every request a connection timeout, and a node that recovers is picked up
+without a restart.
 
 **No duplicated work.** Each generation carries a unique task id; failover retries
 the same id on the next node, and the router refuses to double-dispatch an id that
@@ -450,7 +603,6 @@ never exposed to the network.
    NODE_ROLE=secondary
    NODE_NAME=mac-studio
    NODE_TOKEN='a-long-random-shared-secret'      # identical to the Mini's
-   PRIMARY_NODE_URL=http://mini.local:8000         # informational
    MODEL_ID=mlx-community/Qwen2.5-Coder-32B-Instruct-4bit   # the big model the Mini offloads
    AUTH_ENABLED=1                                    # its own admin; users log in on the Mini
    # Do NOT set STUDIO_NODE_URL here (a secondary has no secondary).
@@ -530,21 +682,94 @@ Only `SEARCH_RESULTS` (count) is configurable.
 
 ---
 
+## Production hardening checklist
+
+Work through this before exposing the app to anyone but yourself. Every item is
+enforced or configurable in the code, not just advice.
+
+**Identity**
+
+- [ ] `AUTH_ENABLED=1`. With auth off the app serves a single synthetic local
+      admin to whoever reaches it; that is safe only because the server binds
+      `127.0.0.1` exclusively. If you put a proxy in front, auth must be on.
+- [ ] `AUTH_ADMIN_PASSWORD` set to something you chose, or the random one printed
+      once at first startup changed after you log in. It is never hard-coded.
+- [ ] `AUTH_ALLOW_TEST_USER=0` (the dev account is not a backdoor, but it has no
+      place in production).
+- [ ] `AUTH_COOKIE_SECURE=1` once TLS terminates in front of the app.
+- [ ] Login throttle left on, or `LOGIN_MAX_FAILURES` / `LOGIN_WINDOW_S` tuned
+      deliberately rather than by accident.
+- [ ] OIDC configured if the org has an IdP; local admin login stays as the
+      break-glass path.
+
+**Network**
+
+- [ ] The app port (8000) and both model ports (8080) are unreachable from the
+      internet. The app itself only ever listens on `127.0.0.1`.
+- [ ] TLS terminated by a proxy or tunnel (see
+      [Secure internet access](#secure-internet-access)).
+- [ ] `ALLOWED_ORIGINS` lists exact origins. `*` is **refused** at startup with a
+      warning, because a wildcard combined with cookie credentials would let any
+      site the user visits drive this API as them.
+- [ ] `NODE_TOKEN` set to a long random secret on both nodes, and the Studio
+      reachable only over the private network.
+
+**Data**
+
+- [ ] Back up `data/feedback.db` (it holds users, sessions, conversations,
+      feedback and imports). `GET /api/backup` exports it.
+- [ ] Decide the log content level: `LOG_CHAT_CONTENT=metadata` (default) logs
+      lengths and fingerprints, `full` logs redacted message text, `disabled`
+      logs neither. Secrets are redacted at every level.
+- [ ] `LOG_RETENTION_DAYS` matches your retention policy.
+- [ ] Review the training queue. A non-admin's rating never enters the shared
+      LoRA corpus by itself: it waits in **Models → Training data → approve
+      queued** (`POST /api/feedback/approve-pending`). Leave
+      `AUTO_RETRAIN_THRESHOLD=0` unless you want retraining to fire unattended.
+
+**Capability**
+
+- [ ] `ALLOW_SHELL` and `ALLOW_PYTHON` stay `0` unless you intend users to
+      execute code on the host. The `code_exec` capability cannot bypass them.
+- [ ] `PROJECT_DIR` points at the repo you actually want editable, if any. The
+      diff endpoint deliberately withholds the enclosing repository.
+- [ ] `MAX_CONCURRENT_GENERATIONS` sized for the machine's RAM, not optimism.
+- [ ] Agent profiles grant the narrowest capability set that does the job.
+
+**Verify**
+
+- [ ] `python3 deploy.py --selftest` and `python3 tests/test_app.py` both pass on
+      the box you are deploying to.
+- [ ] `python3 deploy.py --print-config` shows the values you expect (it prints
+      resolved config, never secrets).
+- [ ] A non-admin account can reach Chat and nothing else — confirm with a direct
+      `curl` to an admin endpoint, not just by looking at the UI.
+
+---
+
 ## Testing
 
 Two complementary suites, both runnable without a model server:
 
 ```bash
-# Offline invariants (no dependencies needed): routing, calculator, chunking,
-# auth hashing/sessions/RBAC, multi-user isolation, logging redaction, cluster
-# routing decisions, Claude-import security, the DuckDuckGo-Lite lock, and more.
+# 18 offline invariant checks (no dependencies needed): routing, calculator,
+# chunking, auth hashing/sessions/RBAC, multi-user isolation, logging redaction,
+# cluster routing decisions, import security, multi-provider import parsing,
+# agent capability -> tool mapping, the DuckDuckGo-Lite lock, and the embedded
+# UI's structural invariants (one <script>, one <style>, balanced markup, every
+# getElementById target present, no unescaped innerHTML).
 python3 deploy.py --selftest
 
-# HTTP integration tests (auth flows, RBAC blocking, cross-user isolation,
-# import, node-token gating, concurrency, backward-compatible auth-off).
+# 29 HTTP integration tests (auth flows, login throttling, RBAC blocking,
+# cross-user isolation, per-user prompt isolation, the training-approval gate,
+# CORS wildcard refusal, generation admission control, agent CRUD and capability
+# gating, import, node-token gating, concurrency, backward-compatible auth-off).
 python3 tests/test_app.py            # standalone runner
 # or, with pytest installed:
 python3 -m pip install pytest && python3 -m pytest tests/ -q
+
+# The single-file build must pass the same invariants as the package.
+python3 bundle.py && python3 deploy_bundled.py --selftest
 ```
 
 Other diagnostics: `python3 deploy.py --doctor` (ports), `--bench` (throughput),
@@ -586,4 +811,16 @@ Other diagnostics: `python3 deploy.py --doctor` (ports), `--bench` (throughput),
   (`logs/`, `data/`, `adapters/`, caches) are gitignored.
 - **Git tracking runtime files.** They are ignored via `.gitignore`; if something
   slipped in earlier, `git rm --cached <path>` (the file stays on disk).
+- **`429 too many failed attempts`.** The login throttle. Wait out the
+  `Retry-After` seconds; a successful login clears the counter immediately. Raise
+  `LOGIN_MAX_FAILURES` only if a legitimate shared-IP setup trips it.
+- **`503 … generations already queued`.** Admission control is shedding load
+  rather than running out of memory. Raise `MAX_CONCURRENT_GENERATIONS` only if
+  the machine genuinely has the RAM for another concurrent KV cache; raising
+  `GENERATION_QUEUE_DEPTH` instead just makes callers wait longer.
+- **Thumbs-up did not reach the training data.** Expected for a non-admin: it is
+  queued. An admin releases it in **Models → Training data → approve queued**.
+- **Headings render in the fallback font.** Google Fonts is unreachable from that
+  machine or blocked by policy. Everything else works; the page falls back to the
+  system font stack by design.
 ```

@@ -199,16 +199,30 @@ UI_JS_CHAT = r"""
      if (node.mdTimer) return;
      node.mdTimer = setTimeout(function() {
        node.mdTimer = null;
-       // Don't render a code fence that is still open; wait for it to close.
+       // A code fence that is still open must not be rendered half-formed. Show
+       // the raw text so the code streams visibly, and mark the node un-rendered
+       // so the token handler keeps the plain view live until the fence closes.
        var fences = (node.raw.match(/```/g) || []).length;
-       if (fences % 2 === 1) return;
+       if (fences % 2 === 1) {
+         node.text.textContent = node.raw;
+         node.rendered = false;
+         return;
+       }
        renderMarkdown(node.raw, node.text);
+       // Rendered now: the token handler stops overwriting textContent with raw
+       // text every token, so the message no longer oscillates plain<->markdown
+       // (the flicker). Subsequent tokens accumulate and re-render on the next
+       // debounce, swapped in atomically by renderMarkdown.
+       node.rendered = true;
        scrollDown();
      }, 250);
    }
 
    function renderMarkdown(text, host) {
-     host.innerHTML = "";
+     // Build into a detached fragment and swap it in atomically at the end, so
+     // the message is never momentarily empty (clearing innerHTML then refilling
+     // on every debounced streaming pass is what made the answer flicker).
+     var frag = document.createDocumentFragment();
      var lines = String(text == null ? "" : text).split("\n");
      var i = 0;
      var list = null;
@@ -223,7 +237,7 @@ UI_JS_CHAT = r"""
          i++;
          while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) { buf.push(lines[i]); i++; }
          i++;
-         host.appendChild(makeCodeBlock(buf.join("\n"), lang));
+         frag.appendChild(makeCodeBlock(buf.join("\n"), lang));
          continue;
        }
        var heading = line.match(/^(#{1,4})\s+(.*)$/);
@@ -232,7 +246,7 @@ UI_JS_CHAT = r"""
          var h = document.createElement("h" + Math.min(4, heading[1].length + 2));
          h.className = "md-h";
          renderInline(heading[2], h);
-         host.appendChild(h);
+         frag.appendChild(h);
          i++;
          continue;
        }
@@ -242,7 +256,7 @@ UI_JS_CHAT = r"""
          if (!list || list.ordered !== ordered) {
            var el = document.createElement(ordered ? "ol" : "ul");
            el.className = "md-list";
-           host.appendChild(el);
+           frag.appendChild(el);
            list = { el: el, ordered: ordered };
          }
          var li = document.createElement("li");
@@ -256,7 +270,7 @@ UI_JS_CHAT = r"""
          var q = document.createElement("blockquote");
          q.className = "md-quote";
          renderInline(line.replace(/^\s*>\s?/, ""), q);
-         host.appendChild(q);
+         frag.appendChild(q);
          i++;
          continue;
        }
@@ -271,8 +285,9 @@ UI_JS_CHAT = r"""
          i++;
        }
        renderInline(block.join("\n"), p);
-       host.appendChild(p);
+       frag.appendChild(p);
      }
+     host.replaceChildren(frag);
      return host;
    }
 
@@ -329,25 +344,6 @@ UI_JS_CHAT = r"""
      chat.appendChild(div);
      scrollDown();
      return div;
-   }
-
-   function addToolCard(name, args) {
-     var card = document.createElement("div");
-     card.className = "tool-card";
-     var head = document.createElement("div");
-     head.className = "name";
-     head.textContent = "tool: " + name;
-     var argsEl = document.createElement("div");
-     argsEl.className = "args";
-     argsEl.textContent = JSON.stringify(args);
-     var body = document.createElement("pre");
-     body.textContent = "running...";
-     card.appendChild(head);
-     card.appendChild(argsEl);
-     card.appendChild(body);
-     chat.appendChild(card);
-     scrollDown();
-     return { card: card, body: body };
    }
 
    // --- Glass box: build one trace timeline per assistant turn. ---
@@ -548,16 +544,50 @@ UI_JS_CHAT = r"""
 
    async function fetchJSON(url, options) {
      var res = await fetch(url, options);
+     // A 401 on any authenticated request means the session ended (expired,
+     // revoked by an admin, or logged out in another tab): return to login.
+     if (res.status === 401 && typeof onUnauthorized === "function") onUnauthorized();
      var raw = await res.text();
-     if (!raw) return { res: res, data: {} };
+     var data = {};
+     if (raw) {
+       try {
+         data = JSON.parse(raw);
+       } catch (err) {
+         throw new Error(
+           "HTTP " + res.status + " from " + (res.url || url) +
+           " returned non-JSON, so this page is probably talking to the model " +
+           "server instead of the web UI. Body: " + raw.slice(0, 200)
+         );
+       }
+     }
+     // Throw on any non-2xx so callers' catch blocks surface the real error
+     // (a 403/400/500/503) instead of silently reading fields off an error body
+     // and rendering an empty, healthy-looking state.
+     if (!res.ok) {
+       throw new Error((data && (data.error || data.detail)) || ("HTTP " + res.status));
+     }
+     return { res: res, data: data };
+   }
+
+   // Download a URL as a file via fetch+blob (not window.location), so a
+   // 401/403/404/500 shows a message instead of replacing the whole app tab.
+   async function downloadFile(url, filename) {
      try {
-       return { res: res, data: JSON.parse(raw) };
+       var resp = await fetch(url);
+       if (resp.status === 401 && typeof onUnauthorized === "function") { onUnauthorized(); return; }
+       if (!resp.ok) {
+         var e = {}; try { e = await resp.json(); } catch (x) {}
+         addSystem("Download failed: " + (e.error || e.detail || ("HTTP " + resp.status)));
+         return;
+       }
+       var text = await resp.text();
+       var a = document.createElement("a");
+       a.href = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
+       a.download = filename;
+       document.body.appendChild(a); a.click(); a.remove();
+       URL.revokeObjectURL(a.href);
      } catch (err) {
-       throw new Error(
-         "HTTP " + res.status + " from " + (res.url || url) +
-         " returned non-JSON, so this page is probably talking to the model " +
-         "server instead of the web UI. Body: " + raw.slice(0, 200)
-       );
+       addSystem("Download failed: " + err.message);
      }
    }
 
@@ -601,8 +631,16 @@ UI_JS_CHAT = r"""
 
        if (!res.ok || !res.body) {
          var text = await res.text();
+         // Session ended mid-chat (this is a raw fetch, not fetchJSON): return
+         // to the login screen instead of showing a cryptic error.
+         if (res.status === 401 && typeof onUnauthorized === "function") {
+           onUnauthorized(); stopActivity(trace); return;
+         }
+         // Show the clean message, not the raw {"error": ...} JSON envelope.
+         var msg = text;
+         try { var j = JSON.parse(text); msg = j.error || j.detail || text; } catch (e) {}
          var a0 = traceAnswer(trace);
-         a0.text.textContent = "Error: " + text.slice(0, 400);
+         a0.text.textContent = "Error: " + String(msg).slice(0, 400);
          a0.node.classList.remove("pending");
          a0.node.classList.add("failed");
          stopActivity(trace);
@@ -681,7 +719,11 @@ UI_JS_CHAT = r"""
            }
            var ansNode = traceAnswer(trace);
            ansNode.raw = (ansNode.raw || "") + event.token;
-           ansNode.text.textContent = ansNode.raw;
+           // Only write the growing raw text while markdown has not rendered yet
+           // (or a code fence is open). Once rendered, leave the formatted DOM in
+           // place and let the debounced renderMarkdown update it — writing raw
+           // text every token here is what made the answer flicker.
+           if (!ansNode.rendered) ansNode.text.textContent = ansNode.raw;
            scheduleMarkdown(ansNode);
            bumpActivity(trace);
            setActivity(trace, "generating\u2026");
@@ -934,7 +976,6 @@ UI_JS_CHAT = r"""
        document.getElementById("cfgTemperature").value = cfg.temperature;
        document.getElementById("cfgContext").value = cfg.context_size;
        document.getElementById("cfgHistory").value = cfg.history_turns;
-       document.getElementById("cfgAgent").value = cfg.agent_enabled ? "true" : "false";
        document.getElementById("cfgAgentSteps").value = cfg.agent_max_steps;
        document.getElementById("cfgSearchBackend").value = cfg.search_backend;
        document.getElementById("cfgSearchResults").value = cfg.search_results;
@@ -961,7 +1002,7 @@ UI_JS_CHAT = r"""
        temperature: Number(document.getElementById("cfgTemperature").value),
        context_size: Number(document.getElementById("cfgContext").value),
        history_turns: Number(document.getElementById("cfgHistory").value),
-       agent_enabled: document.getElementById("cfgAgent").value === "true",
+       agent_enabled: agentToggle.checked,
        agent_max_steps: Number(document.getElementById("cfgAgentSteps").value),
        search_results: Number(document.getElementById("cfgSearchResults").value),
        tool_result_chars: Number(document.getElementById("cfgToolChars2").value ||
@@ -997,21 +1038,33 @@ UI_JS_CHAT = r"""
        // Non-admins never call loadConfig(), so take the context size (used by
        // the context meter) from health instead.
        if (typeof data.context_size === "number") contextSize = data.context_size;
-       var msg = "Model: " + (data.model_status || "unknown");
-       if (data.ui_build && data.ui_build !== "{{UI_BUILD}}") {
-         msg = "STALE PAGE: server is build " + data.ui_build +
-               ", this tab is {{UI_BUILD}}. Hard-reload.\n" + msg;
+       // The header line stays short enough to read at a glance; everything
+       // else goes to the tooltip, which has room to wrap.
+       var brief = ["Model: " + (data.model_status || "unknown")];
+       var detail = [];
+       var stale = data.ui_build && data.ui_build !== "{{UI_BUILD}}";
+       if (stale) {
+         brief = ["STALE PAGE \u2014 hard-reload"];
+         detail.push("Server is build " + data.ui_build + ", this tab is {{UI_BUILD}}.");
        }
-       msg += "  |  agent " + (data.agent_enabled ? "on" : "off") +
-              ", ctx " + data.context_size + ", max " + data.max_tokens +
-              ", tools " + (data.tools ? data.tools.length : 0);
-       msg += "\nRetrain: " + ((data.retrain && data.retrain.message) || "idle");
+       brief.push("agent " + (data.agent_enabled ? "on" : "off"));
+       brief.push("ctx " + data.context_size);
+       detail.push("Max reply " + data.max_tokens + " tokens");
+       detail.push((data.tools ? data.tools.length : 0) + " tools");
+       var retrain = (data.retrain && data.retrain.message) || "idle";
+       if (retrain !== "idle") brief.push("retrain: " + retrain);
+       else detail.push("Retrain idle");
        if (data.stats) {
-         msg += "  |  feedback " + data.stats.total + " total, " + data.stats.approved
-              + " approved, " + data.stats.untrained + " untrained";
+         brief.push(data.stats.untrained + " untrained");
+         detail.push("Feedback: " + data.stats.total + " total, "
+                     + data.stats.approved + " approved, "
+                     + data.stats.untrained + " untrained");
+         if (data.stats.pending) {
+           brief.push(data.stats.pending + " awaiting approval");
+         }
        }
        if (typeof data.memories === "number") {
-         msg += ", " + data.memories + " notes";
+         detail.push(data.memories + " memory notes");
        }
        var warn = document.getElementById("prefixWarn");
        if (data.prefix && data.prefix.generation > 1) {
@@ -1024,22 +1077,27 @@ UI_JS_CHAT = r"""
        }
        if (data.tasks) {
          var running = data.tasks.running || [];
-         msg += "\nTasks: " + data.tasks.total + " defined, " + running.length + " running";
          if (running.length) {
-           msg += " (" + running.map(function(item) {
+           brief.push(running.length + " task" + (running.length > 1 ? "s" : "") + " running");
+           detail.push("Running: " + running.map(function(item) {
              return "step " + item.step + "/" + item.max_steps;
-           }).join(", ") + ")";
+           }).join(", "));
          }
+         detail.push(data.tasks.total + " tasks defined");
        }
-       statusEl.textContent = msg;
+       statusEl.textContent = brief.join("  \u00b7  ");
        statusEl.className = "";
        statusEl.setAttribute("data-tip-below", "");
        statusEl.setAttribute("data-tip",
-         "Live server status. Model: " + (data.model || "?")
+         "Model " + (data.model || "?")
          + " \u00b7 context " + (data.context_size || contextSize) + " tokens"
-         + (data.ram_gb ? " \u00b7 " + data.ram_gb + "GB RAM" : ""));
-       if (data.model_status && data.model_status.indexOf("error") === 0) statusEl.className = "error";
-       else if (data.model_status === "starting" || data.model_status === "loading") statusEl.className = "warn";
+         + (data.ram_gb ? " \u00b7 " + data.ram_gb + "GB RAM" : "")
+         + (detail.length ? " \u00b7 " + detail.join(" \u00b7 ") : ""));
+       if (stale || (data.model_status && data.model_status.indexOf("error") === 0)) {
+         statusEl.className = "error";
+       } else if (data.model_status === "starting" || data.model_status === "loading") {
+         statusEl.className = "warn";
+       }
      } catch (err) {
        statusEl.textContent = "Status unavailable: " + err.message;
        statusEl.className = "error";

@@ -14,11 +14,16 @@ UI_HEAD = r"""
  <meta charset="utf-8">
  <meta name="viewport" content="width=device-width, initial-scale=1">
  <title>{{APP_NAME}}</title>
+ <!-- Texcel brand typeface. Loaded when online; the CSS font stack falls back to
+      a clean geometric system sans offline, so the app never blocks on this. -->
+ <link rel="preconnect" href="https://fonts.googleapis.com">
+ <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+ <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Raleway:ital,wght@0,400;0,500;0,600;0,700;0,800;1,400&display=swap">
  <style>"""
 
 UI_BODY = r"""</style>
 </head>
-<body>
+<body class="booting">
  <header>
    <div class="brand"><span class="brand-slot">{{APP_LOGO}}</span><strong>{{APP_NAME}}</strong> <span class="build" title="UI build version">build {{UI_BUILD}}</span></div>
    <div id="status">Starting...</div>
@@ -34,22 +39,28 @@ UI_BODY = r"""</style>
      <button onclick="showView('history')" data-tip-below data-tip="Browse and search every past conversation." title="Search conversations">Search</button>
      <button onclick="exportChat()" data-tip-below data-tip="Download this conversation as Markdown." title="Export conversation">Export</button>
      <button onclick="togglePrompts()" data-tip-below data-tip="Save and reuse prompts you type often." title="Prompt library">Prompts</button>
-     <button id="themeBtn" onclick="toggleTheme()" data-tip-below data-tip="Switch between the dark and light colour scheme." title="Toggle theme">Light</button>
-     <button class="admin-only" onclick="retrain()" data-tip-below data-tip="Fine-tune the model on your thumbs-up/down feedback so far (LoRA)." title="Retrain on feedback">Retrain</button>
      <button class="admin-only" onclick="toggleSettings()" data-tip-below data-tip="Model, tools, generation and memory settings you can change live." title="Open settings">Settings</button>
-     <span id="userChip" class="user-chip" title="Signed-in user"></span>
-     <button id="logoutBtn" onclick="doLogout()" style="display:none" data-tip-below data-tip="End your session and return to the login screen." title="Log out">Log out</button>
+     <div class="acct" id="acctMenu">
+       <button class="acct-btn" onclick="toggleAcct()" data-tip-below data-tip="Your account and session." title="Account"><span id="userChip" class="user-chip"></span> <span class="caret">&#9662;</span></button>
+       <div class="acct-pop hidden" id="acctPop">
+         <div class="acct-info" id="acctInfo"></div>
+         <button id="logoutBtn" onclick="doLogout()" title="End your session and return to the login screen">Log out</button>
+       </div>
+     </div>
    </div>
  </header>
 
  <div id="loginOverlay">
    <div id="loginBox">
-     <div class="brand" style="justify-content:center;margin-bottom:4px"><span class="brand-slot">{{APP_LOGO}}</span><strong>{{APP_NAME}}</strong></div>
+     <div class="brand" style="justify-content:center;margin-bottom:4px"><span class="brand-slot">{{APP_LOGO_LOGIN}}</span><strong>{{APP_NAME}}</strong></div>
      <div class="hint" style="text-align:center;margin-bottom:12px">Sign in to continue.</div>
-     <label style="font-size:12px;color:#999">Username</label>
+     <label style="font-size:12px;color:var(--muted)">Username</label>
      <input id="loginUser" type="text" autocomplete="username" onkeydown="loginKey(event)" placeholder="username">
-     <label style="font-size:12px;color:#999;margin-top:8px">Password</label>
-     <input id="loginPass" type="password" autocomplete="current-password" onkeydown="loginKey(event)" placeholder="password">
+     <label style="margin-top:8px">Password</label>
+     <div class="pw-field">
+       <input id="loginPass" type="password" autocomplete="current-password" onkeydown="loginKey(event)" placeholder="password">
+       <button type="button" class="pw-reveal" onclick="togglePw('loginPass', this)" title="Show or hide the password">show</button>
+     </div>
      <div id="loginError" class="login-error"></div>
      <button class="primary" style="width:100%;margin-top:12px" onclick="doLogin()">Sign in</button>
      <button id="oidcBtn" style="width:100%;margin-top:8px;display:none" onclick="oidcLogin()">Sign in with Microsoft</button>
@@ -109,13 +120,13 @@ UI_BODY = r"""</style>
      </div>
 
      <div class="task-monitor">
-       <div id="monitorHeader" style="color:#888;font-size:13px">
+       <div id="monitorHeader" style="color:var(--muted);font-size:13px">
          Select a task to watch its runs, or create one.
        </div>
        <div id="runControls" style="display:none;margin-top:10px">
          <div class="row" style="max-width:520px">
            <div>
-             <label style="font-size:12px;color:#999">Run</label>
+             <label style="font-size:12px;color:var(--muted)">Run</label>
              <select id="runPicker" onchange="openRun(this.value)"></select>
            </div>
            <div style="flex:0 0 auto;display:flex;align-items:flex-end;gap:6px">
@@ -139,7 +150,7 @@ UI_BODY = r"""</style>
        <div id="historyList" style="margin-top:12px">loading...</div>
      </div>
 
-     <div class="panel">
+     <div class="panel admin-only">
        <h3 data-tip="Save or restore everything you have created in this app.">Backup</h3>
        <div class="hint">
          Downloads your conversations, prompts, feedback and indexed documents as
@@ -155,10 +166,22 @@ UI_BODY = r"""</style>
    </div>
 
    <div id="modelsView" class="view hidden">
-     <div class="panel">
-       <h3 data-tip="Import a Claude data export (.zip): conversations, projects and files.">Import Claude history</h3>
+     <div class="subnav" id="adminTabs">
+       <button data-mg-tab="models" class="active" onclick="showAdminTab('models')">Model</button>
+       <button data-mg-tab="agents" onclick="showAdminTab('agents')">Agents</button>
+       <button data-mg-tab="knowledge" onclick="showAdminTab('knowledge')">Knowledge</button>
+       <button data-mg-tab="codebase" onclick="showAdminTab('codebase')">Codebase</button>
+       <button data-mg-tab="data" onclick="showAdminTab('data')">Training data</button>
+       <button data-mg-tab="import" onclick="showAdminTab('import')">Import</button>
+       <button data-mg-tab="users" onclick="showAdminTab('users')">Users</button>
+       <button data-mg-tab="cluster" onclick="showAdminTab('cluster')">Cluster</button>
+     </div>
+     <div id="adminPanels">
+     <div data-mg="import" class="panel">
+       <h3 data-tip="Import a chat history export (.zip) from Claude, ChatGPT, DeepSeek or xAI: conversations, projects and files.">Import chat history</h3>
        <div class="hint">
-         Upload a Claude &ldquo;Export data&rdquo; .zip. Conversations become browsable
+         Upload an &ldquo;Export data&rdquo; .zip from Claude, ChatGPT, DeepSeek or xAI.
+         Conversations become browsable
          history, their text is indexed into your knowledge base for retrieval, and
          project instructions are saved as reusable prompts. The archive is validated
          and sandboxed (path-traversal, zip-bomb and size limits). Nothing is dumped
@@ -167,19 +190,19 @@ UI_BODY = r"""</style>
        </div>
        <div class="row" style="margin-top:10px">
          <div><input id="importFile" type="file" accept=".zip,application/zip"></div>
-         <div style="flex:0 0 auto"><button class="primary" onclick="startImport()" data-tip="Upload and process the selected Claude export." title="Import">Import</button></div>
+         <div style="flex:0 0 auto"><button class="primary" onclick="startImport()" data-tip="Upload and process the selected chat export." title="Import">Import</button></div>
          <div style="flex:0 0 auto"><button onclick="loadImports()" title="Refresh import list">Refresh</button></div>
        </div>
        <div id="importStatus" class="hint" style="margin-top:8px"></div>
        <div id="importList" style="margin-top:10px">loading...</div>
      </div>
-     <div class="panel">
+     <div data-mg="models" class="panel">
        <h3>Current</h3>
        <div id="modelCurrent" class="logbox" style="max-height:none">loading...</div>
 
        <h3>Switch model</h3>
        <table class="models"><tbody id="modelTable"></tbody></table>
-       <label style="display:block;font-size:12px;color:#999;margin:12px 0 4px">
+       <label style="display:block;font-size:12px;color:var(--muted);margin:12px 0 4px">
          Or any Hugging Face repo id
        </label>
        <div class="row">
@@ -190,11 +213,11 @@ UI_BODY = r"""</style>
        <h3>Adapter and cache</h3>
        <div class="row">
          <div>
-           <label style="font-size:12px;color:#999">LoRA adapter</label>
+           <label style="font-size:12px;color:var(--muted)">LoRA adapter</label>
            <select id="adapterSelect"></select>
          </div>
          <div>
-           <label style="font-size:12px;color:#999">KV cache cap (0 = unbounded)</label>
+           <label style="font-size:12px;color:var(--muted)">KV cache cap (0 = unbounded)</label>
            <input id="kvSize" type="number" min="0" step="512">
          </div>
        </div>
@@ -212,7 +235,7 @@ UI_BODY = r"""</style>
        <div id="modelLog" class="logbox">loading...</div>
      </div>
 
-     <div class="panel">
+     <div data-mg="data" class="panel">
        <h3 data-tip="How reusable your collected data is for training this or any future model.">Training data</h3>
        <div id="datasetStats" class="logbox" style="max-height:none">loading...</div>
        <div class="hint">
@@ -221,7 +244,7 @@ UI_BODY = r"""</style>
          answers become examples to imitate; rejected ("no, wrong") answers and
          your corrections become preference pairs for DPO-style tuning.
        </div>
-       <label style="display:block;font-size:12px;color:#999;margin:10px 0 4px">Export format</label>
+       <label style="display:block;font-size:12px;color:var(--muted);margin:10px 0 4px">Export format</label>
        <div class="row" style="flex-wrap:wrap;gap:6px">
          <button onclick="exportDataset('chat')" data-tip="Chat messages WITH this assistant's system prompt. Trains a model to be this assistant. Used by the built-in LoRA loop." title="Export chat JSONL">Chat (this assistant)</button>
          <button onclick="exportDataset('bare')" data-tip="Chat messages with NO system prompt. Model-neutral: train a different base model or persona." title="Export bare JSONL">Bare Q&amp;A (any model)</button>
@@ -231,9 +254,10 @@ UI_BODY = r"""</style>
        <div class="row" style="margin-top:8px">
          <label class="agent-toggle" data-tip="Only export rows you have marked reviewed. Curated data trains better on any model."><input id="exportReviewedOnly" type="checkbox"> reviewed only</label>
          <button onclick="loadDatasetStats()" data-tip="Refresh the dataset counts." title="Refresh stats">Refresh</button>
+         <button id="approvePendingBtn" hidden onclick="approvePendingFeedback()" data-tip="Ratings from non-admin accounts wait here. They never train the shared adapter until you approve them." title="Approve queued examples">approve queued</button>
        </div>
      </div>
-     <div class="panel">
+     <div data-mg="knowledge" class="panel">
        <h3 data-tip="Index your own documents so answers come from your material, with sources.">Knowledge base</h3>
        <div id="docsStats" class="logbox" style="max-height:none">loading...</div>
        <div class="hint">
@@ -246,7 +270,7 @@ UI_BODY = r"""</style>
          <strong>Drop files here</strong> or click to choose &mdash; PDFs, Word docs, spreadsheets, notebooks, text.
        </div>
        <input id="fileInput" type="file" multiple style="display:none">
-       <label style="display:block;font-size:12px;color:#999;margin:10px 0 4px">File or folder to index (relative to the project)</label>
+       <label style="display:block;font-size:12px;color:var(--muted);margin:10px 0 4px">File or folder to index (relative to the project)</label>
        <div class="row">
          <div><input id="docsPath" type="text" placeholder="docs"></div>
          <div style="flex:0 0 auto"><button onclick="indexDocs()" data-tip="Read and index this file or folder into the knowledge base." title="Index">Index</button></div>
@@ -260,7 +284,7 @@ UI_BODY = r"""</style>
          <div style="flex:0 0 auto"><button onclick="searchDocs()" data-tip="Preview what the model would retrieve for this question." title="Search">Search</button></div>
          <div style="flex:0 0 auto"><button onclick="clearDocs()" data-tip="Remove every indexed document. Your files are not touched." title="Clear">Clear</button></div>
        </div>
-       <label style="display:block;font-size:12px;color:#999;margin:12px 0 4px" data-tip="Limit retrieval to specific documents, so answers come only from what you choose.">Answer only from these documents</label>
+       <label style="display:block;font-size:12px;color:var(--muted);margin:12px 0 4px" data-tip="Limit retrieval to specific documents, so answers come only from what you choose.">Answer only from these documents</label>
        <div id="docScope" style="max-height:150px;overflow-y:auto"></div>
        <div class="row" style="margin-top:8px">
          <button onclick="applyScope()" data-tip="Restrict retrieval to the ticked documents." title="Apply scope">Apply scope</button>
@@ -268,9 +292,9 @@ UI_BODY = r"""</style>
        </div>
        <pre id="docsResult" class="gbody gdiff" style="display:none;margin-top:8px"></pre>
      </div>
-     <div class="panel">
+     <div data-mg="codebase" class="panel">
        <h3 data-tip="The local codebase the agent reads and edits in place. Review here before you push.">Codebase</h3>
-       <label style="display:block;font-size:12px;color:#999;margin:4px 0 4px">Project directory (PROJECT_DIR)</label>
+       <label style="display:block;font-size:12px;color:var(--muted);margin:4px 0 4px">Project directory (PROJECT_DIR)</label>
        <div class="row">
          <div><input id="cfgProjectDir" type="text" placeholder="/Users/you/path/to/repo"></div>
          <div style="flex:0 0 auto"><button onclick="openBrowser()" data-tip="Browse your folders and pick the project directory." title="Browse for a folder">Browse...</button></div>
@@ -289,6 +313,80 @@ UI_BODY = r"""</style>
        </div>
        <div class="hint" id="sandboxHint" style="margin-top:8px"></div>
        <pre id="projectDiff" class="gbody gdiff" style="display:none;margin-top:8px"></pre>
+     </div>
+
+     <div data-mg="users" class="panel admin-only">
+       <h3 data-tip="Create and manage the people who can sign in, and their roles.">Users</h3>
+       <div class="hint">
+         Admins can reach every panel here and manage users; standard users get the
+         chat, their own history and knowledge base. Disabling or changing a user
+         signs them out immediately. The last remaining admin cannot be removed.
+       </div>
+       <div id="usersList" style="margin-top:10px">loading...</div>
+       <label style="display:block;font-size:12px;color:var(--muted);margin:12px 0 4px">Add a user</label>
+       <div class="row" style="flex-wrap:wrap;gap:6px">
+         <div><input id="newUserName" type="text" placeholder="username" autocomplete="off"></div>
+         <div><input id="newUserPass" type="password" placeholder="password" autocomplete="new-password"></div>
+         <div style="flex:0 0 auto">
+           <select id="newUserRole">
+             <option value="user">user</option>
+             <option value="admin">admin</option>
+           </select>
+         </div>
+         <div style="flex:0 0 auto"><button class="primary" onclick="createUser()" data-tip="Create this local user." title="Add user">Add user</button></div>
+         <div style="flex:0 0 auto"><button onclick="loadUsers()" title="Refresh user list">Refresh</button></div>
+       </div>
+     </div>
+
+     <div data-mg="agents" class="panel admin-only">
+       <h3 data-tip="Define named agents and exactly what each one is allowed to do.">Agents</h3>
+       <div class="hint">
+         An agent is a named profile that switches on capabilities. It only gets the
+         tools you enable here &mdash; file operations, running code, web &amp; APIs,
+         your knowledge base, memory, or Office&nbsp;365. Create a few specialised
+         agents, then run several together on one task below.
+       </div>
+       <div id="agentsList" style="margin-top:10px">loading...</div>
+
+       <label style="display:block;font-size:12px;color:var(--muted);margin:14px 0 4px">New agent</label>
+       <div class="row">
+         <div><input id="newAgentName" type="text" placeholder="name, e.g. Coder" autocomplete="off"></div>
+       </div>
+       <div class="row" style="margin-top:6px">
+         <div><input id="newAgentDesc" type="text" placeholder="what this agent is for (optional)" autocomplete="off"></div>
+       </div>
+       <div id="newAgentCaps" class="cap-grid" style="margin-top:8px"></div>
+       <div class="row" style="margin-top:8px">
+         <button class="primary" onclick="createAgent()" data-tip="Create this agent profile." title="Add agent">Add agent</button>
+         <button onclick="loadAgents()" title="Refresh agents">Refresh</button>
+       </div>
+
+       <label style="display:block;font-size:12px;color:var(--muted);margin:16px 0 4px">Run several agents on one task</label>
+       <div class="hint">Each selected agent works the task with only its own tools; their answers are merged into one.</div>
+       <div id="agentRunPick" class="cap-grid" style="margin-top:6px"></div>
+       <textarea id="agentRunPrompt" placeholder="describe the task for the selected agents..." style="width:100%;margin-top:6px;min-height:64px"></textarea>
+       <div class="row" style="margin-top:6px">
+         <button class="primary" onclick="runAgents()" data-tip="Run the selected agents together and merge their answers." title="Run together">Run together</button>
+       </div>
+       <div id="agentRunResult" style="margin-top:10px"></div>
+     </div>
+
+     <div data-mg="cluster" class="panel admin-only">
+       <h3 data-tip="Live health of the Mac Mini (primary) and Mac Studio (secondary), and how work was routed.">Cluster &amp; routing</h3>
+       <div class="hint">
+         Work is classified and routed automatically: the primary handles light
+         chat, heavy reasoning and large models prefer the high-memory secondary,
+         and a node that fails is skipped (with a cooldown and a half-open retry)
+         so the other keeps serving. Nothing here is a machine you pick by hand.
+       </div>
+       <div id="clusterNodes" class="logbox" style="max-height:none;margin-top:10px">loading...</div>
+       <div id="routingSummary" class="hint" style="margin-top:8px"></div>
+       <label style="display:block;font-size:12px;color:var(--muted);margin:12px 0 4px">Recent routing decisions</label>
+       <div id="routingEvents" class="logbox" style="max-height:260px">loading...</div>
+       <div class="row" style="margin-top:8px">
+         <button onclick="loadCluster()" data-tip="Refresh node health and routing history." title="Refresh cluster">Refresh</button>
+       </div>
+     </div>
      </div>
    </div>
 
@@ -314,7 +412,7 @@ UI_BODY = r"""</style>
      <h3>Prompt library</h3>
      <div class="hint">Save prompts you type often, then insert one into the message box with a click.</div>
      <div id="promptList" style="margin-top:10px">loading...</div>
-     <label style="display:block;font-size:12px;color:#999;margin:12px 0 4px">Save the current message box as</label>
+     <label style="display:block;font-size:12px;color:var(--muted);margin:12px 0 4px">Save the current message box as</label>
      <div class="row">
        <div><input id="promptName" type="text" placeholder="name, e.g. code-review"></div>
        <div style="flex:0 0 auto"><button onclick="savePrompt()" data-tip="Save whatever is in the message box under this name." title="Save prompt">Save</button></div>
@@ -325,7 +423,20 @@ UI_BODY = r"""</style>
    </aside>
 
    <aside id="settings">
-     <h3>Generation</h3>
+
+     <details class="sgroup" open>
+       <summary data-tip="Theme and look of the app.">Appearance</summary>
+       <div class="sbody">
+       <label>Colour scheme</label>
+       <div class="row">
+         <button id="themeBtn" onclick="toggleTheme()" data-tip="Switch between the light and dark colour scheme." title="Toggle theme">Light</button>
+       </div>
+       <div class="hint">Your choice is remembered in this browser.</div>
+       </div>
+     </details>
+     <details class="sgroup">
+       <summary data-tip="Prompt, reply length, temperature and context.">Generation</summary>
+       <div class="sbody">
      <label>System prompt</label>
      <textarea id="cfgSystem"></textarea>
      <div class="row">
@@ -350,15 +461,15 @@ UI_BODY = r"""</style>
      </div>
      <div class="meter"><div id="ctxBar"></div></div>
      <div class="hint" id="ctxHint">Context usage in this conversation.</div>
-
-     <h3 style="margin-top:18px">Agent</h3>
+       </div>
+     </details>
+     <details class="sgroup">
+       <summary data-tip="Tool use and step behaviour.">Agent</summary>
+       <div class="sbody">
      <div class="row">
        <div>
-         <label data-tip="Whether new chats start in agent mode (tools + step reasoning) or as plain single replies.">Enabled by default</label>
-         <select id="cfgAgent">
-           <option value="false">off</option>
-           <option value="true">on</option>
-         </select>
+         <label data-tip="Agent mode lets the model call tools (search, fetch, files, APIs) and reason in steps. Off = a plain single reply. Takes effect on your next message; Save keeps it as the default.">Agent mode</label>
+         <label class="agent-toggle" title="Toggle agent mode"><span class="switch"><input id="agentToggle" type="checkbox"><span class="slider"></span></span> tools + step reasoning</label>
        </div>
        <div>
          <label>Max steps</label>
@@ -388,8 +499,30 @@ UI_BODY = r"""</style>
        Context size takes effect on the next message. The KV cache size passed to
        the model server only changes on restart.
      </div>
-
-     <h3 style="margin-top:18px">Performance</h3>
+       </div>
+     </details>
+     <details class="sgroup">
+       <summary data-tip="Model, adapter and fine-tuning.">Models &amp; training</summary>
+       <div class="sbody">
+       <div class="hint">
+         Switching model, adapters, the knowledge base and the training set all
+         live in the admin area; these open it at the right section.
+       </div>
+       <div class="row" style="margin-top:8px;flex-wrap:wrap;gap:6px">
+         <button onclick="showAdminSection('models')" data-tip="Choose the model and LoRA adapter." title="Model manager">Model &amp; adapter</button>
+         <button onclick="showAdminSection('data')" data-tip="Your collected training examples and exports." title="Training data">Training data</button>
+         <button onclick="showAdminSection('knowledge')" data-tip="Index your own documents for retrieval." title="Knowledge base">Knowledge base</button>
+       </div>
+       <label style="margin-top:12px">Retraining</label>
+       <div class="row">
+         <button onclick="retrain()" data-tip="Fine-tune the model on your thumbs-up/down feedback so far (LoRA)." title="Retrain on feedback">Retrain on feedback</button>
+       </div>
+       <div class="hint">Runs a LoRA fine-tune from your approved answers.</div>
+       </div>
+     </details>
+     <details class="sgroup">
+       <summary data-tip="Speed, caching and prefill.">Performance</summary>
+       <div class="sbody">
      <div class="row">
        <div>
          <label data-tip="How much of a tool result is fed back to the model as context.">Tool result into context (chars)</label>
@@ -423,8 +556,11 @@ UI_BODY = r"""</style>
        Flat means the prefix is being reused.
      </div>
      <div class="hint" id="prefixWarn" style="display:none"></div>
-
-     <h3 style="margin-top:18px">Memory</h3>
+       </div>
+     </details>
+     <details class="sgroup">
+       <summary data-tip="Notes the assistant keeps.">Memory</summary>
+       <div class="sbody">
      <div class="row">
        <div><input id="memKey" type="text" placeholder="key"></div>
        <div><input id="memValue" type="text" placeholder="value"></div>
@@ -438,15 +574,20 @@ UI_BODY = r"""</style>
        Notes the agent stores with the remember tool, and anything you add here.
        They persist across restarts.
      </div>
-
-     <h3 style="margin-top:18px">Tools</h3>
+       </div>
+     </details>
+     <details class="sgroup">
+       <summary data-tip="Tools currently available.">Tools</summary>
+       <div class="sbody">
      <div class="tools-list" id="toolsList">loading...</div>
+
+       </div>
+     </details>
    </aside>
  </div>
 
  <footer id="composer">
    <textarea id="input" placeholder="Send a message. Shift+Enter for a new line." rows="1" data-tip="Type here. Enter sends, Shift+Enter adds a line. Paste large files freely; they are processed in chunks." title="Message input"></textarea>
-   <label class="agent-toggle" data-tip="Agent mode lets the model call tools (search, fetch, weather, calculator) and reason in steps. Off = a plain single reply." title="Toggle agent mode"><input id="agentToggle" type="checkbox"> agent</label>
    <button id="stopBtn" onclick="stopStream()" disabled data-tip="Stop the current response. Keeps whatever streamed so far." title="Stop generating">Stop</button>
    <button id="sendBtn" class="primary" onclick="send()" data-tip="Send your message (or press Enter)." title="Send message">Send</button>
  </footer>

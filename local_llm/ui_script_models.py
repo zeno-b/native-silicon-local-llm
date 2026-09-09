@@ -13,19 +13,49 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
      var box = document.getElementById("datasetStats");
      if (!box) return;
      try {
-       var s = await fetchJSON("/api/dataset/stats");
+       var s = (await fetchJSON("/api/dataset/stats")).data;
        var bySource = Object.keys(s.by_source || {})
          .map(function(k) { return k + ": " + s.by_source[k]; }).join(", ") || "none";
-       box.textContent =
-         "Total examples:       " + s.total + "\\n" +
-         "Approved (to imitate): " + s.approved + "\\n" +
-         "Rejected (bad answers): " + s.rejected + "\\n" +
-         "Corrections:          " + s.corrected + "\\n" +
-         "Preference pairs:     " + s.preference_pairs + "\\n" +
-         "Reviewed (curated):   " + s.reviewed + "\\n" +
-         "By source:            " + bySource;
+       var pending = s.pending || 0;
+       // Pad to the longest label instead of hand-counting spaces, which had
+       // already drifted out of alignment by one column.
+       var rows = [
+         ["Total examples", s.total],
+         ["Approved (to imitate)", s.approved],
+         ["Awaiting approval", pending],
+         ["Rejected (bad answers)", s.rejected],
+         ["Corrections", s.corrected],
+         ["Preference pairs", s.preference_pairs],
+         ["Reviewed (curated)", s.reviewed],
+         ["By source", bySource]
+       ];
+       var width = rows.reduce(function(w, r) { return Math.max(w, r[0].length); }, 0) + 2;
+       box.textContent = rows.map(function(r) {
+         return (r[0] + ":" + " ".repeat(width - r[0].length)) + r[1];
+       }).join("\n");
+       // The queue holds ratings from non-admin accounts, which never enter the
+       // shared adapter on their own. Only offer the button when it has work.
+       var btn = document.getElementById("approvePendingBtn");
+       if (btn) {
+         btn.hidden = pending === 0;
+         btn.textContent = "approve " + pending + " queued";
+       }
      } catch (err) {
        box.textContent = "Could not load dataset stats: " + err.message;
+     }
+   }
+
+   async function approvePendingFeedback() {
+     var btn = document.getElementById("approvePendingBtn");
+     if (btn) btn.disabled = true;
+     try {
+       var out = (await fetchJSON("/api/feedback/approve-pending", { method: "POST" })).data;
+       alert("Approved " + out.approved + " example(s) for training.");
+     } catch (err) {
+       alert("Could not approve: " + err.message);
+     } finally {
+       if (btn) btn.disabled = false;
+       loadDatasetStats();
      }
    }
 
@@ -54,9 +84,9 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
      var box = document.getElementById("projectStatus");
      if (!box) return;
      try {
-       var s = await fetchJSON("/api/project/status");
+       var s = (await fetchJSON("/api/project/status")).data;
        if (!s.project_dir) {
-         box.textContent = "No project set — file tools use the sandbox workspace.\\n"
+         box.textContent = "No project set — file tools use the sandbox workspace.\n"
            + "Set a project directory above to work on a local codebase.";
          var inp = document.getElementById("cfgProjectDir");
          if (inp && !inp.value) inp.value = "";
@@ -71,9 +101,9 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
        if (s.is_git_repo) {
          var st = (s.status || "").trim();
          lines.push("");
-         lines.push(st ? ("Uncommitted (git status):\\n" + st) : "Working tree clean.");
+         lines.push(st ? ("Uncommitted (git status):\n" + st) : "Working tree clean.");
        }
-       box.textContent = lines.join("\\n");
+       box.textContent = lines.join("\n");
        var hint = document.getElementById("sandboxHint");
        if (hint) {
          var exec = [];
@@ -102,8 +132,13 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
      var pre = document.getElementById("projectDiff");
      if (!pre) return;
      try {
-       var d = await fetchJSON("/api/project/diff");
-       if (!d.is_git_repo) { pre.style.display = "block"; pre.textContent = "Not a git repository — no diff available."; return; }
+       var d = (await fetchJSON("/api/project/diff")).data;
+       pre.style.display = "block";
+       if (!d.project_dir) {
+         pre.textContent = "No project set — nothing to diff. Set a project directory above.";
+         return;
+       }
+       if (!d.is_git_repo) { pre.textContent = "Not a git repository — no diff available."; return; }
        pre.style.display = "block";
        pre.textContent = (d.diff && d.diff.trim()) ? d.diff : "No uncommitted changes.";
      } catch (err) {
@@ -114,12 +149,25 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
    async function saveProjectDir() {
      var val = (document.getElementById("cfgProjectDir").value || "").trim();
      try {
-       await fetchJSON("/api/config", {
+       var out = await fetchJSON("/api/config", {
          method: "POST",
          headers: { "Content-Type": "application/json" },
          body: JSON.stringify({ project_dir: val })
        });
-       alert(val ? ("Project set to " + val) : "Project cleared — using sandbox workspace.");
+       // Confirm the server actually took it. This used to alert success
+       // unconditionally, which hid the fact that the field was being dropped.
+       var d = out.data || {};
+       var applied = (d.config && d.config.project_dir) || "";
+       // Compare on "did the server end up with a project set", not on string
+       // equality: the server resolves ~ and symlinks, so /var/... legitimately
+       // comes back as /private/var/... .
+       if (val && !applied) {
+         alert("The server did not apply that project directory. It reported: "
+               + (applied || "(none)"));
+       } else {
+         alert(val ? ("Project set to " + applied)
+                   : "Project cleared — using sandbox workspace.");
+       }
        loadProjectStatus();
      } catch (err) {
        alert("Could not set project directory: " + err.message);
@@ -145,7 +193,7 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
      var box = document.getElementById("docsStats");
      if (!box) return;
      try {
-       var s = await fetchJSON("/api/docs/stats");
+       var s = (await fetchJSON("/api/docs/stats")).data;
        if (!s.enabled) { box.textContent = "Knowledge base unavailable."; return; }
        var lines = ["Documents: " + s.documents, "Passages:  " + s.chunks];
        if (s.search_mode && s.search_mode !== "fts5") {
@@ -157,7 +205,10 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
          s.items.slice(0, 15).forEach(function(i) {
            lines.push("  " + i.path + "  (" + i.chunks + " passages)");
          });
-         if (s.items.length > 15) lines.push("  ... and " + (s.items.length - 15) + " more");
+         // Count from the authoritative document total, not from `items` (which
+         // the API caps), or the two numbers on screen contradict each other.
+         var total = (typeof s.documents === "number") ? s.documents : s.items.length;
+         if (total > 15) lines.push("  ... and " + (total - 15) + " more");
        } else {
          lines.push("");
          lines.push("Nothing indexed yet — answers use the model's own knowledge.");
@@ -282,9 +333,20 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
                                { method: "POST" });
        var d = r.data || r;
        if (d.error) { alert(d.error); return; }
-       // Drop the last rendered answer, then re-send the same question.
-       var nodes = chat.querySelectorAll(".turn, .msg.assistant");
-       if (nodes.length) nodes[nodes.length - 1].remove();
+       // The server's regenerate drops BOTH sides of the exchange, so the page
+       // must too: removing only the answer left the old question on screen and
+       // send() then rendered it a second time (plus a stranded feedback bar).
+       var kids = Array.prototype.slice.call(chat.children);
+       var droppedAnswer = false;
+       for (var i = kids.length - 1; i >= 0; i--) {
+         var el = kids[i];
+         if (el.classList.contains("feedback")) { el.remove(); continue; }
+         if (!droppedAnswer && (el.classList.contains("turn")
+                                || el.classList.contains("assistant"))) {
+           el.remove(); droppedAnswer = true; continue;
+         }
+         if (droppedAnswer && el.classList.contains("user")) { el.remove(); break; }
+       }
        input.value = d.prompt;
        send();
      } catch (err) {
@@ -293,7 +355,8 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
    }
 
    function exportChat() {
-     window.location = "/api/conversation/" + encodeURIComponent(conversationId) + "/export?format=markdown";
+     downloadFile("/api/conversation/" + encodeURIComponent(conversationId) + "/export?format=markdown",
+                  "conversation-" + conversationId + ".md");
    }
 """
 

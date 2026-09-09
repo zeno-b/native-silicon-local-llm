@@ -6,36 +6,13 @@ Split out of the original single-file deploy.py; behaviour is unchanged.
 from __future__ import annotations
 
 import argparse
-import ast
-import asyncio
-import csv
-import html
-import hashlib
 import json
 import logging
-import math
-import operator
 import os
-import platform
-import random
-import re
-import shutil
 import signal
-import socket
-import sqlite3
-import traceback
-import shlex
-import subprocess
 import sys
-import textwrap
 import threading
 import time
-import urllib.parse
-import uuid
-from dataclasses import dataclass, field, asdict, replace as dataclass_replace
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, Literal
 
 from .core import *  # noqa: F401,F403
 from .obslog import *  # noqa: F401,F403
@@ -56,44 +33,15 @@ from .textutil import *  # noqa: F401,F403
 from .llm import *  # noqa: F401,F403
 
 
-def build_config(args) -> Config:
-    """Build a Config from parsed CLI args. Shared by serving and the
-    --print-config / --dump-prompt inspection flags so they see the same
-    configuration the server would actually run with."""
-    return Config(
-        model=args.model,
-        system_prompt=args.system_prompt,
-        model_port=args.model_port,
-        web_port=args.web_port,
-        train_iters=args.train_iters,
-        train_lr=args.train_lr,
-        train_seq_len=args.train_seq_len,
-        max_tokens=args.max_tokens,
-        auto_retrain_threshold=args.auto_retrain_threshold,
-        context_size=args.context_size,
-        max_kv_size=args.max_kv_size,
-        temperature=args.temperature,
-        history_turns=args.history_turns,
-        agent_enabled=args.agent,
-        agent_max_steps=args.agent_max_steps,
-        allow_python=args.allow_python,
-        allow_shell=args.allow_shell,
-        agent_tools=args.agent_tools,
-        allow_local_fetch=args.allow_local_fetch,
-        adapter=args.adapter,
-        model_catalog=args.model_catalog,
-        max_concurrent_tasks=args.max_concurrent_tasks,
-        search_backend=args.search_backend,
-        search_results=args.search_results,
-        seed_demo=args.seed_demo,
-        retrain_now=args.retrain_now,
-        export_only=args.export_only,
-        list_feedback=args.list_feedback,
-        export_format=args.export_format,
-    )
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI parser, extracted so tests can parse an empty argv.
 
-
-def main() -> None:
+    Value flags default to None on purpose: build_config() drops None so the
+    dataclass in config.py stays the single source of every default. When a
+    flag repeated a literal default here it silently SHADOWED the config
+    layer -- a 64GB machine ran a 4096-token context instead of the 32768 the
+    RAM-aware default computes, and trained with 30 iterations instead of 300.
+    """
     parser = argparse.ArgumentParser(
         description="All-in-one local LLM server, chat UI, feedback, and retraining loop."
     )
@@ -101,13 +49,13 @@ def main() -> None:
     parser.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT)
     parser.add_argument("--model-port", type=int, default=int(os.environ.get("MODEL_PORT", "8080")))
     parser.add_argument("--web-port", type=int, default=int(os.environ.get("WEB_PORT", "8000")))
-    parser.add_argument("--train-iters", type=int, default=int(os.environ.get("TRAIN_ITERS", "30")))
-    parser.add_argument("--train-lr", default=os.environ.get("TRAIN_LR", "1e-4"))
-    parser.add_argument("--train-seq-len", default=os.environ.get("TRAIN_SEQ_LEN", "256"))
+    parser.add_argument("--train-iters", type=int, default=None)
+    parser.add_argument("--train-lr", default=None)
+    parser.add_argument("--train-seq-len", default=None)
     parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("MAX_TOKENS", "512")))
     parser.add_argument("--auto-retrain-threshold", type=int, default=int(os.environ.get("AUTO_RETRAIN_THRESHOLD", "0")))
 
-    parser.add_argument("--context-size", type=int, default=int(os.environ.get("CONTEXT_SIZE", "4096")),
+    parser.add_argument("--context-size", type=int, default=None,
                         help="Token budget this process enforces when assembling a request.")
     parser.add_argument("--max-kv-size", type=int, default=int(os.environ.get("MAX_KV_SIZE", "0")),
                         help="KV cache cap passed to mlx_lm.server. 0 leaves it unbounded.")
@@ -168,6 +116,55 @@ def main() -> None:
     parser.add_argument("--print-config", action="store_true",
                         help="Print the resolved configuration (after env, flags, and clamps), then exit.")
     parser.add_argument("--export-format", choices=["jsonl", "csv"], default="jsonl")
+    return parser
+
+
+def build_config(args) -> Config:
+    """Build a Config from parsed CLI args. Shared by serving and the
+    --print-config / --dump-prompt inspection flags so they see the same
+    configuration the server would actually run with.
+
+    Only arguments the user actually supplied are forwarded: a None means "not
+    given", so the field keeps the default config.py computes (several of which
+    are RAM-aware). Passing every arg unconditionally is what let argparse
+    literals override the RAM-derived context window and training defaults.
+    """
+    supplied = {
+        "model": args.model,
+        "system_prompt": args.system_prompt,
+        "model_port": args.model_port,
+        "web_port": args.web_port,
+        "train_iters": args.train_iters,
+        "train_lr": args.train_lr,
+        "train_seq_len": args.train_seq_len,
+        "max_tokens": args.max_tokens,
+        "auto_retrain_threshold": args.auto_retrain_threshold,
+        "context_size": args.context_size,
+        "max_kv_size": args.max_kv_size,
+        "temperature": args.temperature,
+        "history_turns": args.history_turns,
+        "agent_enabled": args.agent,
+        "agent_max_steps": args.agent_max_steps,
+        "allow_python": args.allow_python,
+        "allow_shell": args.allow_shell,
+        "agent_tools": args.agent_tools,
+        "allow_local_fetch": args.allow_local_fetch,
+        "adapter": args.adapter,
+        "model_catalog": args.model_catalog,
+        "max_concurrent_tasks": args.max_concurrent_tasks,
+        "search_backend": args.search_backend,
+        "search_results": args.search_results,
+        "seed_demo": args.seed_demo,
+        "retrain_now": args.retrain_now,
+        "export_only": args.export_only,
+        "list_feedback": args.list_feedback,
+        "export_format": args.export_format,
+    }
+    return Config(**{k: v for k, v in supplied.items() if v is not None})
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.selftest:

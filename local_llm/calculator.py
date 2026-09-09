@@ -5,49 +5,23 @@ Split out of the original single-file deploy.py; behaviour is unchanged.
 
 from __future__ import annotations
 
-import argparse
 import ast
-import asyncio
-import csv
-import html
-import hashlib
-import json
-import logging
 import math
 import operator
 import os
-import platform
-import random
-import re
-import shutil
-import signal
-import socket
-import sqlite3
-import traceback
-import shlex
-import subprocess
-import sys
-import textwrap
-import threading
-import time
-import urllib.parse
-import uuid
-from dataclasses import dataclass, field, asdict, replace as dataclass_replace
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, Literal
+from typing import Any
 
 from .core import *  # noqa: F401,F403
 
 
-# the process. safe_eval runs in the web process, on the request thread, with
-# no subprocess timeout around it the way run_python and run_shell have, so an
-# unbounded intermediate takes the whole app down rather than one tool call.
-# 65536 bits is a 19,728-digit number, past any real calculator use.
 # Calculator safety bounds. These cap the only two whitelisted operations whose
 # cost is not bounded by expression length (exponentiation and factorial), so a
-# seven-character expression cannot allocate until the process dies. Configurable
-# for anyone who needs bigger numbers on a bigger machine.
+# seven-character expression like 9**9**9 cannot allocate until it kills the
+# process. safe_eval runs in the web process, on the request thread, with no
+# subprocess timeout around it the way run_python and run_shell have, so an
+# unbounded intermediate takes the whole app down rather than one tool call.
+# 65536 bits is a 19,728-digit number, past any real calculator use; both are
+# configurable for anyone who needs bigger numbers on a bigger machine.
 MAX_RESULT_BITS = int(os.environ.get("CALC_MAX_RESULT_BITS", str(1 << 16)))
 MAX_FACTORIAL_INPUT = int(os.environ.get("CALC_MAX_FACTORIAL", "1000"))
 

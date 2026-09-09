@@ -207,7 +207,7 @@ class Auth:
                 ip = request.client.host if request.client else None
                 ua = request.headers.get("user-agent")
         except Exception:
-            pass
+            pass      # ip/ua are audit niceties; never block a login for them
         self.db.create_session(self._hash_token(token), user["id"], iso(expires), ip, ua)
         self.db.touch_login(user["id"])
         return token
@@ -295,15 +295,6 @@ class Auth:
                       route=str(getattr(request, "url", "")), user_id=user["id"],
                       role=user.get("role"))
             raise HTTPException(status_code=403, detail="administrator access required")
-        return user
-
-    async def optional_user(self, request: Request) -> dict | None:
-        user = self.user_for_request(request)
-        if user:
-            bind_context(user_id=user["id"], username=user.get("username"),
-                         role=user.get("role"))
-            set_acting_user(user["id"])
-            request.state.user = user
         return user
 
     # ---- inter-node token ------------------------------------------------- #
@@ -415,9 +406,10 @@ class Auth:
         # Expiry.
         if int(claims.get("exp", 0)) < int(time.time()) - 60:
             raise ValueError("id_token expired")
-        # Nonce replay protection.
-        if nonce and claims.get("nonce") and claims["nonce"] != nonce:
-            raise ValueError("id_token nonce mismatch")
+        # Nonce replay protection: if we issued a nonce (we always do), the token
+        # MUST carry a matching one — a missing nonce is a failure, not a pass.
+        if nonce and claims.get("nonce") != nonce:
+            raise ValueError("id_token nonce missing or mismatched")
         # Optional signature verification if cryptography is available.
         self._maybe_verify_signature(id_token, disc)
         return claims

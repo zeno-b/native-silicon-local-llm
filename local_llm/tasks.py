@@ -5,39 +5,14 @@ Split out of the original single-file deploy.py; behaviour is unchanged.
 
 from __future__ import annotations
 
-import argparse
-import ast
 import asyncio
-import csv
-import html
-import hashlib
-import json
 import logging
-import math
-import operator
-import os
-import platform
-import random
-import re
-import shutil
-import signal
-import socket
-import sqlite3
-import traceback
-import shlex
-import subprocess
-import sys
-import textwrap
-import threading
 import time
-import urllib.parse
-import uuid
-from dataclasses import dataclass, field, asdict, replace as dataclass_replace
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, Literal
+from dataclasses import replace as dataclass_replace
+from typing import AsyncGenerator
 
 from .core import *  # noqa: F401,F403
+from .obslog import *  # noqa: F401,F403
 from .config import *  # noqa: F401,F403
 from .database import *  # noqa: F401,F403
 from .agent import *  # noqa: F401,F403
@@ -97,7 +72,7 @@ class TaskRun:
             try:
                 queue.put_nowait(None)
             except asyncio.QueueFull:
-                pass
+                pass  # a subscriber too slow to take the sentinel is already gone
 
 
 class TaskManager:
@@ -176,7 +151,7 @@ class TaskManager:
             try:
                 await self._scheduler
             except (asyncio.CancelledError, Exception):
-                pass
+                pass      # we asked it to stop; whatever it raises is not news
         # Wait on the run tasks themselves. Polling self.active only observed
         # the bookkeeping dict, so a runner still unwinding its finally block
         # could outlive shutdown and write to a closed database.
@@ -291,9 +266,16 @@ class TaskManager:
                 agent = Agent(task_config, registry,
                               ModelClient(task_config, cluster=self.cluster))
 
+                # Attribute this run to the task's owner so RAG retrieval, memory
+                # writes and knowledge indexing scope to that user, not 'local'.
+                owner = task.get("user_id") or SENTINEL_LOCAL_USER
+                set_acting_user(owner)
+
                 history: list[dict] = []
                 if task.get("use_history"):
-                    rows = self.db.get_messages(conversation_id, limit=self.config.history_turns * 2)
+                    rows = self.db.get_messages(conversation_id,
+                                                limit=self.config.history_turns * 2,
+                                                user_id=owner)
                     history = [{"role": r["role"], "content": r["content"]} for r in rows]
 
                 async for event in agent.run(
@@ -311,8 +293,8 @@ class TaskManager:
                         status = "cancelled"
 
                 if task.get("use_history") and answer:
-                    self.db.add_message(conversation_id, "user", task["goal"])
-                    self.db.add_message(conversation_id, "assistant", answer)
+                    self.db.add_message(conversation_id, "user", task["goal"], user_id=owner)
+                    self.db.add_message(conversation_id, "assistant", answer, user_id=owner)
 
         except asyncio.CancelledError:
             status = "cancelled"
@@ -458,7 +440,7 @@ def append_task_log(line: str) -> None:
         with open(LOG_DIR / LOG_FILES["tasks"], "a", encoding="utf-8") as handle:
             handle.write(f"[{iso(utc_now())}] {line}\n")
     except OSError:
-        pass
+        pass          # a task log write must never fail the task itself
 
 
 

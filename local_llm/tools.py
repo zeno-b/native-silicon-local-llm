@@ -5,37 +5,20 @@ Split out of the original single-file deploy.py; behaviour is unchanged.
 
 from __future__ import annotations
 
-import argparse
-import ast
-import asyncio
-import csv
-import html
-import hashlib
 import json
 import logging
-import math
-import operator
-import os
-import platform
-import random
 import re
-import shutil
-import signal
-import socket
-import sqlite3
 import traceback
 import shlex
 import subprocess
 import sys
-import textwrap
 import threading
 import time
 import urllib.parse
-import uuid
-from dataclasses import dataclass, field, asdict, replace as dataclass_replace
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, Literal
+from typing import Any, Callable
 
 from .core import *  # noqa: F401,F403
 from .obslog import *  # noqa: F401,F403
@@ -398,9 +381,23 @@ class ToolRegistry:
                 handler=self._run_tests,
             ))
 
+        # Office 365 (Microsoft Graph) tools. Registered ONLY when an Azure AD app
+        # is configured: every registered tool's description is re-sent in the
+        # agent system prompt on every step, so three unusable tools were pure
+        # prefill cost on an 8GB machine. The "office365" capability allowlists
+        # them once they exist.
+        if self._o365_configured():
+            self._register_o365()
+
         allow = {name.strip() for name in (self.config.agent_tools or "").split(",") if name.strip()}
         if allow:
-            unknown = allow - set(self._tools)
+            # Some tools only exist under the right configuration (shell/python
+            # execution, a connected Office 365 app). An agent whose capabilities
+            # include them is not misconfigured, so their absence is expected and
+            # must not be reported as a bad tool name.
+            conditional = {"run_shell", "run_python", "run_tests",
+                           "o365_mail", "o365_files", "o365_calendar"}
+            unknown = allow - set(self._tools) - conditional
             if unknown:
                 log(f"AGENT_TOOLS names tools that do not exist: {', '.join(sorted(unknown))}",
                     logging.WARNING)
@@ -435,42 +432,85 @@ class ToolRegistry:
             if max_chars:
                 limit = min(self.config.tool_raw_chars, max(200, int(max_chars)))
         except (TypeError, ValueError):
-            pass
+            pass      # the model passed a non-number: keep the configured cap
         # Read a bounded number of bytes rather than resp.text. An unbounded
         # read of a large file is how a tool call turns into an out-of-memory
         # kill on a machine with 8GB shared between the app and the model.
         byte_cap = min(MAX_FETCH_BYTES, max(4096, limit * 8))
+        # Follow redirects MANUALLY so every hop is SSRF-checked BEFORE it is
+        # fetched. With httpx's follow_redirects=True the guard only saw the first
+        # and the final URL, so a public link that 30x-redirected to
+        # 169.254.169.254 or 127.0.0.1:<port> was actually connected to before any
+        # validation. Now each Location is validated first, with a hop cap.
+        chunks: list[bytes] = []
+        total = 0
+        content_type = ""
+        encoding = "utf-8"
+        current = url
+        is_pdf = False
+        cap_bytes = byte_cap
         with httpx.Client(
             timeout=self.config.tool_timeout,
-            follow_redirects=True,
+            follow_redirects=False,
             headers={"User-Agent": USER_AGENT},
         ) as client:
-            with client.stream("GET", url) as resp:
-                resp.raise_for_status()
+            for _hop in range(10):
                 if not self.config.allow_local_fetch:
-                    guard_public_url(str(resp.url))
-                content_type = resp.headers.get("content-type", "").lower()
-                if content_type and not any(
-                    kind in content_type
-                    for kind in ("text/", "json", "xml", "html", "javascript", "csv")
-                ):
-                    return f"{url}\n\n[skipped: unsupported content type {content_type}]"
-                chunks: list[bytes] = []
-                total = 0
-                for chunk in resp.iter_bytes():
-                    chunks.append(chunk)
-                    total += len(chunk)
-                    if total >= byte_cap:
-                        break
-                encoding = resp.encoding or "utf-8"
-        body = b"".join(chunks).decode(encoding, "replace")
+                    guard_public_url(current)
+                with client.stream("GET", current) as resp:
+                    if resp.is_redirect and resp.headers.get("location"):
+                        current = str(resp.url.join(resp.headers["location"]))
+                        continue  # validate + fetch the next hop on the next loop
+                    resp.raise_for_status()
+                    content_type = resp.headers.get("content-type", "").lower()
+                    # Decide what to read BEFORE reading it. Headers alone rule
+                    # out two whole classes of waste: an unsupported type is
+                    # rejected without pulling a byte, and HTML/JSON stops at
+                    # byte_cap (~160KB) instead of the 2MB PDF ceiling, which is
+                    # all that was ever kept anyway. Deciding after the download
+                    # meant a large page cost ~12x the bandwidth, wall-clock and
+                    # peak memory of the text it contributed.
+                    path_only = str(resp.url).lower().split("?", 1)[0].split("#", 1)[0]
+                    is_pdf = "pdf" in content_type or path_only.endswith(".pdf")
+                    if not is_pdf and content_type and not any(
+                        kind in content_type
+                        for kind in ("text/", "json", "xml", "html", "javascript", "csv")
+                    ):
+                        return f"{url}\n\n[skipped: unsupported content type {content_type}]"
+                    # A PDF's extractable text is far smaller than its raw bytes,
+                    # so it alone is allowed the full MAX_FETCH_BYTES.
+                    cap_bytes = MAX_FETCH_BYTES if is_pdf else byte_cap
+                    for chunk in resp.iter_bytes():
+                        chunks.append(chunk)
+                        total += len(chunk)
+                        if total >= cap_bytes:
+                            break
+                    encoding = resp.encoding or "utf-8"
+                    break
+            else:
+                raise ValueError("too many redirects")
+        data = b"".join(chunks)
+        # Binary content with an empty/missing Content-Type slips past the
+        # header check above and would decode into replacement-character
+        # garbage; detect it by NUL bytes in the body instead.
+        if not is_pdf and b"\x00" in data[:4096]:
+            return f"{url}\n\n[skipped: binary content]"
+        if len(data) > cap_bytes:
+            data = data[:cap_bytes]        # the final chunk can overshoot
+        total = len(data)
+        if is_pdf:
+            import io
+            text = self._extract_pdf(io.BytesIO(data), limit)
+            truncated = "\n\n[truncated: PDF exceeded the fetch byte cap]" if total >= cap_bytes else ""
+            return (f"{url}\n\n" + text)[:limit] + truncated
+        body = data.decode(encoding, "replace")
         text = strip_html(body) if "html" in content_type or "<" in body[:200] else body
         title = ""
         match = re.search(r"(?is)<title[^>]*>(.*?)</title>", body)
         if match:
             title = strip_html(match.group(1))
         header = f"{title}\n{url}\n\n" if title else f"{url}\n\n"
-        truncated = "\n\n[truncated]" if total >= byte_cap else ""
+        truncated = "\n\n[truncated]" if total >= cap_bytes else ""
         return (header + text)[:limit] + truncated
 
     def _calculator(self, expression: str) -> str:
@@ -586,7 +626,7 @@ class ToolRegistry:
             if proc.returncode == 0:
                 return proc.stdout[:limit]
         except Exception:
-            pass
+            pass      # no git, or not a repo: fall back to the plain search below
         return ""
 
     def _root(self) -> Path:
@@ -780,15 +820,23 @@ class ToolRegistry:
                 f"top-level: {shape(data)}\n\nhead:\n{pretty[:cap - 200]}")
 
     def _read_pdf(self, target: Path, cap: int) -> str:
+        return self._extract_pdf(str(target), cap)
+
+    @staticmethod
+    def _extract_pdf(source: Any, cap: int) -> str:
+        """Extract text from a PDF given a path string or a binary stream
+        (BytesIO). Shared by the file reader and the URL fetcher."""
         for mod, fn in (("pypdf", "PdfReader"), ("PyPDF2", "PdfReader")):
             try:
                 m = __import__(mod)
-                reader = getattr(m, fn)(str(target))
-                text = "\n".join((p.extract_text() or "") for p in reader.pages)
-                return (f"[pdf: {len(reader.pages)} pages]\n\n" + text.strip())[:cap] or \
-                       f"[pdf: {len(reader.pages)} pages, no extractable text (scanned?)]"
             except ImportError:
-                continue
+                continue  # try the next library
+            try:
+                reader = getattr(m, fn)(source)
+                text = "\n".join((p.extract_text() or "") for p in reader.pages).strip()
+                if not text:
+                    return f"[pdf: {len(reader.pages)} pages, no extractable text (scanned?)]"
+                return (f"[pdf: {len(reader.pages)} pages]\n\n" + text)[:cap]
             except Exception as exc:
                 return f"[could not extract pdf text: {exc}]"
         return "[pdf detected but no PDF library installed. `pip install pypdf` to read PDFs.]"
@@ -861,7 +909,7 @@ class ToolRegistry:
             return f"Could not fetch {url}: {type(exc).__name__}: {exc}"
         if not text or len(text.strip()) < 50:
             return f"Nothing substantial to index from {url}."
-        n = self.db.index_document(url, text, url)
+        n = self.db.index_document(url, text, url, user_id=get_acting_user())
         return f"Indexed {url} into the knowledge base ({n} passages)."
 
     def _search_docs(self, query: str, limit: Any = None) -> str:
@@ -869,7 +917,10 @@ class ToolRegistry:
             k = min(10, max(1, int(limit)))
         except (TypeError, ValueError):
             k = 5
-        hits = self.db.search_documents(query, limit=k) if self.db else []
+        # Scope to the acting user's own + shared documents so the tool never
+        # surfaces another user's imported/indexed material.
+        hits = (self.db.search_documents(query, limit=k, user_id=get_acting_user())
+                if self.db else [])
         if not hits:
             return "No matching passages in the knowledge base."
         out = []
@@ -898,7 +949,8 @@ class ToolRegistry:
             if not text or text.startswith("[binary file"):
                 skipped += 1
                 continue
-            n = self.db.index_document(self._rel(f), text, f.name)
+            n = self.db.index_document(self._rel(f), text, f.name,
+                                       user_id=get_acting_user())
             chunks += n
             indexed += 1
         if not files:
@@ -929,7 +981,7 @@ class ToolRegistry:
                 lines = sum(1 for _ in target.open(encoding="utf-8", errors="replace"))
                 info.append(f"lines: {lines}")
             except Exception:
-                pass
+                pass  # unreadable: report the rest of the metadata, not an error
         return "\n".join(info)
 
     def _write_file(self, path: str, content: str) -> str:
@@ -1031,7 +1083,8 @@ class ToolRegistry:
             count = min(20, max(1, int(limit)))
         except (TypeError, ValueError):
             count = 5
-        rows = self.db.list_feedback(limit=count, search=query)
+        # Only the acting user's own feedback — never another user's prompts/answers.
+        rows = self.db.list_feedback(limit=count, search=query, user_id=get_acting_user())
         if not rows:
             return "No matching feedback."
         lines = []
@@ -1040,6 +1093,67 @@ class ToolRegistry:
             lines.append(f"Q: {row.get('user_prompt', '')}\nA: {answer}")
         return "\n\n".join(lines)
 
+    def _register_o365(self) -> None:
+        """Register the Graph-backed tools. Called only when O365_* is configured."""
+        self._add(Tool(
+            name="o365_mail",
+            description="Read or send Office 365 / Outlook mail via Microsoft Graph.",
+            parameters={"action": "read | send", "query": "search/filter for read",
+                        "to": "recipient (send)", "subject": "subject (send)",
+                        "body": "message body (send)"},
+            required=["action"],
+            handler=self._o365_mail,
+        ))
+        self._add(Tool(
+            name="o365_files",
+            description="Browse or fetch OneDrive / SharePoint files via Microsoft Graph.",
+            parameters={"action": "list | get", "path": "folder or file path"},
+            required=["action"],
+            handler=self._o365_files,
+        ))
+        self._add(Tool(
+            name="o365_calendar",
+            description="Read Office 365 calendar events via Microsoft Graph.",
+            parameters={"window": "e.g. today | week | a date range"},
+            required=[],
+            handler=self._o365_calendar,
+        ))
+
+    # ---- Office 365 / Microsoft Graph (framework; connect later) --------- #
+    def _o365_configured(self) -> bool:
+        c = self.config
+        return bool(c.o365_tenant_id and c.o365_client_id and c.o365_client_secret)
+
+    def _o365(self, service: str, **kwargs: Any) -> str:
+        """Shared Office 365 entrypoint.
+
+        The connection framework is in place (config + capability + tools); live
+        Microsoft Graph calls are not wired yet, so this reports its state clearly
+        instead of failing. When O365_* is unset it tells the user how to connect;
+        when set it acknowledges the request and names what a live build would do.
+        """
+        if not self._o365_configured():
+            return ("Office 365 is not connected. An admin must register an Azure AD "
+                    "app and set O365_TENANT_ID, O365_CLIENT_ID and O365_CLIENT_SECRET "
+                    "(Settings -> Office 365), then this agent can use it.")
+        detail = ", ".join(f"{k}={v}" for k, v in kwargs.items() if v)
+        return (f"[office365:{service}] request accepted ({detail or 'no args'}). "
+                f"Connected app {self.config.o365_client_id[:8]}... on tenant "
+                f"{self.config.o365_tenant_id[:8]}... with scopes "
+                f"{self.config.o365_scopes}. Microsoft Graph calls are not enabled "
+                "in this build yet; the connection is configured and ready to be wired.")
+
+    def _o365_mail(self, action: str, query: str = "", to: str = "",
+                   subject: str = "", body: str = "") -> str:
+        return self._o365("mail", action=action, query=query, to=to,
+                          subject=subject, body=body)
+
+    def _o365_files(self, action: str, path: str = "") -> str:
+        return self._o365("files", action=action, path=path)
+
+    def _o365_calendar(self, window: str = "week") -> str:
+        return self._o365("calendar", window=window)
+
     def _remember(self, key: str, value: str) -> str:
         if self.db is None:
             return "Memory store unavailable."
@@ -1047,7 +1161,9 @@ class ToolRegistry:
         if not key:
             raise ValueError("key must not be empty")
         # Scope the note to the acting user (contextvar) so it is private to them.
-        self.db.remember(key, str(value), self.conversation_id,
+        # conversation id also comes from a contextvar: the registry is shared, so
+        # reading an instance attribute would race across concurrent requests.
+        self.db.remember(key, str(value), get_acting_conversation(),
                          user_id=get_acting_user())
         return f"Stored under {key}."
 
@@ -1174,7 +1290,10 @@ class ToolRegistry:
         """Run a tool. Returns (result text, error message or None)."""
         tool = self.get(name)
         start = time.time()
+        # Bind on the shared instance for backward compat, but the source of
+        # truth for tool handlers is the per-context contextvar (race-free).
         self.conversation_id = conversation_id
+        set_acting_conversation(conversation_id)
         if tool is None:
             error = f"Unknown tool: {name}. Available: {', '.join(self.names())}"
             if self.db:

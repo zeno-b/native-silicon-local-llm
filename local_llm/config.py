@@ -5,37 +5,10 @@ Split out of the original single-file deploy.py; behaviour is unchanged.
 
 from __future__ import annotations
 
-import argparse
-import ast
-import asyncio
-import csv
-import html
-import hashlib
-import json
 import logging
-import math
-import operator
 import os
-import platform
-import random
-import re
-import shutil
-import signal
-import socket
-import sqlite3
-import traceback
-import shlex
-import subprocess
-import sys
-import textwrap
-import threading
-import time
-import urllib.parse
-import uuid
-from dataclasses import dataclass, field, asdict, replace as dataclass_replace
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, Literal
+from dataclasses import dataclass, field, asdict
+from typing import Literal
 
 from .core import *  # noqa: F401,F403
 from .sysutil import *  # noqa: F401,F403
@@ -176,6 +149,11 @@ class Config:
     # stop. These exist to satisfy "never error or stop; step down and continue".
     resilient_retries: int = field(default_factory=lambda: int(os.environ.get("RESILIENT_RETRIES", "3")))
     min_max_tokens: int = field(default_factory=lambda: int(os.environ.get("MIN_MAX_TOKENS", "128")))
+    # Reply budget for a CODE request. The general max_tokens default (512) cuts a
+    # program off mid-function, which is what happened to a C++ CRUD answer: the
+    # text simply stopped at "std::string newTitle, new". Code gets more room,
+    # bounded by the context window at use time.
+    code_max_tokens: int = field(default_factory=lambda: int(os.environ.get("CODE_MAX_TOKENS", "1536")))
     # If the model server sends nothing for this many seconds mid-generation, the
     # request is treated as stalled: it raises, and the resilient loop retries
     # with a smaller budget instead of hanging. This is what turns "stuck" into
@@ -230,7 +208,21 @@ class Config:
     # How many background task runs may execute at once. The model server
     # serves one request at a time, so more than one mostly adds queueing.
     max_concurrent_tasks: int = field(default_factory=lambda: int(os.environ.get("MAX_CONCURRENT_TASKS", "1")))
+    # How many chat/agent generations may run at once, and how deep the queue
+    # behind them goes. Each in-flight generation holds its own KV cache in the
+    # same unified memory as the model weights, so this is a memory limit as much
+    # as a fairness one; the default scales with RAM.
+    max_concurrent_generations: int = field(default_factory=lambda: int(
+        os.environ.get("MAX_CONCURRENT_GENERATIONS")
+        or _default_concurrent_generations(TOTAL_RAM_GB)))
+    generation_queue_depth: int = field(default_factory=lambda: int(
+        os.environ.get("GENERATION_QUEUE_DEPTH", "4")))
     task_poll_seconds: int = field(default_factory=lambda: int(os.environ.get("TASK_POLL_SECONDS", "2")))
+    # Wall-clock cap for ONE agent inside a multi-agent run (/api/agents/run).
+    # Without it a wedged or unreachable model server holds the whole request
+    # open; on timeout that agent reports a failure and the others still return.
+    agent_run_timeout: float = field(default_factory=lambda: float(
+        os.environ.get("AGENT_RUN_TIMEOUT", "300")))
     # Seconds of interactive quiet before a scheduled run is allowed to start.
     chat_idle_seconds: int = field(default_factory=lambda: int(os.environ.get("CHAT_IDLE_SECONDS", "45")))
     # fetch_url refuses loopback and RFC1918 targets unless this is on, so a
@@ -361,6 +353,18 @@ class Config:
     oidc_default_role: str = field(default_factory=lambda: os.environ.get("OIDC_DEFAULT_ROLE", "user").strip())
 
     # ----------------------------------------------------------------- #
+    # Office 365 / Microsoft Graph (agent "office365" capability). These are the
+    # connection settings; with them unset the capability's tools return a clear
+    # "not configured" message instead of calling Graph, so the framework ships
+    # now and can be connected later by supplying an Azure AD app.
+    # ----------------------------------------------------------------- #
+    o365_tenant_id: str = field(default_factory=lambda: os.environ.get("O365_TENANT_ID", "").strip())
+    o365_client_id: str = field(default_factory=lambda: os.environ.get("O365_CLIENT_ID", "").strip())
+    o365_client_secret: str = field(default_factory=lambda: os.environ.get("O365_CLIENT_SECRET", ""))
+    o365_scopes: str = field(default_factory=lambda: os.environ.get(
+        "O365_SCOPES", "https://graph.microsoft.com/.default").strip())
+
+    # ----------------------------------------------------------------- #
     # Mac Mini (primary) / Mac Studio (secondary) cluster + routing
     # (see cluster.py). Single-node by default: with no STUDIO_NODE_URL the
     # router has one node (the local model server) and behaves as before.
@@ -371,17 +375,26 @@ class Config:
     # http://studio.local:8080 . Empty disables the secondary node entirely.
     studio_node_url: str = field(default_factory=lambda: os.environ.get("STUDIO_NODE_URL", "").strip())
     # A secondary advertises where its router/primary is (used for heartbeats).
-    primary_node_url: str = field(default_factory=lambda: os.environ.get("PRIMARY_NODE_URL", "").strip())
     # Shared secret for inter-node calls (sent as a bearer token). SECRET.
     node_token: str = field(default_factory=lambda: os.environ.get("NODE_TOKEN", ""))
     # Configurable routing factors. No arbitrary hard-coded thresholds.
     route_max_active_per_node: int = field(default_factory=lambda: int(os.environ.get("ROUTE_MAX_ACTIVE", "2")))
     route_queue_depth: int = field(default_factory=lambda: int(os.environ.get("ROUTE_QUEUE_DEPTH", "4")))
     route_cpu_pct: float = field(default_factory=lambda: float(os.environ.get("ROUTE_CPU_PCT", "85")))
+    # Load average per core at which a node counts as saturated. This is a RATIO
+    # (1.0 == fully committed), not a percentage: a healthy Mac routinely sits
+    # above 1.0, so the bar is deliberately well clear of normal operation.
+    route_load_ratio: float = field(default_factory=lambda: float(os.environ.get("ROUTE_LOAD_RATIO", "4")))
     route_mem_pct: float = field(default_factory=lambda: float(os.environ.get("ROUTE_MEM_PCT", "85")))
     # If the primary's recent latency exceeds this SLA (ms), eligible work spills
     # to the Studio. 0 disables the SLA factor.
     route_sla_ms: int = field(default_factory=lambda: int(os.environ.get("ROUTE_SLA_MS", "0")))
+    # Circuit breaker: after a node trips to UNAVAILABLE it is skipped for this
+    # long, then allowed a single half-open trial request. A success closes the
+    # breaker (back to healthy); a failure re-opens it for another cooldown. This
+    # lets a briefly-flapping Studio recover between heartbeats without hammering
+    # a genuinely-down node on every request.
+    route_cooldown_s: float = field(default_factory=lambda: float(os.environ.get("ROUTE_COOLDOWN_S", "20")))
     # Substrings that mark a model as "large" (needs the high-memory Studio).
     large_model_markers: str = field(default_factory=lambda: os.environ.get(
         "LARGE_MODEL_MARKERS", "14B,32B,70B,72B").strip())
@@ -408,6 +421,7 @@ class Config:
     # Fields whose value must never be returned by public() or written to a log.
     SECRET_FIELDS = (
         "admin_password", "test_password", "oidc_client_secret", "node_token",
+        "o365_client_secret",
     )
 
     # Settings the web UI is allowed to change at runtime. Anything not listed
@@ -430,14 +444,15 @@ class Config:
         "chunk_size_ratio", "auto_fetch_char_cap", "stall_timeout", "ready_wait_timeout",
         "resilient_retries", "min_max_tokens", "hard_step_cap",
         "show_internals", "retrieval_deadline", "exec_backend", "docker_image",
-        "test_command", "auto_iterate_rounds",
+        "test_command", "auto_iterate_rounds", "agent_run_timeout", "code_max_tokens",
         # Logging: enabling DEBUG/TRACE and disabling content logs at runtime.
         "log_level", "log_format", "log_chat_content",
         # Routing factors, tunable live so a two-Mac cluster can be dialled in.
         # (studio_node_url is NOT here: adding/removing a node is a topology
         # change that rebuilds the registry, so it needs a restart.)
         "route_max_active_per_node", "route_queue_depth", "route_cpu_pct",
-        "route_mem_pct", "route_sla_ms", "large_model_markers",
+        "route_mem_pct", "route_load_ratio", "route_sla_ms", "route_cooldown_s",
+        "large_model_markers",
         "heartbeat_interval", "heartbeat_timeout",
     )
 
@@ -566,7 +581,11 @@ class Config:
         self.route_queue_depth = min(100000, max(0, self.route_queue_depth))
         self.route_cpu_pct = min(100.0, max(1.0, self.route_cpu_pct))
         self.route_mem_pct = min(100.0, max(1.0, self.route_mem_pct))
+        self.route_load_ratio = min(64.0, max(0.0, self.route_load_ratio))
+        self.code_max_tokens = min(32768, max(256, self.code_max_tokens))
         self.route_sla_ms = min(3600000, max(0, self.route_sla_ms))
+        self.route_cooldown_s = min(3600.0, max(0.0, self.route_cooldown_s))
+        self.agent_run_timeout = min(3600.0, max(10.0, self.agent_run_timeout))
         self.heartbeat_interval = min(3600.0, max(1.0, self.heartbeat_interval))
         self.heartbeat_timeout = min(86400.0, max(2.0, self.heartbeat_timeout))
         self.node_probe_timeout = min(120.0, max(1.0, self.node_probe_timeout))
@@ -584,10 +603,104 @@ class Config:
 
 
 
+# --------------------------------------------------------------------------- #
+# Agent capabilities. An "agent" is a named profile that switches on a set of
+# capabilities; each capability maps to the concrete tools it unlocks, so the
+# admin picks *what an agent can do* in plain terms and the registry gates the
+# actual tools. Capabilities are the single source of truth for both the UI
+# (the checkboxes on the Agents screen) and the runtime (the tool allowlist).
+# --------------------------------------------------------------------------- #
+CAPABILITY_GROUPS = {
+    "file_ops": {
+        "label": "File operations",
+        "description": "Read, search, create and edit files in the project directory.",
+        "tools": ["read_file", "write_file", "edit_file", "list_files",
+                  "search_files", "file_info"],
+    },
+    "code_exec": {
+        "label": "Run code & shell",
+        "description": "Execute shell commands, run Python, and run the test suite "
+                       "(needs --allow-shell / --allow-python to be enabled on the server).",
+        "tools": ["run_shell", "run_python", "run_tests"],
+    },
+    "web_api": {
+        "label": "Web & APIs",
+        "description": "Search the web and fetch URLs / call HTTP APIs (DuckDuckGo Lite).",
+        "tools": ["web_search", "fetch_url"],
+    },
+    "knowledge": {
+        "label": "Knowledge base",
+        "description": "Retrieve answers from the user's indexed documents (RAG).",
+        "tools": [],  # RAG is a retrieval flag, not a tool; see rag_for_capabilities().
+    },
+    "memory": {
+        "label": "Memory",
+        "description": "Remember and recall notes and prior feedback across turns.",
+        "tools": ["remember", "recall_memory", "forget", "recall_feedback"],
+    },
+    "office365": {
+        "label": "Office 365",
+        "description": "Read/send mail, browse OneDrive/SharePoint files and read the "
+                       "calendar via Microsoft Graph (needs an Azure AD app; configured "
+                       "in Settings).",
+        "tools": ["o365_mail", "o365_files", "o365_calendar"],
+    },
+}
+
+# Tools every agent always has: the loop's exit condition plus harmless utilities
+# that need no permission. Never gated by a capability.
+ALWAYS_ON_TOOLS = ["final_answer", "calculator", "current_time", "weather"]
+
+# Order capabilities are shown in the UI.
+CAPABILITY_ORDER = ["file_ops", "code_exec", "web_api", "knowledge", "memory", "office365"]
+
+
+def tools_for_capabilities(capabilities) -> list[str]:
+    """The concrete tool allowlist unlocked by a set of capability keys.
+
+    Always includes ALWAYS_ON_TOOLS so the agent can still answer and do basic
+    utility work even with no capability enabled.
+    """
+    caps = set(capabilities or [])
+    allowed = list(ALWAYS_ON_TOOLS)
+    for key in CAPABILITY_ORDER:
+        if key in caps:
+            allowed.extend(CAPABILITY_GROUPS[key]["tools"])
+    # De-dupe, preserve order.
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in allowed:
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def rag_for_capabilities(capabilities) -> bool:
+    """Whether the knowledge-base (RAG) retrieval should be on for these caps."""
+    return "knowledge" in set(capabilities or [])
+
+
+def public_capabilities() -> list[dict]:
+    """Capability catalogue for the UI (key, label, description), in display order."""
+    return [
+        {"key": key,
+         "label": CAPABILITY_GROUPS[key]["label"],
+         "description": CAPABILITY_GROUPS[key]["description"]}
+        for key in CAPABILITY_ORDER
+    ]
+
+
 # Re-exported explicitly: the original file was one flat namespace, so private
 # helpers (leading underscore) must cross module boundaries too.
 __all__ = [
     'Config',
     '_DDG_LITE_ALIASES',
     '_normalize_search_backend',
+    'CAPABILITY_GROUPS',
+    'CAPABILITY_ORDER',
+    'ALWAYS_ON_TOOLS',
+    'tools_for_capabilities',
+    'rag_for_capabilities',
+    'public_capabilities',
 ]

@@ -5,37 +5,17 @@ Split out of the original single-file deploy.py; behaviour is unchanged.
 
 from __future__ import annotations
 
-import argparse
-import ast
+import contextlib
 import asyncio
-import csv
-import html
-import hashlib
-import json
 import logging
-import math
-import operator
 import os
 import platform
-import random
-import re
-import shutil
-import signal
-import socket
-import sqlite3
-import traceback
-import shlex
 import subprocess
 import sys
 import textwrap
-import threading
-import time
-import urllib.parse
-import uuid
-from dataclasses import dataclass, field, asdict, replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, Literal
+from typing import Any
 
 
 
@@ -73,7 +53,7 @@ def _detect_total_ram_gb() -> float:
         if out.returncode == 0 and out.stdout.strip().isdigit():
             return int(out.stdout.strip()) / (1024 ** 3)
     except Exception:
-        pass
+        pass          # no sysctl (or not macOS): fall through to os.sysconf
     try:
         return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1024 ** 3)
     except Exception:
@@ -148,6 +128,82 @@ def _default_fetch_cap(ram_gb: float) -> int:
     return 6000
 
 
+def _default_concurrent_generations(ram_gb: float) -> int:
+    """How many model generations may run at once on this machine.
+
+    Every in-flight generation holds its own KV cache in the same unified memory
+    as the model weights, so N concurrent chats cost roughly N caches on top of
+    the weights. An 8GB Mac running a 3B model has room for a couple; a 64GB
+    Studio running a 32B model has proportionally more. Override with
+    MAX_CONCURRENT_GENERATIONS.
+    """
+    if ram_gb >= 48:
+        return 4
+    if ram_gb >= 24:
+        return 3
+    return 2
+
+
+class GenerationBusy(Exception):
+    """Raised when the generation queue is full and the caller must retry."""
+
+
+class GenerationGate:
+    """Admission control for model generations: N running, a bounded queue.
+
+    Without it, every accepted request buys a KV cache, so enough simultaneous
+    chats will push a Mac into swap or an OOM kill instead of merely being slow.
+    A bounded waiting room is the other half: queueing without a limit just moves
+    the failure from memory exhaustion to requests timing out after minutes of
+    waiting, which is worse than an immediate, honest 503.
+    """
+
+    def __init__(self, limit: int, queue_multiplier: int = 4):
+        self.limit = max(1, int(limit))
+        self.max_waiting = self.limit * max(1, int(queue_multiplier))
+        self.waiting = 0
+        self._sem: asyncio.Semaphore | None = None
+        self._loop: Any = None
+
+    def _semaphore(self) -> asyncio.Semaphore:
+        # An asyncio.Semaphore belongs to the loop that first awaited it, and
+        # this process starts a fresh loop per test app, so rebind on a change.
+        loop = asyncio.get_running_loop()
+        if self._sem is None or self._loop is not loop:
+            self._sem, self._loop, self.waiting = asyncio.Semaphore(self.limit), loop, 0
+        return self._sem
+
+    async def acquire(self) -> None:
+        """Take one slot, waiting if others are running. Raises GenerationBusy
+        rather than queueing when the waiting room is already full."""
+        sem = self._semaphore()
+        if self.waiting >= self.max_waiting:
+            raise GenerationBusy(
+                f"{self.waiting} generations already queued; try again shortly")
+        self.waiting += 1
+        try:
+            await sem.acquire()
+        finally:
+            self.waiting -= 1
+
+    def release(self) -> None:
+        """Give the slot back. Never raises, so it is safe in a finally."""
+        try:
+            if self._sem is not None:
+                self._sem.release()
+        except (ValueError, RuntimeError):
+            pass          # already released, or the loop was torn down under us
+
+    @contextlib.asynccontextmanager
+    async def slot(self):
+        """Hold one generation slot for the duration of a block."""
+        await self.acquire()
+        try:
+            yield
+        finally:
+            self.release()
+
+
 # Total RAM is detected once at import. MODEL_ID overrides the RAM-based choice.
 TOTAL_RAM_GB = _detect_total_ram_gb()
 DEFAULT_MODEL = os.environ.get("MODEL_ID") or _default_model_for_ram(TOTAL_RAM_GB)
@@ -174,9 +230,15 @@ CHARS_PER_TOKEN = 4
 # instructions, and the model's own reply.
 CONTEXT_SAFETY_MARGIN = 256
 
+# Failed-login throttle: at most LOGIN_MAX_FAILURES failures per (client ip,
+# username) within LOGIN_WINDOW_S before the endpoint answers 429. scrypt makes
+# each verification expensive, so this protects CPU as much as credentials.
+LOGIN_MAX_FAILURES = int(os.environ.get("LOGIN_MAX_FAILURES", "8"))
+LOGIN_WINDOW_S = float(os.environ.get("LOGIN_WINDOW_S", "300"))
+
 # Bump when HTML_PAGE changes. Shown in the header and returned by /api/health so
 # a stale browser cache is immediately visible rather than silently misleading.
-UI_BUILD = "2026-08-07.9-glass"
+UI_BUILD = "2026-09-07.texcel"
 # Branding. Set APP_NAME to change the title shown in the header and browser tab.
 # Set APP_LOGO to a URL or a local path (rendered as an image) or to an emoji or
 # short text (rendered as-is). Both are safe to leave unset.
@@ -214,8 +276,10 @@ def in_venv() -> bool:
     return sys.prefix != sys.base_prefix or bool(os.environ.get("VIRTUAL_ENV"))
 
 
-REQUIRED_MODULES = ["mlx_lm", "fastapi", "uvicorn", "httpx", "pydantic"]
-REQUIRED_PACKAGES = ["mlx-lm", "fastapi", "uvicorn", "httpx", "pydantic"]
+# Note: the module name and the pip package name differ for python-multipart
+# (imported as `multipart`), so the two lists are intentionally not identical.
+REQUIRED_MODULES = ["mlx_lm", "fastapi", "uvicorn", "httpx", "pydantic", "pypdf", "multipart"]
+REQUIRED_PACKAGES = ["mlx-lm", "fastapi", "uvicorn", "httpx", "pydantic", "pypdf", "python-multipart"]
 # Guards the install-then-re-exec handoff. A package that installs cleanly but
 # still cannot be imported (mlx-lm off Apple Silicon, a broken wheel) otherwise
 # sends bootstrap round the same install and exec forever, with nothing on
@@ -365,6 +429,34 @@ def trim_to_context(
     while kept and fixed + messages_tokens(kept) > budget:
         kept.pop(0)
         dropped += 1
+
+    # If trimming took the MOST RECENT exchange, put an abbreviated version back.
+    # A follow-up almost always refers to the last turn ("it doesn't have a main
+    # function"), and one long answer -- a program, a big tool result -- is enough
+    # to evict it wholesale. The model then has no idea what is being discussed
+    # and answers something like "no". A shortened tail is far better than none:
+    # it keeps the thread while still respecting the budget.
+    if dropped and not kept:
+        room = budget - fixed
+        recovered: list[dict] = []
+        for message in reversed(history[-2:]):
+            if room <= 96:                      # not enough left to say anything
+                break
+            text = str(message.get("content") or "")
+            # ~4 characters per token, minus a little for the marker itself.
+            allowed_chars = max(0, (room - 32) * 4)
+            if len(text) > allowed_chars:
+                text = (text[:allowed_chars].rstrip()
+                        + "\n[... truncated to fit the context window ...]")
+            candidate = {"role": message.get("role", "user"), "content": text}
+            cost = messages_tokens([candidate])
+            if cost > room:
+                continue
+            recovered.insert(0, candidate)
+            room -= cost
+        if recovered:
+            kept = recovered
+            dropped = max(0, dropped - len(recovered))
     return [system, *pinned, *kept, user], dropped
 
 
@@ -413,6 +505,8 @@ __all__ = [
     'BOOTSTRAP_MARKER',
     'CHARS_PER_TOKEN',
     'CONTEXT_SAFETY_MARGIN',
+    'LOGIN_MAX_FAILURES',
+    'LOGIN_WINDOW_S',
     'DATA_DIR',
     'DB_PATH',
     'DEFAULT_MODEL',
@@ -433,6 +527,9 @@ __all__ = [
     '_DEFAULT_SYSTEM_PROMPT',
     '_default_context_for_ram',
     '_default_fetch_cap',
+    '_default_concurrent_generations',
+    'GenerationBusy',
+    'GenerationGate',
     '_default_model_for_ram',
     '_default_reasoning_tokens',
     '_detect_total_ram_gb',

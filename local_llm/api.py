@@ -5,37 +5,19 @@ Split out of the original single-file deploy.py; behaviour is unchanged.
 
 from __future__ import annotations
 
-import argparse
-import ast
 import asyncio
-import csv
 import html
-import hashlib
 import json
 import logging
-import math
-import operator
 import os
-import platform
-import random
-import re
-import shutil
-import signal
-import socket
-import sqlite3
 import traceback
-import shlex
 import subprocess
-import sys
-import textwrap
-import threading
 import time
-import urllib.parse
 import uuid
-from dataclasses import dataclass, field, asdict, replace as dataclass_replace
-from datetime import datetime, timezone
+from dataclasses import replace as dataclass_replace
+from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, Literal
+from typing import Any, AsyncGenerator
 
 from .core import *  # noqa: F401,F403
 from .obslog import *  # noqa: F401,F403
@@ -120,6 +102,11 @@ def _define_api_models() -> None:
         stable_prefix: bool | None = None
         summarise_tool_results: bool | None = None
         summarise_over_chars: int | None = Field(None, ge=500, le=100000)
+        # The local codebase the file tools work on. Absent from this schema the
+        # Set button in the Codebase panel was inert: Pydantic dropped the key
+        # before config.apply() saw it, so the UI reported success and nothing
+        # changed. "" clears it (back to the sandbox workspace).
+        project_dir: str | None = Field(None, max_length=1000)
 
     class ToolRequest(BaseModel):  # noqa: F811
         name: str = Field(..., min_length=1, max_length=64)
@@ -211,6 +198,7 @@ def create_app(
         finally:
             await tasks.stop()
             health_monitor.stop()
+            await ModelClient.aclose()   # release the pooled model connections
 
     app = FastAPI(title=f"{APP_NAME}", lifespan=lifespan)
     # Exposed so tests and the CLI can reach the scheduler without a global.
@@ -219,6 +207,42 @@ def create_app(
     app.state.router = router
     app.state.node_registry = node_registry
     app.state.importer = importer
+
+    # Admission control for model generations. Each in-flight generation holds
+    # its own KV cache in the same unified memory as the weights, so an
+    # unlimited number of simultaneous chats is an out-of-memory kill waiting to
+    # happen on an 8GB Mac; past the bounded queue callers get an honest 503
+    # instead of a request that eventually times out.
+    generation_gate = GenerationGate(config.max_concurrent_generations,
+                                     config.generation_queue_depth)
+
+    # Failed-login timestamps, keyed twice per attempt: "<ip>|<username>" stops
+    # guessing one account's password, and "<ip>|" stops a spray across many
+    # usernames from the same client (which the per-username key alone misses).
+    # Each bucket holds at most its own limit in timestamps, expired entries are
+    # dropped on touch, and _login_sweep() clears abandoned buckets, so the dict
+    # cannot grow without bound even under a rotating-username attack.
+    _login_failures: dict[str, list[float]] = {}
+
+    def _login_sweep(now: float) -> None:
+        """Drop buckets whose newest failure has aged out of the window."""
+        for key in [k for k, v in _login_failures.items()
+                    if not v or now - v[-1] >= LOGIN_WINDOW_S]:
+            _login_failures.pop(key, None)
+
+    def _login_blocked(now: float, key: str, limit: int) -> int:
+        """Seconds to wait before `key` may try again, or 0 when it may proceed."""
+        recent = [t for t in _login_failures.get(key, []) if now - t < LOGIN_WINDOW_S]
+        if recent:
+            _login_failures[key] = recent
+        else:
+            _login_failures.pop(key, None)
+        if len(recent) < limit:
+            return 0
+        return int(LOGIN_WINDOW_S - (now - recent[0])) + 1
+
+    def _login_record_failure(now: float, key: str, limit: int) -> None:
+        _login_failures[key] = (_login_failures.get(key, []) + [now])[-limit:]
 
     # RBAC dependency shortcuts. USER = any authenticated user (synthetic local
     # admin when auth is disabled); ADMIN = must have the admin role. Enforced
@@ -237,8 +261,9 @@ def create_app(
     @app.exception_handler(Exception)
     async def _unhandled(request: _Request, exc: Exception):
         cid = get_correlation_id()
-        # Redact the exception text: a stack/message can carry a URL with
-        # embedded credentials, a token echoed from a tool, etc.
+        # Keep the exception detail SERVER-SIDE only (redacted). The client gets a
+        # generic message plus the correlation id; the class/message/stack (which
+        # can carry SQL fragments, file paths, KeyError keys, etc.) never leaks.
         safe = redact_text(f"{type(exc).__name__}: {exc}")
         log_event(_req_log, logging.ERROR, "http.unhandled_error",
                   method=request.method, route=request.url.path,
@@ -247,7 +272,7 @@ def create_app(
         return JSONResponse(
             status_code=500,
             content={
-                "error": safe,
+                "error": "internal error",
                 "path": request.url.path,
                 "correlation_id": cid,
                 "hint": "This was logged. Quote the correlation_id when reporting it.",
@@ -267,8 +292,17 @@ def create_app(
     ]
     for extra in os.environ.get("ALLOWED_ORIGINS", "").split(","):
         extra = extra.strip()
-        if extra and extra not in _origins:
-            _origins.append(extra)
+        if not extra or extra in _origins:
+            continue
+        if extra == "*":
+            # Enforce the promise above instead of only stating it. Starlette
+            # echoes the caller's Origin when allow_origins contains "*" AND
+            # credentials are on, so a wildcard here would give EVERY site the
+            # user visits authenticated access to this API with their cookie.
+            log("ALLOWED_ORIGINS=* is refused: a wildcard cannot be combined with "
+                "cookie credentials. List the exact origin(s) instead.", logging.WARNING)
+            continue
+        _origins.append(extra)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=_origins,
@@ -311,9 +345,19 @@ def create_app(
             clear_context()
             raise
         response.headers["X-Correlation-ID"] = cid
-        # The index page and SSE streams are high-volume/low-signal at INFO.
+        # High-volume, low-signal requests (the index page, SSE streams, and the
+        # UI's 3-second status/log polls) are logged at DEBUG so app.log is not
+        # flooded; everything else stays at INFO. A non-2xx/3xx still logs at
+        # WARNING regardless, so failures of a poll route are never hidden.
         path = request.url.path
-        level = logging.DEBUG if (path == "/" or path.endswith("/stream")) else logging.INFO
+        routine = (path == "/" or path.endswith("/stream")
+                   or path == "/api/health" or path.startswith("/api/logs/"))
+        if response.status_code >= 400:
+            level = logging.WARNING
+        elif routine:
+            level = logging.DEBUG
+        else:
+            level = logging.INFO
         log_event(_req_log, level, "http.request",
                   method=request.method, route=path,
                   status=response.status_code,
@@ -346,12 +390,35 @@ def create_app(
     async def auth_login(body: dict, request: Request, response: Response):
         username = str(body.get("username", "")).strip()
         password = str(body.get("password", ""))
+        # Throttle failed attempts before spending any CPU on them. scrypt
+        # verification is deliberately slow, so an unthrottled endpoint is both a
+        # credential-guessing oracle and a CPU/memory amplifier: each try costs
+        # the server far more than it costs the attacker. A success clears both
+        # counters for that client, so a legitimate user who mistypes and then
+        # gets it right is never left locked out.
+        client_ip = request.client.host if request.client else "?"
+        user_key, ip_key = f"{client_ip}|{username.lower()}", f"{client_ip}|"
+        ip_limit = LOGIN_MAX_FAILURES * 3
+        now = time.time()
+        if len(_login_failures) > 512:
+            _login_sweep(now)
+        retry_in = (_login_blocked(now, user_key, LOGIN_MAX_FAILURES)
+                    or _login_blocked(now, ip_key, ip_limit))
+        if retry_in:
+            log_event(get_logger("auth"), logging.WARNING, "auth.login_throttled",
+                      username=username, client=client_ip, retry_in_s=retry_in)
+            return JSONResponse(
+                {"error": f"too many failed attempts; try again in {retry_in}s"},
+                status_code=429, headers={"Retry-After": str(retry_in)})
         user = await asyncio.to_thread(auth.authenticate_local, username, password)
         if not user:
+            _login_record_failure(now, user_key, LOGIN_MAX_FAILURES)
+            _login_record_failure(now, ip_key, ip_limit)
             log_event(get_logger("auth"), logging.WARNING, "auth.login_failed",
-                      username=username,
-                      client=(request.client.host if request.client else None))
+                      username=username, client=client_ip)
             return JSONResponse({"error": "invalid username or password"}, status_code=401)
+        _login_failures.pop(user_key, None)
+        _login_failures.pop(ip_key, None)
         token = auth.create_session(user, request)
         auth.set_cookie(response, token)
         log_event(get_logger("auth"), logging.INFO, "auth.login",
@@ -361,8 +428,15 @@ def create_app(
     @app.post("/api/auth/logout")
     def auth_logout(request: Request, response: Response):
         token = auth._token_from_request(request)
+        # Resolve who is logging out (before the session is destroyed) so logout
+        # is in the audit trail too, not just login.
+        user = auth.resolve_token(token) if token else None
         auth.logout(token)
         auth.clear_cookie(response)
+        if user:
+            log_event(get_logger("auth"), logging.INFO, "auth.logout",
+                      user_id=user["id"], username=user.get("username"),
+                      role=user.get("role"))
         return {"ok": True}
 
     @app.get("/api/auth/me")
@@ -397,12 +471,13 @@ def create_app(
                         or f"{request.url.scheme}://{request.url.netloc}/api/auth/oidc/callback")
         try:
             user = await asyncio.to_thread(auth.oidc_exchange, code, state, redirect_uri)
+            token = auth.create_session(user, request)
+            resp = RedirectResponse("/", status_code=303)
+            auth.set_cookie(resp, token)
         except Exception as exc:
+            log(f"oidc_callback failed: {type(exc).__name__}: {exc}", logging.WARNING)
             return HTMLResponse(f"<p>Login failed: {html.escape(redact_text(str(exc)))}. "
                                 "<a href='/'>Back</a></p>", status_code=400)
-        token = auth.create_session(user, request)
-        resp = RedirectResponse("/", status_code=303)
-        auth.set_cookie(resp, token)
         log_event(get_logger("auth"), logging.INFO, "auth.oidc_login",
                   user_id=user["id"], role=user["role"])
         return resp
@@ -441,10 +516,11 @@ def create_app(
             updates["password_hash"] = hash_password(str(body["password"]))
         if not updates:
             return JSONResponse({"error": "nothing to update"}, status_code=400)
-        # Never lock everyone out: keep at least one enabled admin.
-        losing_admin = (target["role"] == "admin"
+        # Never lock everyone out: keep at least one ENABLED admin (a disabled
+        # admin cannot log in, so it must not count toward the guard).
+        losing_admin = (target["role"] == "admin" and not target.get("disabled")
                         and (updates.get("role") == "user" or updates.get("disabled")))
-        if losing_admin and db.count_users(role="admin") <= 1:
+        if losing_admin and db.count_enabled_admins() <= 1:
             return JSONResponse({"error": "cannot demote or disable the last admin"},
                                 status_code=400)
         user = db.update_user(user_id, **updates)
@@ -457,9 +533,218 @@ def create_app(
         target = db.get_user(user_id)
         if not target:
             return JSONResponse({"error": "no such user"}, status_code=404)
-        if target["role"] == "admin" and db.count_users(role="admin") <= 1:
+        if (target["role"] == "admin" and not target.get("disabled")
+                and db.count_enabled_admins() <= 1):
             return JSONResponse({"error": "cannot delete the last admin"}, status_code=400)
         return {"deleted": db.delete_user(user_id)}
+
+    # ------------------------------------------------- agents (profiles) -- #
+    def _valid_caps(raw):
+        """Known capability keys from a client payload, in canonical order.
+
+        Returns None when the payload is not a list of keys so the caller can
+        answer 400. Being strict matters: a bare string used to collapse to an
+        empty set (silently creating an agent that can do nothing) and a
+        non-iterable raised TypeError, which surfaced as a 500.
+        """
+        if raw is None:
+            return []
+        if not isinstance(raw, (list, tuple, set)):
+            return None
+        want = {c for c in raw if isinstance(c, str)}
+        return [k for k in CAPABILITY_ORDER if k in want]
+
+    @app.get("/api/agents/capabilities")
+    def agents_capabilities(user: dict = USER):
+        # The capability catalogue for the Agents screen, plus which execution
+        # capabilities are actually available on this server (shell/python).
+        return {"capabilities": public_capabilities(),
+                "runtime": {"allow_shell": config.allow_shell,
+                            "allow_python": config.allow_python,
+                            "office365_configured": bool(
+                                config.o365_tenant_id and config.o365_client_id
+                                and config.o365_client_secret)}}
+
+    @app.get("/api/agents")
+    def agents_list(user: dict = USER):
+        # Any signed-in user may list agents to pick one in chat; only the enabled
+        # ones are offered to non-admins, admins see all (to manage them).
+        agents = db.list_agents()
+        if user.get("role") != "admin":
+            agents = [a for a in agents if a.get("enabled")]
+        return {"agents": agents}
+
+    @app.post("/api/agents")
+    def agents_create(body: dict, _a: dict = ADMIN):
+        name = str(body.get("name", "")).strip()
+        if not name:
+            return JSONResponse({"error": "a name is required"}, status_code=400)
+        caps = _valid_caps(body.get("capabilities"))
+        if caps is None:
+            return JSONResponse(
+                {"error": "capabilities must be a list of capability keys"},
+                status_code=400)
+        agent_row = db.create_agent(
+            name=name,
+            description=str(body.get("description", "")),
+            capabilities=caps,
+            enabled=bool(body.get("enabled", True)))
+        log_event(get_logger("agents"), logging.INFO, "agents.created",
+                  agent_id=agent_row.get("id"), name=name,
+                  capabilities=agent_row.get("capabilities"))
+        return {"agent": agent_row}
+
+    def _agent_for_profile(profile: dict) -> tuple:
+        """Build a capability-gated (Config, Agent) for one saved agent profile.
+
+        The capabilities become a concrete tool allowlist and the RAG flag, on a
+        per-run copy of the config so concurrent runs never clobber each other.
+        """
+        caps = profile.get("capabilities") or []
+        cfg = dataclass_replace(
+            config,
+            agent_tools=",".join(tools_for_capabilities(caps)),
+            rag_enabled=rag_for_capabilities(caps) and config.rag_enabled)
+        reg = ToolRegistry(cfg, db)
+        return cfg, Agent(cfg, reg, ModelClient(cfg, cluster=router))
+
+    @app.post("/api/agents/run")
+    async def agents_run(body: dict, user: dict = USER):
+        """Run several agent profiles together on one prompt, then merge.
+
+        Each selected agent runs concurrently with only the tools its capabilities
+        unlock; their answers are collected and a final pass synthesises them into
+        one result. This is the "multiple agents on a task" mode.
+        """
+        prompt = str(body.get("prompt", "")).strip()
+        ids = body.get("agent_ids") or []
+        if not prompt:
+            return JSONResponse({"error": "prompt is required"}, status_code=400)
+        if not isinstance(ids, list) or not ids:
+            return JSONResponse({"error": "select at least one agent"}, status_code=400)
+        max_agents = 6
+        profiles = [db.get_agent(str(i)) for i in ids[:max_agents]]
+        profiles = [p for p in profiles if p and p.get("enabled")]
+        # Report what the cap dropped rather than silently ignoring selections.
+        skipped = max(0, len(ids) - max_agents)
+        if not profiles:
+            return JSONResponse({"error": "no enabled agents matched"}, status_code=400)
+        uid = user["id"]
+
+        async def run_one(profile: dict) -> dict:
+            answer, used = "", []
+            try:
+                set_acting_user(uid)
+                # Building the gated agent is inside the try too: a bad profile
+                # must degrade to one failed row, never fail the whole request.
+                _cfg, ag = _agent_for_profile(profile)
+
+                async def drive():
+                    got, tools = "", []
+                    async for ev in ag.run_iterating(prompt, [], None,
+                                                     config.max_tokens, config.temperature):
+                        if ev.get("type") == "final":
+                            got = ev.get("answer") or ""
+                            tools = ev.get("tools_used") or []
+                    return got, tools
+
+                # Bound each agent: an unreachable or wedged model server must not
+                # hold the whole multi-agent request open indefinitely. The
+                # generation gate is inside the timeout on purpose — a fan-out of
+                # agents is exactly the request that would otherwise start N
+                # generations at once, and waiting for a slot counts against the
+                # agent's own budget rather than being free.
+                async def gated():
+                    async with generation_gate.slot():
+                        return await drive()
+
+                answer, used = await asyncio.wait_for(
+                    gated(), timeout=config.agent_run_timeout)
+            except GenerationBusy as exc:
+                answer = f"(this agent was not started: {exc})"
+            except asyncio.TimeoutError:
+                log(f"agent run timed out ({profile.get('name')}) after "
+                    f"{config.agent_run_timeout:.0f}s", logging.WARNING)
+                answer = f"(this agent timed out after {config.agent_run_timeout:.0f}s)"
+            except Exception as exc:
+                log(f"agent run failed ({profile.get('name')}): "
+                    f"{type(exc).__name__}: {exc}", logging.WARNING)
+                answer = f"(this agent failed: {redact_text(str(exc))})"
+            return {"id": profile["id"], "name": profile["name"],
+                    "capabilities": profile.get("capabilities") or [],
+                    "answer": answer, "tools_used": used}
+
+        # return_exceptions so one agent blowing up in an unexpected way still
+        # returns the others' work instead of 500-ing the whole run.
+        raw_results = await asyncio.gather(*(run_one(p) for p in profiles),
+                                           return_exceptions=True)
+        results = []
+        for profile, res in zip(profiles, raw_results):
+            if isinstance(res, asyncio.CancelledError):
+                raise res  # a real cancellation must not be swallowed
+            if isinstance(res, BaseException):
+                log(f"agent task crashed ({profile.get('name')}): "
+                    f"{type(res).__name__}: {res}", logging.WARNING)
+                results.append({"id": profile["id"], "name": profile["name"],
+                                "capabilities": profile.get("capabilities") or [],
+                                "answer": f"(this agent failed: {redact_text(str(res))})",
+                                "tools_used": []})
+            else:
+                results.append(res)
+
+        merged = ""
+        if len(results) > 1:
+            joined = "\n\n".join(f"### {r['name']}\n{r['answer']}" for r in results)
+            merge_msgs = [
+                {"role": "system", "content": config.system_prompt_with_identity},
+                {"role": "user", "content":
+                    f"{prompt}\n\nSeveral specialised agents each answered this:\n\n"
+                    f"{joined}\n\nSynthesise ONE best answer, combining their "
+                    "strengths and resolving any conflicts. Plain text."},
+            ]
+            try:
+                set_acting_user(uid)
+                merged, _ = await asyncio.wait_for(
+                    model_client.complete_with_stats(
+                        merge_msgs, config.max_tokens, config.temperature,
+                        kind="reasoning"),
+                    timeout=config.agent_run_timeout)
+                merged = strip_reasoning(merged).strip()
+            except asyncio.TimeoutError:
+                log("agent merge timed out; returning the individual answers",
+                    logging.WARNING)
+            except Exception as exc:
+                log(f"agent merge failed: {type(exc).__name__}: {exc}", logging.WARNING)
+        return {"results": results, "merged": merged,
+                "skipped": skipped, "max_agents": max_agents}
+
+    @app.post("/api/agents/{agent_id}")
+    def agents_update(agent_id: str, body: dict, _a: dict = ADMIN):
+        if not db.get_agent(agent_id):
+            return JSONResponse({"error": "no such agent"}, status_code=404)
+        updates: dict = {}
+        if "name" in body and str(body["name"]).strip():
+            updates["name"] = str(body["name"]).strip()
+        if "description" in body:
+            updates["description"] = str(body["description"])
+        if "capabilities" in body:
+            caps = _valid_caps(body["capabilities"])
+            if caps is None:
+                return JSONResponse(
+                    {"error": "capabilities must be a list of capability keys"},
+                    status_code=400)
+            updates["capabilities"] = caps
+        if "enabled" in body:
+            updates["enabled"] = bool(body["enabled"])
+        if not updates:
+            return JSONResponse({"error": "nothing to update"}, status_code=400)
+        return {"agent": db.update_agent(agent_id, **updates)}
+
+    @app.delete("/api/agents/{agent_id}")
+    def agents_delete(agent_id: str, _a: dict = ADMIN):
+        if not db.get_agent(agent_id):
+            return JSONResponse({"error": "no such agent"}, status_code=404)
+        return {"deleted": db.delete_agent(agent_id)}
 
     # --------------------------------------------- cluster / routing ------ #
     @app.get("/api/cluster/nodes")
@@ -485,7 +770,9 @@ def create_app(
     # Guarded by the shared NODE_TOKEN so the mlx server itself stays unexposed.
     @app.get("/api/node/health")
     def node_health(request: Request):
-        if config.node_token and not auth.check_node_token(request):
+        # Always require the shared node token: this endpoint exists only for a
+        # peer node to probe this one, and leaks model/load telemetry otherwise.
+        if not config.node_token or not auth.check_node_token(request):
             return JSONResponse({"error": "node token required"}, status_code=401)
         cpu, mem = sample_local_load()
         return {"state": model_manager.status, "model_status": model_manager.status,
@@ -497,9 +784,19 @@ def create_app(
     async def node_generate(body: dict, request: Request):
         if not config.node_token or not auth.check_node_token(request):
             return JSONResponse({"error": "node token required"}, status_code=401)
+        # Validate the peer-supplied body (400 on bad shape, not a leaky 500).
         messages = body.get("messages") or []
-        max_tokens = int(body.get("max_tokens") or config.max_tokens)
-        temperature = float(body.get("temperature", config.temperature))
+        if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+            return JSONResponse({"error": "messages must be a list of objects"}, status_code=400)
+        try:
+            max_tokens = int(body.get("max_tokens") or config.max_tokens)
+            temperature = float(body.get("temperature", config.temperature))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "max_tokens/temperature must be numeric"}, status_code=400)
+        # The local model must be up to serve a peer.
+        blocked = not_ready()
+        if blocked is not None:
+            return blocked
         made = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
         if body.get("stream"):
@@ -523,7 +820,11 @@ def create_app(
                                    "completion_tokens": stats.completion_tokens})
                 yield "data: [DONE]\n\n"
             return StreamingResponse(gen(), media_type="text/event-stream")
-        text, stats = await node_worker_client.complete_with_stats(messages, max_tokens, temperature)
+        try:
+            text, stats = await node_worker_client.complete_with_stats(messages, max_tokens, temperature)
+        except Exception as exc:
+            return JSONResponse({"error": redact_text(f"{type(exc).__name__}: {exc}")},
+                                status_code=502)
         return {"id": made, "object": "chat.completion", "created": created,
                 "model": config.model,
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
@@ -534,17 +835,25 @@ def create_app(
     # --------------------------------------------- Claude history import -- #
     @app.post("/api/import")
     async def import_upload(request: Request, _a: dict = ADMIN):
-        # Read the raw ZIP body (no multipart dependency). Reject early on an
-        # oversized declared length before buffering it.
+        # Read the raw ZIP body (no multipart dependency), streaming with a hard
+        # cap so a missing/lying Content-Length cannot cause unbounded buffering.
+        cap = config.import_max_zip_bytes
         try:
             declared = int(request.headers.get("content-length") or 0)
         except ValueError:
             declared = 0
-        if declared and declared > config.import_max_zip_bytes:
+        if declared and declared > cap:
             return JSONResponse(
-                {"error": f"upload exceeds IMPORT_MAX_ZIP_BYTES ({config.import_max_zip_bytes})"},
-                status_code=413)
-        data = await request.body()
+                {"error": f"upload exceeds IMPORT_MAX_ZIP_BYTES ({cap})"}, status_code=413)
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > cap:
+                return JSONResponse(
+                    {"error": f"upload exceeds IMPORT_MAX_ZIP_BYTES ({cap})"}, status_code=413)
+            chunks.append(chunk)
+        data = b"".join(chunks)
         filename = request.headers.get("x-filename", "export.zip")
         user_id = get_acting_user() or SENTINEL_LOCAL_USER
         try:
@@ -582,10 +891,24 @@ def create_app(
     @app.get("/api/health")
     async def health(user: dict = USER):
         is_admin = user.get("role") == "admin"
-        model_healthy = await model_manager.health_probe() if model_manager.is_alive() else False
+        # Cached probe: the UI polls this every ~3s, but a real generation probe
+        # only runs at most every 15s so the status bar never ties up the model.
+        model_healthy = await model_manager.health_probe_cached()
         # Everyone may see whether the service is up and which model/agent is
         # active; only admins see internal telemetry (feedback stats, prefix
         # cache state, retrain progress, per-node/task detail).
+        # Every SQLite read here runs on a worker thread. This handler fires
+        # every ~3s per open tab, and blocking sqlite calls inside an async
+        # endpoint run on the event loop itself, so they would stutter the
+        # token stream of whatever generation is in flight.
+        def _db_counters() -> dict:
+            counters = {"memories": db.count_memories(user_id=user["id"])}
+            if is_admin:
+                counters["stats"] = db.get_stats()
+                counters["task_total"] = db.count_tasks()
+            return counters
+
+        counters = await asyncio.to_thread(_db_counters)
         payload = {
             "ui_build": UI_BUILD,
             "model_status": model_manager.status,
@@ -598,7 +921,7 @@ def create_app(
             "temperature": config.temperature,
             "tools": registry.names(),
             "search_backend": config.search_backend,
-            "memories": db.count_memories(user_id=user["id"]),
+            "memories": counters["memories"],
             "role": user.get("role"),
             "username": user.get("username"),
             "auth_enabled": config.auth_enabled,
@@ -610,13 +933,13 @@ def create_app(
                 "model_process_alive": model_manager.is_alive(),
                 "retrain": retrain_manager.status,
                 "prefix": dict(PREFIX_STATE),
-                "stats": db.get_stats(),
+                "stats": counters["stats"],
                 "ram_gb": round(TOTAL_RAM_GB),
                 "adapter": model_manager.adapter_choice,
                 "node_role": config.node_role,
                 "multi_node": node_registry.multi_node,
                 "tasks": {
-                    "total": len(db.list_tasks()),
+                    "total": counters["task_total"],
                     "running": [
                         {"task_id": task_id, **(tasks.live_status(task_id) or {})}
                         for task_id in list(tasks.by_task)
@@ -643,6 +966,20 @@ def create_app(
     def set_reviewed(feedback_id: int, reviewed: bool = True, _a: dict = ADMIN):
         return {"updated": db.set_reviewed(feedback_id, reviewed)}
 
+    @app.post("/api/feedback/approve-pending")
+    def approve_pending_feedback(_a: dict = ADMIN):
+        """Clear the queue of user-submitted rows waiting for training approval."""
+        approved = db.approve_pending()
+        if approved:
+            log_event(get_logger("api"), logging.INFO, "feedback.approved_pending",
+                      count=approved)
+        return {"approved": approved}
+
+    @app.post("/api/feedback/{feedback_id}/approved")
+    def set_approved(feedback_id: int, approved: bool = True, _a: dict = ADMIN):
+        """Approve or reject one queued row. Either way it leaves the queue."""
+        return {"updated": db.set_approved(feedback_id, approved)}
+
     @app.get("/api/dataset/stats")
     def dataset_stats(_a: dict = ADMIN):
         return db.dataset_stats()
@@ -656,7 +993,7 @@ def create_app(
         try:
             return {"result": registry._index_docs(path), "stats": db.document_stats()}
         except Exception as exc:
-            return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=400)
+            return JSONResponse({"error": redact_text(f"{type(exc).__name__}: {exc}")}, status_code=400)
 
     @app.get("/api/docs/search")
     def docs_search(q: str = Query(...), limit: int = 5, user: dict = USER):
@@ -704,7 +1041,7 @@ def create_app(
                 result = registry._index_docs(f"uploads/{name}")
                 return {"result": result, "path": f"uploads/{name}", "stats": db.document_stats()}
             except Exception as exc:
-                return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=400)
+                return JSONResponse({"error": redact_text(f"{type(exc).__name__}: {exc}")}, status_code=400)
 
     @app.get("/api/uploads/enabled")
     def uploads_enabled(user: dict = USER):
@@ -715,7 +1052,7 @@ def create_app(
         try:
             return {"result": registry._index_url(url), "stats": db.document_stats()}
         except Exception as exc:
-            return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=400)
+            return JSONResponse({"error": redact_text(f"{type(exc).__name__}: {exc}")}, status_code=400)
 
     @app.get("/api/conversations/search")
     def conversations_search(q: str = Query(...), limit: int = 30, user: dict = USER):
@@ -740,19 +1077,19 @@ def create_app(
 
     @app.get("/api/prompts")
     def prompts_list(user: dict = USER):
-        return {"prompts": db.list_prompts()}
+        return {"prompts": db.list_prompts(user_id=user["id"])}
 
     @app.post("/api/prompts")
     def prompts_save(name: str = Query(...), body: str = Query(...), user: dict = USER):
         try:
-            db.save_prompt(name, body)
+            db.save_prompt(name, body, user_id=user["id"])
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
-        return {"saved": name.strip(), "prompts": db.list_prompts()}
+        return {"saved": name.strip(), "prompts": db.list_prompts(user_id=user["id"])}
 
     @app.delete("/api/prompts/{name}")
     def prompts_delete(name: str, user: dict = USER):
-        return {"deleted": db.delete_prompt(name)}
+        return {"deleted": db.delete_prompt(name, user_id=user["id"])}
 
     @app.get("/api/backup")
     def backup_export(_a: dict = ADMIN):
@@ -778,7 +1115,7 @@ def create_app(
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception as exc:
-            return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=400)
+            return JSONResponse({"error": redact_text(f"{type(exc).__name__}: {exc}")}, status_code=400)
 
     @app.get("/api/browse")
     def browse_directories(path: str = Query(""), _a: dict = ADMIN):
@@ -818,7 +1155,7 @@ def create_app(
         except PermissionError:
             return JSONResponse({"error": f"no permission to read {path}"}, status_code=403)
         except Exception as exc:
-            return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=400)
+            return JSONResponse({"error": redact_text(f"{type(exc).__name__}: {exc}")}, status_code=400)
 
     @app.post("/api/conversation/{conversation_id}/fork")
     def conversation_fork(conversation_id: str, upto: int | None = None, user: dict = USER):
@@ -884,8 +1221,18 @@ def create_app(
         stack — routing, tools, knowledge base, retries — not just the raw model.
         Supports stream=true (OpenAI-shaped SSE deltas) and non-streaming.
         """
+        # Validate the client body up front: malformed shape is a 400, not a 500.
+        messages = body.get("messages") or []
+        if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+            return JSONResponse({"error": {"message": "messages must be a list of objects"}},
+                                status_code=400)
         try:
-            messages = body.get("messages") or []
+            max_tokens = int(body.get("max_tokens") or config.max_tokens)
+            temperature = float(body.get("temperature", config.temperature))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": {"message": "max_tokens/temperature must be numeric"}},
+                                status_code=400)
+        try:
             prompt = ""
             for msg in reversed(messages):
                 if msg.get("role") == "user":
@@ -896,14 +1243,16 @@ def create_app(
                                     status_code=400)
             history = [{"role": m.get("role"), "content": m.get("content") or ""}
                        for m in messages[:-1] if m.get("role") in ("user", "assistant")]
-            max_tokens = int(body.get("max_tokens") or config.max_tokens)
-            temperature = float(body.get("temperature", config.temperature))
             cid = f"openai-{uuid.uuid4().hex[:8]}"
+            uid = user["id"]
 
             # Streaming: emit OpenAI-shaped SSE deltas so editors and SDK clients
             # that expect stream=True (Continue, Zed, the OpenAI SDK) work.
             if body.get("stream"):
                 async def sse_stream():
+                    # Re-bind the acting user in the generator's context so RAG
+                    # retrieval and memory tools scope to this caller.
+                    set_acting_user(uid)
                     made = f"chatcmpl-{uuid.uuid4().hex[:12]}"
                     created = int(time.time())
 
@@ -931,7 +1280,8 @@ def create_app(
                                 if full and not sent:
                                     yield chunk({"content": full})
                     except Exception as exc:
-                        yield chunk({"content": f"\n[error: {type(exc).__name__}: {exc}]"})
+                        log(f"openai stream failed: {type(exc).__name__}: {exc}", logging.ERROR)
+                        yield chunk({"content": f"\n[error: {redact_text(str(exc))}]"})
                     yield chunk({}, finish="stop")
                     yield "data: [DONE]\n\n"
 
@@ -957,8 +1307,11 @@ def create_app(
                 "x_tools_used": used,
             }
         except Exception as exc:
-            return JSONResponse({"error": {"message": f"{type(exc).__name__}: {exc}"}},
-                                status_code=500)
+            log(f"openai_chat_completions failed: {type(exc).__name__}: {exc}", logging.ERROR)
+            return JSONResponse(
+                {"error": {"message": redact_text(f"{type(exc).__name__}: {exc}"),
+                           "type": "internal_error"}},
+                status_code=500)
 
     def _git(args: list[str], limit: int = 60000) -> tuple[bool, str]:
         """Run a read-only git command in the project dir. Returns (ok, output)."""
@@ -994,14 +1347,19 @@ def create_app(
 
     @app.get("/api/project/diff")
     def project_diff(path: str = "", _a: dict = ADMIN):
+        # Report whether a project is actually configured. Without it the UI
+        # cannot tell "your project's diff" from the diff of whatever repo
+        # happens to enclose the sandbox workspace (i.e. this app's own source).
+        configured = bool((config.project_dir or "").strip())
         is_repo, _ = _git(["rev-parse", "--is-inside-work-tree"])
         if not is_repo:
-            return {"is_git_repo": False, "diff": ""}
+            return {"is_git_repo": False, "diff": "", "project_dir": config.project_dir}
         args = ["diff", "--no-color"]
         if path:
             args += ["--", path]
         ok, diff = _git(args)
-        return {"is_git_repo": True, "diff": diff}
+        return {"is_git_repo": True, "diff": diff if configured else "",
+                "project_dir": config.project_dir}
 
     @app.post("/api/project/revert")
     def project_revert(_a: dict = ADMIN):
@@ -1170,6 +1528,13 @@ def create_app(
                   content=content_for_log(request.message))
 
         try:
+            await generation_gate.acquire()
+        except GenerationBusy as exc:
+            db.log_metric("chat", (time.time() - start_time) * 1000, 503, str(exc),
+                          user_id=uid)
+            return JSONResponse({"error": str(exc)}, status_code=503,
+                                headers={"Retry-After": "5"})
+        try:
             stats: GenerationStats | None = None
             if use_agent:
                 answer = ""
@@ -1230,9 +1595,11 @@ def create_app(
                 "usage": stats.as_event() if stats else None,
             }
         except Exception as exc:
+            log(f"/api/chat failed: {type(exc).__name__}: {exc}", logging.ERROR)
             db.log_metric("chat", (time.time() - start_time) * 1000, 503, str(exc), user_id=uid)
-            return JSONResponse(content={"error": str(exc)}, status_code=503)
+            return JSONResponse(content={"error": redact_text(str(exc))}, status_code=503)
         finally:
+            generation_gate.release()
             tasks.chat_in_flight = max(0, tasks.chat_in_flight - 1)
             tasks.note_chat_activity()
 
@@ -1277,6 +1644,20 @@ def create_app(
             log_event(get_logger("chat"), logging.INFO, "chat.start",
                       conversation_id=conversation_id, user_id=uid, agent=use_agent,
                       streaming=True, content=content_for_log(request.message))
+            # The slot is taken inside the generator, not before the response:
+            # a client that disconnects before consuming the stream never runs
+            # this body, so acquiring earlier would leak a slot per abandoned
+            # request. The queue-full case becomes an SSE error event because
+            # the status line is already committed by then.
+            try:
+                await generation_gate.acquire()
+            except GenerationBusy as exc:
+                tasks.chat_in_flight = max(0, tasks.chat_in_flight - 1)
+                await asyncio.to_thread(
+                    db.log_metric, "chat_stream", 0.0, 503, str(exc), user_id=uid)
+                yield await sse({"type": "error", "error": str(exc)})
+                yield "data: [DONE]\n\n"
+                return
             try:
                 yield await sse({"type": "start", "conversation_id": conversation_id, "agent": use_agent})
                 # Turn a short "good job" / "no, wrong" into feedback on the
@@ -1352,9 +1733,11 @@ def create_app(
                     db.log_metric, "chat_stream", (time.time() - start_time) * 1000, 200,
                     user_id=uid)
             except Exception as exc:
+                log(f"/api/chat/stream failed: {type(exc).__name__}: {exc}", logging.ERROR)
                 db.log_metric("chat_stream", (time.time() - start_time) * 1000, 503, str(exc), user_id=uid)
-                yield await sse({"type": "error", "error": str(exc)})
+                yield await sse({"type": "error", "error": redact_text(str(exc))})
             finally:
+                generation_gate.release()
                 tasks.chat_in_flight = max(0, tasks.chat_in_flight - 1)
                 tasks.note_chat_activity()
             yield "data: [DONE]\n\n"
@@ -1373,6 +1756,19 @@ def create_app(
     def set_config(request: ConfigRequest, _a: dict = ADMIN):
         try:
             requested = request.model_dump(exclude_none=True)
+            # A project directory must actually exist; "" clears it. Without this
+            # a typo would be stored and every file tool would fail later with a
+            # confusing error instead of being refused here.
+            if "project_dir" in requested:
+                wanted = str(requested["project_dir"]).strip()
+                if wanted:
+                    resolved = Path(wanted).expanduser()
+                    if not resolved.is_dir():
+                        return JSONResponse(
+                            {"error": f"{wanted} is not a directory"}, status_code=400)
+                    requested["project_dir"] = str(resolved.resolve())
+                else:
+                    requested["project_dir"] = ""
             changed = config.apply(requested)
         except Exception as exc:
             return JSONResponse(
@@ -1619,20 +2015,32 @@ def create_app(
 
     @app.post("/api/feedback")
     async def feedback(request: FeedbackRequest, user: dict = USER):
-        approved = 1 if (request.corrected_response or request.rating > 0) else 0
+        # A thumbs-up or a correction normally marks the row for training. From a
+        # NON-ADMIN it only queues it: the LoRA adapter is shared by everyone, so
+        # letting any account write straight into the training corpus (and, with
+        # AUTO_RETRAIN_THRESHOLD set, trigger the retrain itself) would let one
+        # user steer the model every other user talks to. Admins are unaffected,
+        # which includes the default single-user setup, where the local user IS
+        # the admin, so nothing changes unless AUTH_ENABLED=1.
+        wanted = bool(request.corrected_response or request.rating > 0)
+        is_admin = user.get("role") == "admin"
+        approved = 1 if (wanted and is_admin) else 0
+        pending = 1 if (wanted and not is_admin) else 0
         session_id = str(uuid.uuid4())[:8]
 
         db.execute(
             """INSERT INTO feedback
                (user_prompt, assistant_response, rating, corrected_response,
-                approved_for_training, session_id, model_id, source, user_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'button', ?)""",
+                approved_for_training, pending_approval, session_id, model_id,
+                source, user_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'button', ?)""",
             (
                 request.user_prompt,
                 request.assistant_response,
                 request.rating,
                 request.corrected_response,
                 approved,
+                pending,
                 session_id,
                 config.model,
                 user["id"],
@@ -1650,6 +2058,7 @@ def create_app(
         return {
             "status": "feedback saved",
             "approved_for_training": bool(approved),
+            "pending_approval": bool(pending),
             "session_id": session_id,
         }
 

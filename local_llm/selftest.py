@@ -7,37 +7,12 @@ from __future__ import annotations
 
 import importlib
 
-import argparse
-import ast
-import asyncio
-import csv
-import html
-import hashlib
 import json
-import logging
-import math
-import operator
-import os
 import platform
-import random
 import re
-import shutil
-import signal
-import socket
-import sqlite3
-import traceback
-import shlex
-import subprocess
 import sys
-import textwrap
-import threading
 import time
-import urllib.parse
-import uuid
-from dataclasses import dataclass, field, asdict, replace as dataclass_replace
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, Literal
 
 from .core import *  # noqa: F401,F403
 from .obslog import *  # noqa: F401,F403
@@ -212,6 +187,16 @@ def selftest() -> int:
     _divs_close = len(re.findall(r"</div>", page))
     if _divs_open != _divs_close:
         failures.append(f"UI <div> tags are unbalanced ({_divs_open} open, {_divs_close} close)")
+    # The UI JS lives in Python RAW strings, so a newline escape must be written
+    # `\n`. Writing `\\n` reaches JS as an escaped backslash and renders the two
+    # characters "\n" to the user instead of a line break -- exactly what made the
+    # Training data and Codebase panels show "Total examples: 1\nApproved: 1".
+    # Nothing in this UI legitimately emits a literal backslash-n, so any is a bug.
+    if "\\\\n" in page:
+        _bad = page.count("\\\\n")
+        failures.append(f"UI JS has {_bad} double-escaped newline(s) (\\\\n in a raw "
+                        "string renders a literal \\n; use a single backslash)")
+
     _script = re.search(r"<script>(.*?)</script>", page, re.S)
     if _script:
         _body = _script.group(1)
@@ -331,6 +316,10 @@ def selftest() -> int:
         ("python script to pull the newest CVEs", True),
         ("fix this function", True),
         ("implement a binary search in rust", True),
+        # A Swift coding task must read as code (not a research query), so it is
+        # answered by writing code rather than routed to a web search.
+        ("write a swift function that uses drive api without api key", True),
+        ("write a kotlin coroutine example", True),
         ("write up the latest news on Apple", False),
         ("what are the latest CVEs for openssl?", False),
         ("whats tomorrows weather in brussels", False),
@@ -343,10 +332,28 @@ def selftest() -> int:
         ("write a script using the latest OpenAI API", True),
         ("implement a binary search in rust", False),
         ("write a regex for emails", False),
+        # "drive api without api key" is a coding task, not a lookup: no search.
+        ("write a swift function that uses drive api without api key", False),
     ]:
         got = bool(is_code_request(text) and CODE_NEEDS_LOOKUP.search(text))
         if got != want_lookup:
             failures.append(f"code-needs-lookup({text!r}) != {want_lookup}")
+
+    # Follow-up remarks refer to the previous answer, so knowledge-base retrieval
+    # must not fire on them (it matched unrelated transcripts and the model then
+    # answered by inventing a conversation that never happened).
+    for _m, _want in [
+        ("doesnt have a main function", True),
+        ("its not reconsider the first message in this convo", True),
+        ("I meant the c programm you just wrote does not have a main function", True),
+        ("no", True),
+        ("i meant the other one", True),
+        ("what is the eviction policy?", False),
+        ("how does rate limiting and session storage work in our queue?", False),
+        ("write a c++ crud basic program", False),
+    ]:
+        if is_followup_remark(_m) != _want:
+            failures.append(f"is_followup_remark({_m!r}) != {_want}")
 
     # The substantive gate keeps chit-chat off the router.
     for msg, want_substantive in [("hi", False), ("hey there", False), ("thanks!", False),
@@ -574,6 +581,34 @@ def selftest() -> int:
     for _needed in ("docScope",):
         if f'id="{_needed}"' not in _page2:
             failures.append(f"UI is missing the {_needed} element")
+
+    # Every element that ships with the `hidden` state class must be matched by
+    # a rule that actually hides IT. Checking only that `.hidden` appears
+    # somewhere in the CSS is not enough: the sheet had `#palette.hidden`,
+    # `.view.hidden` and friends but no rule covering `.acct-pop.hidden`, so the
+    # account popup sat permanently open over the header with no error anywhere.
+    _css = re.search(r"<style>(.*?)</style>", _page2, re.S)
+    if _css:
+        _sheet = re.sub(r"/\*.*?\*/", " ", _css.group(1), flags=re.S)   # comments first
+        _rules = re.findall(r"([^{}]+)\{[^{}]*display\s*:\s*none", _sheet)
+        # The captured "selector" runs back to the previous rule's closing brace,
+        # so keep only the last line of it, then split a selector list on commas.
+        _selectors = {sel.strip()
+                      for rule in _rules
+                      for sel in rule.strip().split("\n")[-1].split(",")}
+        for _tag in re.finditer(r"<(\w+)([^>]*\bclass=\"[^\"]*\bhidden\b[^\"]*\"[^>]*)>",
+                                _page2):
+            _attrs = _tag.group(2)
+            _classes = set((re.search(r'class="([^"]*)"', _attrs).group(1)).split())
+            _id_match = re.search(r'id="([\w-]+)"', _attrs)
+            _eid = _id_match.group(1) if _id_match else ""
+            _ok = {".hidden", f"#{_eid}.hidden" if _eid else None}
+            _ok |= {f".{c}.hidden" for c in _classes if c != "hidden"}
+            _ok |= {f".hidden.{c}" for c in _classes if c != "hidden"}
+            if not (_ok & _selectors):
+                failures.append(
+                    f"<{_tag.group(1)} id={_eid or '?'}> carries class 'hidden' but no "
+                    "CSS rule hides it")
 
     # Backup round-trips and forking preserves the original conversation.
     with tempfile.TemporaryDirectory() as _btmp:
@@ -1013,6 +1048,47 @@ def selftest() -> int:
         if fast_path_call(text) != expected:
             failures.append(f"fast_path_call({text!r}) returned {fast_path_call(text)!r}")
 
+    # Explicit web-search commands route deterministically (no model-router call
+    # that could second-guess them); ordinary questions do not.
+    for text, expected in [
+        ("search the web for mlx 0.9 release notes", "mlx 0.9 release notes"),
+        ("google apple silicon npu benchmarks", "apple silicon npu benchmarks"),
+        ("web search latest cve for openssl", "latest cve for openssl"),
+        ("find the current bitcoin price online", "the current bitcoin price"),
+        ("what is a monad?", None),          # a plain question stays on the router
+        ("search my codebase for the login handler", None),  # not a web command
+    ]:
+        if web_search_request(text) != expected:
+            failures.append(f"web_search_request({text!r}) returned {web_search_request(text)!r}")
+
+    # Power-user /overrides force a lane and strip the command from the message.
+    for text, expected in [
+        ("/search who won the 2025 tour de france", ("web_search", "who won the 2025 tour de france")),
+        ("/no-search explain tail latency", ("answer", "explain tail latency")),
+        ("/kb what does our runbook say about failover", ("kb", "what does our runbook say about failover")),
+        ("no leading slash here", None),
+        ("/search", ("web_search", "")),     # bare command: caller ignores empty rest
+    ]:
+        if routing_override(text) != expected:
+            failures.append(f"routing_override({text!r}) returned {routing_override(text)!r}")
+
+    # Web-search rerank: the on-topic result is fetched before the off-topic one
+    # that the engine happened to rank first, and aggregator hosts are demoted.
+    _sr = (
+        "1. Random blog\n   https://example.com/misc\n   an unrelated post about gardening\n"
+        "2. MLX 0.9 release notes\n   https://ml-explore.github.io/mlx/build/html/notes.html\n"
+        "   the mlx 0.9 release adds new quantization kernels\n"
+        "3. Reddit thread\n   https://reddit.com/r/foo/comments/x\n   people discussing mlx"
+    )
+    _ranked = rank_result_urls(_sr, "mlx 0.9 release quantization", 3)
+    if not _ranked or "ml-explore.github.io" not in _ranked[0]:
+        failures.append(f"rank_result_urls did not promote the on-topic result: {_ranked}")
+    if _ranked and "reddit.com" in _ranked[0]:
+        failures.append("rank_result_urls failed to demote an aggregator host")
+    # With no query tokens it must fall back to engine order (never drop results).
+    if rank_result_urls(_sr, "", 3)[:1] != top_result_urls(_sr, 1):
+        failures.append("rank_result_urls did not fall back to engine order without a query")
+
     # Prefix stability: step k+1's prompt must start with step k's, so an
     # extending prompt keeps matching a server-side cache.
     def trace_prompts(stable: bool) -> list[list[str]]:
@@ -1323,17 +1399,20 @@ def selftest() -> int:
         failures.append("Config.public() leaked a secret field")
     if _pub.get("oidc_client_secret") != "***set***":
         failures.append("Config.public() did not mark a set secret")
-    configure_logging(Config(log_chat_content="disabled"), force=True)
+    # Reconfigure into a throwaway log dir so running --selftest never writes to
+    # (or pollutes) the real logs/app.log.
+    _logtmp = _tf.mkdtemp()
+    configure_logging(Config(log_chat_content="disabled", log_dir=_logtmp), force=True)
     if content_for_log("hello") is not None:
         failures.append("content logging disabled still returned content")
-    configure_logging(Config(log_chat_content="metadata"), force=True)
+    configure_logging(Config(log_chat_content="metadata", log_dir=_logtmp), force=True)
     _meta = content_for_log("hello world")
     if not isinstance(_meta, dict) or "chars" not in _meta or "hello" in str(_meta):
         failures.append("metadata content logging returned the raw text")
-    configure_logging(Config(log_chat_content="full"), force=True)
+    configure_logging(Config(log_chat_content="full", log_dir=_logtmp), force=True)
     if content_for_log("password=hunter2 hi") is None or "hunter2" in content_for_log("password=hunter2 hi"):
         failures.append("full content logging did not redact")
-    configure_logging(Config(), force=True)  # restore defaults
+    configure_logging(Config(log_dir=_logtmp), force=True)  # restore defaults (temp dir)
     _cid = set_correlation_id(None)
     if not _cid or get_correlation_id() != _cid:
         failures.append("correlation id did not round-trip")
@@ -1369,6 +1448,100 @@ def selftest() -> int:
     _reg.update(_sec.name, state=UNAVAILABLE)
     if _crouter.select(_crouter.classify(model="Qwen2.5-Coder-32B")).primary_choice is None:
         failures.append("router gave no best-effort node when the secondary was down")
+    # A primary still loading weights (STARTING) must not be preferred over a
+    # healthy secondary — it is not ready to serve.
+    _reg.update(_sec.name, state=HEALTHY)
+    _reg.update(_prim.name, active=0, state=STARTING)
+    if _crouter.select(_crouter.classify(model="x")).primary_choice.name != _sec.name:
+        failures.append("router preferred a STARTING primary over a healthy secondary")
+    _reg.update(_prim.name, state=HEALTHY)
+    # Soft capability preference: heavy reasoning steers to the Studio (which
+    # advertises "reasoning") even when the primary is healthy and idle, while
+    # ordinary chat stays on the primary.
+    _reg.update(_prim.name, active=0, state=HEALTHY)
+    _reg.update(_sec.name, active=0, state=HEALTHY)
+    if _crouter.select(_crouter.classify(kind="reasoning")).primary_choice.name != _sec.name:
+        failures.append("router did not steer heavy reasoning to the capability node")
+    if _crouter.select(_crouter.classify(kind="chat")).primary_choice.name != _prim.name:
+        failures.append("router steered light chat off the primary")
+    # A down Studio must not capture reasoning work: it falls back to the primary.
+    _reg.update(_sec.name, state=UNAVAILABLE)
+    if _crouter.select(_crouter.classify(kind="reasoning")).primary_choice.name != _prim.name:
+        failures.append("reasoning preference ignored the Studio being down")
+    _reg.update(_sec.name, state=HEALTHY)
+
+    # Circuit breaker: two dispatch failures trip a node to UNAVAILABLE with a
+    # cooldown, during which it is not selected; after the cooldown it is offered
+    # once as a half-open trial, and a success closes the breaker.
+    _cbcfg = Config(studio_node_url="http://studio.local:8080", route_cooldown_s=0.2)
+    _cbreg = NodeRegistry(_cbcfg)
+    _cbrouter = ClusterRouter(_cbcfg, _cbreg)
+    _cbp = _cbreg.local_node()
+    _cbs = next(n for n in _cbreg.nodes if not n.is_local)
+    _cbreg.update(_cbp.name, state=HEALTHY)
+    _cbreg.update(_cbs.name, state=HEALTHY)
+    _cbreg.end(_cbs, ok=False)
+    _cbreg.end(_cbs, ok=False)
+    if _cbs.state != UNAVAILABLE or _cbs.cooldown_until <= time.time():
+        failures.append("circuit breaker did not open with a cooldown after repeated failures")
+    if _cbs.name in [n.name for n in _cbrouter.select(_cbrouter.classify()).candidates]:
+        failures.append("tripped node was selected during its cooldown")
+    time.sleep(0.25)
+    if _cbs.name not in [n.name for n in _cbrouter.select(_cbrouter.classify()).candidates]:
+        failures.append("tripped node never got a half-open trial after cooldown")
+    _cbreg.end(_cbs, ok=True)
+    if _cbs.state != HEALTHY or _cbs.cooldown_until != 0.0:
+        failures.append("a successful half-open trial did not close the breaker")
+    # A healthy local heartbeat must also close the breaker (reset the failure
+    # count), so a recovered primary degrades rather than instantly re-tripping on
+    # its next single failure.
+    _cbreg.update(_cbp.name, state=UNAVAILABLE, consecutive_failures=2,
+                  cooldown_until=time.time() + 999)
+    def _ready_status():
+        return {"status": "ready"}
+    _hmon = HealthMonitor(_cbcfg, _cbreg, local_status=_ready_status)
+    _hmon._probe_local(_cbp, 1.0, 1.0)
+    if _cbp.state != HEALTHY or _cbp.consecutive_failures != 0 or _cbp.cooldown_until != 0.0:
+        failures.append("a healthy local heartbeat did not close the circuit breaker")
+    # Machine detection: the local node must describe THIS Mac, not a hardcoded
+    # "mac-mini", and may only advertise high-memory capabilities it really has.
+    if friendly_node_name("MacBookPro17,1", "whatever") != "macbook-pro":
+        failures.append("friendly_node_name did not map a MacBookPro model id")
+    if friendly_node_name("Macmini9,1", "x") != "mac-mini":
+        failures.append("friendly_node_name did not map a Mac mini model id")
+    if friendly_node_name("Mac14,13", "Studio-Host") != "studio-host":
+        failures.append("friendly_node_name did not fall back to the hostname")
+    if "large_model" in capabilities_for_machine(8):
+        failures.append("an 8GB machine must not advertise large_model")
+    if "large_model" not in capabilities_for_machine(64):
+        failures.append("a 64GB machine should advertise large_model")
+    _det = detect_machine()
+    if not _det.get("cores") or _det.get("ram_gb") is None:
+        failures.append("detect_machine did not report cores/ram")
+    _lreg = NodeRegistry(Config())
+    if _lreg.local_node().name == "mac-mini" and "macmini" not in \
+            re.sub(r"[^a-z]", "", (_det.get("model") or "").lower()):
+        failures.append("local node is still hardcoded to mac-mini on non-mini hardware")
+
+    # An unmeasurable or merely-busy signal must NOT read as overloaded: a load
+    # average of 2.2x per core on an idle laptop used to be reported as
+    # "cpu 100%" and tripped the threshold.
+    _ohcfg = Config(route_load_ratio=4.0)
+    _ohreg = NodeRegistry(_ohcfg)
+    _ohn = _ohreg.local_node()
+    def _ready_ok():
+        return {"status": "ready"}
+    _ohmon = HealthMonitor(_ohcfg, _ohreg, local_status=_ready_ok)
+    _ohmon._probe_local(_ohn, None, None, 2.2)          # busy but not saturated
+    if _ohn.state != HEALTHY:
+        failures.append(f"a node at 2.2x load was marked {_ohn.state}, expected healthy")
+    _ohmon._probe_local(_ohn, None, None, 9.0)          # genuinely saturated
+    if _ohn.state != OVERLOADED:
+        failures.append("a node at 9x load per core was not marked overloaded")
+    _ohmon._probe_local(_ohn, None, None, None)         # nothing measurable
+    if _ohn.state != HEALTHY:
+        failures.append("a node with no measurable load was not treated as healthy")
+
     # Single-node: exactly one candidate, and it is local.
     _sreg = NodeRegistry(Config())
     _srouter = ClusterRouter(Config(), _sreg)
@@ -1420,14 +1593,171 @@ def selftest() -> int:
             failures.append(f"import did not store the conversation: {_counts}")
         if _counts["skills"] < 1:
             failures.append("import did not save the project instruction as a skill")
-        if not _imdb.get_messages("claude-u1", user_id="alice"):
-            failures.append("imported conversation is not owned by the importer")
+        # Conversation ids are namespaced by owner (no cross-user collision).
+        _alice_convs = [c["conversation_id"] for c in _imdb.list_conversations(user_id="alice")]
+        if not any(c.endswith("-u1") for c in _alice_convs):
+            failures.append(f"imported conversation is not owned by the importer: {_alice_convs}")
         if _imdb.list_conversations(user_id="bob"):
             failures.append("another user can see an imported conversation")
         # Re-import is de-duplicated.
         _c2 = _mgr.process(_mgr.stage_upload("alice", "export.zip", _good.getvalue()), "alice")
         if _c2["duplicates"] < 1 or _c2["conversations"] != 0:
             failures.append(f"re-import was not de-duplicated: {_c2}")
+        # Bob imports the SAME uuid: must NOT be seen as a duplicate of alice's,
+        # and must not clobber alice's knowledge-base doc (owner-namespaced path).
+        _bid = _mgr.stage_upload("bob", "export.zip", _good.getvalue())
+        _bc = _mgr.process(_bid, "bob")
+        if _bc["conversations"] != 1:
+            failures.append(f"bob's same-uuid import was wrongly de-duped: {_bc}")
+        if getattr(_imdb, "fts_enabled", False):
+            if not _imdb.search_documents("read a file in rust", user_id="alice"):
+                failures.append("alice's imported KB doc was clobbered by bob's import")
+        # Removing bob's import must leave alice's conversation intact.
+        _mgr.remove_import(_bid)
+        if not any(c.endswith("-u1") for c in
+                   [x["conversation_id"] for x in _imdb.list_conversations(user_id="alice")]):
+            failures.append("removing one import deleted another user's conversation")
+        if _imdb.list_conversations(user_id="bob"):
+            failures.append("remove_import did not delete its own conversation")
+
+    # ===================================================================== #
+    # "summarise/read <url>" routes to fetch_url (the misroute that answered
+    # from the model's own knowledge and then refused, "I can't open links").
+    # ===================================================================== #
+    for _m, _want in [
+        ("summarize https://example.com/a.pdf", "https://example.com/a.pdf"),
+        ("read this: https://example.com/x", "https://example.com/x"),
+        ("what does https://example.com/y say?", "https://example.com/y"),
+        ("tl;dr https://example.com/z", "https://example.com/z"),
+        ("give me a summary of https://example.com/w", "https://example.com/w"),
+        ("https://example.com/bare", None),   # bare URL -> quick_tool, not this
+        ("i was reading a book yesterday, nothing to do with links", None),
+    ]:
+        if url_read_request(_m) != _want:
+            failures.append(f"url_read_request({_m!r}) -> {url_read_request(_m)!r}, want {_want!r}")
+    # A bare URL still routes to fetch_url via quick_tool.
+    if quick_tool("https://example.com/bare") != ("fetch_url", {"url": "https://example.com/bare"}):
+        failures.append("quick_tool no longer handles a bare URL")
+    # A message merely mentioning two links is not a single-page read request.
+    if url_read_request("compare https://a.com and https://b.com please") is not None:
+        failures.append("url_read_request fired on a message with two URLs")
+
+    # ===================================================================== #
+    # The CLI must not shadow config.py. Every argparse default that repeated a
+    # literal silently beat the RAM-aware default: a 64GB machine ran a 4096
+    # context instead of 32768 and trained 30 iterations instead of 300.
+    # ===================================================================== #
+    # cli imports selftest (for --selftest), so import it lazily here to avoid a
+    # cycle. In the bundled single-file build both names are already global.
+    _bc = globals().get("build_config")
+    _bp = globals().get("build_parser")
+    if _bc is None or _bp is None:
+        from .cli import build_config as _bc, build_parser as _bp
+    _cli_cfg = _bc(_bp().parse_args([]))
+    _plain = Config()
+    for _f in ("context_size", "train_iters", "train_lr", "train_seq_len",
+               "max_tokens", "temperature", "history_turns", "model",
+               "reasoning_tokens", "auto_fetch_char_cap"):
+        if getattr(_cli_cfg, _f) != getattr(_plain, _f):
+            failures.append(f"CLI default shadows config.py for {_f}: "
+                            f"{getattr(_cli_cfg, _f)!r} != {getattr(_plain, _f)!r}")
+    # An explicitly supplied flag must still win.
+    if _bc(_bp().parse_args(["--context-size", "2048"])).context_size != 2048:
+        failures.append("an explicit --context-size no longer overrides the default")
+
+    # ===================================================================== #
+    # Agents: capability -> tool mapping, office365 stubs, profile CRUD.
+    # ===================================================================== #
+    _caps_tools = tools_for_capabilities(["file_ops", "web_api"])
+    if "read_file" not in _caps_tools or "web_search" not in _caps_tools:
+        failures.append("tools_for_capabilities did not unlock file/web tools")
+    if "run_shell" in _caps_tools:
+        failures.append("tools_for_capabilities leaked a code-exec tool without the capability")
+    if "final_answer" not in _caps_tools or "calculator" not in _caps_tools:
+        failures.append("tools_for_capabilities dropped an always-on tool")
+    if not rag_for_capabilities(["knowledge"]) or rag_for_capabilities(["file_ops"]):
+        failures.append("rag_for_capabilities did not follow the knowledge capability")
+    if [c["key"] for c in public_capabilities()] != CAPABILITY_ORDER:
+        failures.append("public_capabilities is out of order")
+    # O365 tools are registered ONLY when an Azure app is configured: an
+    # unusable tool's description would otherwise ride in every agent system
+    # prompt, which is pure prefill cost on a small machine.
+    _oreg = ToolRegistry(Config(project_dir="/tmp"), None)
+    if any(n.startswith("o365") for n in _oreg.names()):
+        failures.append("office365 tools registered without an Azure app configured")
+    _oreg2 = ToolRegistry(Config(project_dir="/tmp", o365_tenant_id="t",
+                                 o365_client_id="c", o365_client_secret="s"), None)
+    if "o365_mail" not in _oreg2.names():
+        failures.append("office365 tools missing even though O365_* is configured")
+    elif "not enabled in this build" not in _oreg2.get("o365_mail").handler(action="read"):
+        failures.append("office365 stub did not report its state")
+    # An agent whose capabilities name a conditional tool is not misconfigured.
+    _cond = ToolRegistry(Config(agent_tools=",".join(tools_for_capabilities(["office365"]))), None)
+    if "final_answer" not in _cond.names():
+        failures.append("capability allowlist dropped final_answer")
+    import tempfile as _agtf
+    _adb = Database(Path(_agtf.mkdtemp()) / "agents.db")
+    _ag = _adb.create_agent("Coder", "writes code", ["file_ops", "code_exec"])
+    if _ag["capabilities"] != ["file_ops", "code_exec"] or not _ag["enabled"]:
+        failures.append("create_agent did not persist capabilities/enabled")
+    _ag2 = _adb.update_agent(_ag["id"], capabilities=["web_api"], enabled=False)
+    if _ag2["capabilities"] != ["web_api"] or _ag2["enabled"]:
+        failures.append("update_agent did not apply capability/enabled changes")
+    if len(_adb.list_agents()) != 1:
+        failures.append("list_agents returned the wrong count")
+    if not _adb.delete_agent(_ag["id"]) or _adb.list_agents():
+        failures.append("delete_agent did not remove the profile")
+    _adb.close()
+
+    # ===================================================================== #
+    # Import is provider-agnostic: Claude, OpenAI/ChatGPT, DeepSeek, xAI.
+    # OpenAI/DeepSeek store the thread as a `mapping` GRAPH, not a list, so a
+    # parser that only looks for messages/chat_messages silently drops them all.
+    # ===================================================================== #
+    _prov = {
+        "claude": [{"uuid": "c1", "name": "C", "chat_messages": [
+            {"sender": "human", "text": "q-claude"},
+            {"sender": "assistant", "content": [{"type": "text", "text": "a-claude"}]}]}],
+        "openai": [{"title": "O", "mapping": {
+            "root": {"parent": None, "children": ["a"], "message": None},
+            "a": {"parent": "root", "children": ["b"], "message": {
+                "author": {"role": "system"}, "content": {"parts": ["sys noise"]}, "create_time": 1}},
+            "b": {"parent": "a", "children": ["c"], "message": {
+                "author": {"role": "user"}, "content": {"parts": ["q-openai"]}, "create_time": 2}},
+            "c": {"parent": "b", "children": [], "message": {
+                "author": {"role": "assistant"}, "content": {"parts": ["a-openai"]}, "create_time": 3}}}}],
+        "deepseek": [{"title": "D", "mapping": {
+            "m1": {"parent": None, "children": ["m2"], "message": {
+                "role": "user", "content": "q-deepseek", "create_time": 1}},
+            "m2": {"parent": "m1", "children": [], "message": {
+                "role": "assistant", "content": "a-deepseek", "create_time": 2}}}}],
+        "grok": [{"conversation_title": "G", "messages": [
+            {"role": "user", "content": "q-grok"},
+            {"role": "assistant", "content": [{"text": "a-grok"}]}]}],
+    }
+    for _name, _payload in _prov.items():
+        _pdb = Database(Path(_agtf.mkdtemp()) / f"{_name}.db")
+        _pim = ImportManager(Config(), _pdb)
+        _pbuf = _io.BytesIO()
+        with _zip.ZipFile(_pbuf, "w") as _pz:
+            _pz.writestr("conversations.json", json.dumps(_payload))
+        _pres = _pim.process(_pim.stage_upload("u", f"{_name}.zip", _pbuf.getvalue()), "u")
+        if _pres.get("conversations") != 1:
+            failures.append(f"{_name} export did not import (got {_pres.get('conversations')})")
+            _pdb.close()
+            continue
+        _prow = _pdb.search_conversations(f"q-{_name}", limit=3, user_id="u")
+        if not _prow:
+            failures.append(f"{_name} import stored no findable message")
+        else:
+            _pmsgs = _pdb.get_messages(_prow[0]["conversation_id"], user_id="u")
+            if [m["role"] for m in _pmsgs] != ["user", "assistant"]:
+                failures.append(f"{_name} import roles = {[m['role'] for m in _pmsgs]}")
+            if not any(f"a-{_name}" in (m["content"] or "") for m in _pmsgs):
+                failures.append(f"{_name} import lost the assistant text")
+            if any("sys noise" in (m["content"] or "") for m in _pmsgs):
+                failures.append(f"{_name} import leaked a system frame into the transcript")
+        _pdb.close()
 
     if failures:
         for failure in failures:
@@ -1448,6 +1778,9 @@ def selftest() -> int:
     print("PASS  structured logging: secret redaction and content-log levels")
     print("PASS  cluster routing: selection, overload/failover, large-model, dedup")
     print("PASS  Claude import: zip-slip blocked, export parsed, de-duplicated")
+    print("PASS  'summarise/read <url>' routes to fetch_url (no more link refusal)")
+    print("PASS  agents: capability->tool mapping, office365 stubs, profile CRUD")
+    print("PASS  import works for Claude, OpenAI, DeepSeek and xAI exports")
     return 0
 
 

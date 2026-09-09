@@ -5,37 +5,13 @@ Split out of the original single-file deploy.py; behaviour is unchanged.
 
 from __future__ import annotations
 
-import argparse
-import ast
 import asyncio
-import csv
-import html
-import hashlib
 import json
 import logging
-import math
-import operator
-import os
-import platform
-import random
 import re
-import shutil
-import signal
-import socket
-import sqlite3
-import traceback
-import shlex
-import subprocess
-import sys
-import textwrap
-import threading
 import time
-import urllib.parse
-import uuid
-from dataclasses import dataclass, field, asdict, replace as dataclass_replace
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, Literal
+from typing import AsyncGenerator
 
 from .core import *  # noqa: F401,F403
 from .obslog import *  # noqa: F401,F403
@@ -169,6 +145,13 @@ class Agent:
             return user_message
         if not getattr(db, "fts_enabled", False):
             return user_message
+        tokens = _query_tokens(user_message)
+        if not tokens:
+            return user_message
+        # A remark about the previous answer ("doesnt have a main function") is
+        # answered from the conversation, never from the knowledge base.
+        if is_followup_remark(user_message):
+            return user_message
         try:
             scope = [p.strip() for p in (self.config.rag_scope or "").split(",") if p.strip()]
             # Scope retrieval to the acting user's own + shared documents so one
@@ -178,6 +161,17 @@ class Agent:
         except Exception as exc:
             log(f"knowledge-base lookup skipped: {exc}", logging.DEBUG)
             return user_message
+        # Keep only passages that genuinely overlap the question. The FTS query
+        # ORs every term, so one common word ("message", "first") is enough to
+        # match a totally unrelated document -- which is how "its not reconsider
+        # the first message in this convo" pulled in someone else's transcript and
+        # the model answered by inventing a conversation. Requiring real overlap
+        # makes retrieval fire only when it has something to contribute.
+        need = 2 if len(tokens) >= 2 else 1
+        hits = [h for h in hits
+                if sum(1 for t in tokens
+                       if t in (str(h.get("chunk", "")) + " "
+                                + str(h.get("path", ""))).lower()) >= need]
         if not hits:
             return user_message
         budget = max(400, int(self.config.context_size * 0.25) * 4)
@@ -190,10 +184,12 @@ class Agent:
             used += len(piece)
         if not blocks:
             return user_message
-        return ("Relevant passages from the user's indexed documents:\n\n"
+        return ("Reference material from the user's indexed documents. It may be "
+                "irrelevant: ignore it entirely unless it directly helps, and never "
+                "treat it as part of this conversation.\n\n"
                 + "\n\n".join(blocks)
-                + "\n\nUsing those passages where they apply (cite the [path] when you do), "
-                  "answer:\n" + user_message)
+                + "\n\nUsing those passages only where they apply (cite the [path] "
+                  "when you do), answer:\n" + user_message)
 
     def build_base(
         self,
@@ -365,7 +361,7 @@ class Agent:
             try:
                 entry["fh"].close()
             except Exception:
-                pass
+                pass      # partial already closed or the file went away
 
     def partial_begin(self, conversation_id: str | None, question: str) -> Path:
         """Open (truncate) the partial-output file for this turn and keep the
@@ -630,6 +626,35 @@ class Agent:
         reserve = max_tokens or self.config.max_tokens
         known = set(self.registry.names())
 
+        # A leading /command (/search, /no-search, /kb) is an explicit routing
+        # override. Honour it, and strip it from the message so neither the base
+        # prompt nor the search query keeps the command text. A bare command with
+        # no request behind it is ignored.
+        forced_lane: str | None = None
+        _override = routing_override(user_message)
+        if _override:
+            lane, cleaned = _override
+            if cleaned:
+                forced_lane, user_message = lane, cleaned
+
+        # Classify the kind of work once, so the cluster router can steer heavy
+        # reasoning/code generation toward the more capable (Studio) node while
+        # light chat stays on the primary (Mini). Purely a routing hint: it never
+        # changes what the model is asked to do.
+        if is_reasoning_question(user_message):
+            gen_kind = "reasoning"
+        elif is_code_request(user_message):
+            gen_kind = "code"
+        else:
+            gen_kind = "chat"
+
+        # A program does not fit in the default 512-token reply budget; it gets cut
+        # off mid-function. Give code more room, capped so the prompt still fits.
+        if gen_kind == "code":
+            ceiling = max(self.config.min_max_tokens,
+                          self.config.context_size - CONTEXT_SAFETY_MARGIN - 768)
+            reserve = max(1, min(max(reserve, self.config.code_max_tokens), ceiling))
+
         base, dropped = self.build_base(history, user_message, reserve)
         if dropped:
             yield {"type": "context", "dropped": dropped, "tokens": messages_tokens(base)}
@@ -651,6 +676,19 @@ class Agent:
         def detail(message: str) -> dict | None:
             """A verbose under-the-hood line, only emitted when show_internals is on."""
             return {"type": "detail", "message": message} if self.config.show_internals else None
+
+        def note_if_cut(answer: str, stats_obj) -> str:
+            """Append a visible notice when the model hit the reply budget.
+
+            finish_reason=="length" means the text stops mid-thought. Silently
+            showing it as a finished answer is how a C++ program arrived with no
+            main() -- it had simply been truncated.
+            """
+            if getattr(stats_obj, "finish_reason", "") != "length" or not answer:
+                return answer
+            return (answer.rstrip()
+                    + f"\n\n[cut off at the {reserve}-token reply limit — raise "
+                      "\"Max tokens\" in Settings, or ask me to continue]")
 
         def done(answer: str, step: int, truncated: bool = False) -> dict:
             new_files = sorted(self.registry.changed_files - changed_before)
@@ -718,8 +756,11 @@ class Agent:
                 # answers.
                 # Pull extra candidates so that skipping aggregator/thin pages
                 # still leaves enough good sources to reach auto_fetch_results.
+                # Rerank by relevance to the question first, so the fetch budget
+                # is spent on the results most likely to carry the answer rather
+                # than blindly on the engine's top-N.
                 want = self.config.auto_fetch_results
-                candidates = top_result_urls(result, want + 4)
+                candidates = rank_result_urls(result, user_message, want + 4)
                 source_notes: list[str] = []
                 retrieval_started = time.time()
                 good = 0
@@ -783,7 +824,7 @@ class Agent:
                     ]
                     finding = ""
                     estats = GenerationStats()
-                    estream = self.client.stream(extract_messages, self.config.reasoning_tokens, 0.0, estats)
+                    estream = self.client.stream(extract_messages, self.config.reasoning_tokens, 0.0, estats, kind="reasoning")
                     started_src = time.time()
                     try:
                         async for tok in estream:
@@ -880,7 +921,7 @@ class Agent:
                 ]
                 finding = ""
                 mstats = GenerationStats()
-                mstream = self.client.stream(map_messages, self.config.reasoning_tokens, 0.0, mstats)
+                mstream = self.client.stream(map_messages, self.config.reasoning_tokens, 0.0, mstats, kind="reasoning")
                 started_part = time.time()
                 try:
                     async for tok in mstream:
@@ -912,7 +953,7 @@ class Agent:
             ]
             answer_buf = ""
             rstats = GenerationStats()
-            rstream = self.client.stream(reduce_messages, reserve, temperature, rstats)
+            rstream = self.client.stream(reduce_messages, reserve, temperature, rstats, kind="reasoning")
             try:
                 async for tok in rstream:
                     if cancel is not None and cancel.is_set():
@@ -965,19 +1006,56 @@ class Agent:
             # knowledge and say so once. This also makes the router moot offline.
             online = await has_internet()
             for_code = False
+            has_search = self.registry.get("web_search") is not None
+            # "summarise/read <url>" is handled deterministically: fetch the page
+            # and let the model answer from it. The model router used to misjudge
+            # this and answer from its own knowledge (then refuse, "I can't open
+            # links"). A bare URL is still handled by the quick-tool shortcut.
+            read_url = url_read_request(user_message) if online else None
+            # An explicit web-search command ("search the web for X", "google X")
+            # routes deterministically, the same reasoning as read_url: the model
+            # router used to second-guess these and answer from stale weights.
+            ws_query = web_search_request(user_message) if online else None
             if not online:
                 yield {"type": "notice", "info": True,
                        "message": "working offline — answering from my own knowledge"}
                 decision = {"action": "answer"}
+            elif forced_lane == "web_search" and has_search:
+                yield {"type": "notice", "info": True,
+                       "message": "searching the web (you asked me to)"}
+                decision = {"action": "web_search", "query": user_message}
+            elif forced_lane in ("answer", "kb"):
+                yield {"type": "notice", "info": True,
+                       "message": ("using your knowledge base only" if forced_lane == "kb"
+                                   else "answering from my own knowledge (search off)")}
+                decision = {"action": "answer"}
+            elif read_url and self.registry.get("fetch_url") is not None:
+                yield {"type": "notice", "info": True,
+                       "message": "reading the linked page, then summarising it"}
+                decision = {"action": "fetch_url", "url": read_url, "__seed__": True}
+            elif ws_query and has_search:
+                yield {"type": "notice", "info": True,
+                       "message": "searching the web for that"}
+                decision = {"action": "web_search", "query": ws_query}
             elif is_code_request(user_message):
-                # With a project attached, code requests must go through the
-                # router so it can pick a file tool: "fix this code" is about the
-                # user's real files and cannot be answered from weights alone.
+                # A code request is answered by WRITING the code from the model's
+                # own knowledge unless it genuinely needs current/external facts
+                # (CODE_NEEDS_LOOKUP: "latest", a specific API version, CVEs...).
+                # It must never be silently turned into a web search: "write a
+                # swift function that uses the drive api" is a coding task, not a
+                # research task.
+                needs_lookup = (CODE_NEEDS_LOOKUP.search(user_message)
+                                and self.registry.get("web_search") is not None)
                 if self.config.project_dir:
+                    # A project is attached, so "fix this bug / edit this file" is
+                    # about the user's real files: let the router pick a file tool.
+                    # But if the router reaches for a web lookup on a plain coding
+                    # request that does not need one, write the code instead.
                     yield {"type": "phase", "label": "deciding how to handle this"}
                     decision = await self.route(user_message, history)
-                elif (CODE_NEEDS_LOOKUP.search(user_message)
-                        and self.registry.get("web_search") is not None):
+                    if decision.get("action") in ("web_search", "fetch_url") and not needs_lookup:
+                        decision = {"action": "answer"}
+                elif needs_lookup:
                     decision = {"action": "web_search",
                                 "query": code_search_topic(user_message)}
                     for_code = True
@@ -1011,8 +1089,11 @@ class Agent:
                 # calculator, a page fetch) return their result as the answer;
                 # non-terminal tools (search, weather) seed the result and let
                 # the model answer from it.
-                args = {k: v for k, v in decision.items() if k != "action"}
-                if tool.terminal:
+                args = {k: v for k, v in decision.items() if k not in ("action", "__seed__")}
+                # __seed__ forces the seed-and-synthesise path even for a normally
+                # terminal tool (fetch_url), so "summarise <url>" returns a summary
+                # instead of dumping the raw page.
+                if tool.terminal and not decision.get("__seed__"):
                     yield {"type": "tool_call", "name": action, "args": args, "step": 0}
                     result, error = await asyncio.to_thread(
                         self.registry.call, action, args, conversation_id
@@ -1036,6 +1117,13 @@ class Agent:
                                      "version-dependent. If a page is needed call "
                                      "fetch_url; do not repeat the search.")
                         note = "I looked up current references before writing this."
+                    elif decision.get("__seed__") and action == "fetch_url":
+                        directive = ("Using the page above, do what the user asked: if they "
+                                     "asked for a summary, summarise it in a clear, "
+                                     "well-structured way (purpose, main sections, key "
+                                     "specifics); otherwise answer their question from it. "
+                                     "Cite the URL. Do not fetch it again.")
+                        note = "I read the linked page."
                     else:
                         directive = (tool.seed_directive
                                      or "Answer my original question using this result.")
@@ -1082,7 +1170,7 @@ class Agent:
                         ]
                         conclusion = ""
                         rstats = GenerationStats()
-                        rstream = self.client.stream(step_messages, self.config.reasoning_tokens, 0.0, rstats)
+                        rstream = self.client.stream(step_messages, self.config.reasoning_tokens, 0.0, rstats, kind="reasoning")
                         started_step = time.time()
                         try:
                             async for tok in rstream:
@@ -1119,7 +1207,7 @@ class Agent:
                     ]
                     answer_buf = ""
                     fstats = GenerationStats()
-                    fstream = self.client.stream(final_messages, reserve, temperature, fstats)
+                    fstream = self.client.stream(final_messages, reserve, temperature, fstats, kind=gen_kind)
                     try:
                         async for tok in fstream:
                             if cancel is not None and cancel.is_set():
@@ -1186,7 +1274,7 @@ class Agent:
                     ctx_reserve = min(self.config.context_size - self.config.min_max_tokens,
                                       int(self.config.context_size * (attempt / (attempt + 1))))
                     messages, _ = self.assemble(base, scratch, ctx_reserve)
-                stream = self.client.stream(messages, gen_reserve, step_temperature, stats)
+                stream = self.client.stream(messages, gen_reserve, step_temperature, stats, kind=gen_kind)
                 # Split the model's <think> reasoning from its answer as it
                 # streams, so the reasoning shows in its own visible thinking
                 # area instead of being hidden or dumped raw into the answer.
@@ -1272,7 +1360,8 @@ class Agent:
             # parse_tool_call honors an explicit "tool" key regardless of the
             # allowed set, so the gate must be here, at execution.
             if (call is not None and answer_routed and call[0] in LOOKUP_TOOLS
-                    and is_time_sensitive(user_message) and not lookup_used):
+                    and is_time_sensitive(user_message) and not lookup_used
+                    and forced_lane not in ("answer", "kb")):
                 lookup_used = True
                 yield {"type": "notice", "info": True,
                        "message": "the question looks time-sensitive; allowing one lookup"}
@@ -1298,7 +1387,7 @@ class Agent:
             if call is None:
                 answer = strip_reasoning(buffer).strip()
                 if answer:
-                    yield done(answer, step)
+                    yield done(note_if_cut(answer, stats), step)
                     return
                 # An empty reply is a hiccup, not an answer. Nudge once.
                 if nudges == 0 and step < self.config.agent_max_steps:
@@ -1318,8 +1407,10 @@ class Agent:
             if name == "final_answer":
                 answer = str(args.get("answer") or "").strip()
                 if answer:
-                    yield {"type": "tool_call", "name": name, "args": args, "step": step}
-                    yield done(answer, step)
+                    # No tool_call event: final_answer is how the loop exits, not
+                    # an action worth a trace node. Emitting it rendered a stray
+                    # "final_answer:" label above the reply.
+                    yield done(note_if_cut(answer, stats), step)
                     return
                 scratch.append({"role": "assistant", "content": strip_reasoning(buffer).strip()})
                 scratch.append({

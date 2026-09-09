@@ -69,6 +69,38 @@ def strip_module(text: str) -> tuple[str, list[str]]:
     return "\n".join(body).strip("\n"), imports
 
 
+def merge_imports(lines: list[str]) -> list[str]:
+    """Collapse the collected import lines into one statement per module.
+
+    Modules import only what they use, so the same module arrives here through
+    several different lines ("from dataclasses import dataclass" from one file,
+    "from dataclasses import dataclass, field" from another). De-duplicating by
+    line text alone would emit all of them: correct, but three redundant imports
+    where one belongs. Union the names per module instead.
+    """
+    plain: list[str] = []                       # "import x" / "import x as y"
+    froms: dict[str, list[str]] = {}            # module -> imported names
+    for line in lines:
+        node = ast.parse(line.strip()).body[0]
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                label = ("import " + alias.name
+                         + (f" as {alias.asname}" if alias.asname else ""))
+                if label not in plain:
+                    plain.append(label)
+        else:                                    # ast.ImportFrom
+            module = "." * node.level + (node.module or "")
+            names = froms.setdefault(module, [])
+            for alias in node.names:
+                label = alias.name + (f" as {alias.asname}" if alias.asname else "")
+                if label not in names:
+                    names.append(label)
+    merged = sorted(plain)
+    merged += [f"from {module} import " + ", ".join(sorted(names))
+               for module, names in sorted(froms.items())]
+    return merged
+
+
 def main() -> None:
     seen_imports: list[str] = []
     chunks: list[str] = []
@@ -85,7 +117,7 @@ def main() -> None:
         "this file; re-run `python3 bundle.py` to rebuild.\n"
         '"""\n\n'
         "from __future__ import annotations\n\n"
-        + "\n".join(sorted(set(seen_imports))) + "\n\n\n"
+        + "\n".join(merge_imports(seen_imports)) + "\n\n\n"
     )
     footer = '\n\nif __name__ == "__main__":\n    main()\n'
     OUT.write_text(header + "\n\n\n".join(chunks) + footer)

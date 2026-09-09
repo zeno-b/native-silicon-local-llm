@@ -102,6 +102,22 @@ def get_acting_user() -> str | None:
     return _acting_user.get()
 
 
+# Which conversation the current unit of work belongs to. Bound per tool call in
+# a contextvar (not on the shared registry instance) so concurrent requests --
+# each running its tools in its own ``asyncio.to_thread`` copied context -- never
+# clobber each other's conversation id.
+_acting_conversation: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "acting_conversation", default=None)
+
+
+def set_acting_conversation(conversation_id: str | None) -> None:
+    _acting_conversation.set(conversation_id)
+
+
+def get_acting_conversation() -> str | None:
+    return _acting_conversation.get()
+
+
 def new_correlation_id() -> str:
     """A fresh short, URL-safe correlation id."""
     return uuid.uuid4().hex[:16]
@@ -373,7 +389,7 @@ def configure_logging(config: Any = None, *, force: bool = False) -> None:
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
     except Exception:
-        pass
+        pass          # read-only volume: keep console logging rather than dying
 
     formatter: logging.Formatter = JsonFormatter() if fmt == "json" else TextFormatter()
     redaction = RedactionFilter()
@@ -404,6 +420,12 @@ def configure_logging(config: Any = None, *, force: bool = False) -> None:
     except Exception as exc:  # pragma: no cover - disk/perm issues are non-fatal
         root.warning("could not open app.log for rotation: %s", exc)
 
+    # Quiet chatty third-party loggers that would otherwise emit an INFO line
+    # per outbound call (httpx logs every request; hpack/httpcore are verbose at
+    # DEBUG). Their warnings/errors still surface.
+    for _noisy in ("httpx", "httpcore", "hpack", "urllib3"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
+
     _prune_old_logs(log_dir, retention_days)
     _CONFIGURED["done"] = True
     log_event(get_logger("boot"), logging.INFO, "logging.configured",
@@ -425,7 +447,7 @@ def _prune_old_logs(log_dir: Path, retention_days: int) -> None:
             except OSError:
                 continue
     except Exception:
-        pass
+        pass          # pruning is housekeeping; never let it block startup
 
 
 def chat_content_level() -> str:
@@ -510,6 +532,8 @@ __all__ = [
     "get_correlation_id",
     "set_acting_user",
     "get_acting_user",
+    "set_acting_conversation",
+    "get_acting_conversation",
     "bind_context",
     "reset_context",
     "clear_context",

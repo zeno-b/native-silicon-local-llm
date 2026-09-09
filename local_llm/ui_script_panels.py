@@ -47,7 +47,8 @@ UI_JS_PANELS = r"""   // ---------------------------------------------------- hi
        exp.textContent = "Export";
        exp.title = "Download as Markdown";
        exp.onclick = function() {
-         window.location = "/api/conversation/" + encodeURIComponent(id) + "/export?format=markdown";
+         downloadFile("/api/conversation/" + encodeURIComponent(id) + "/export?format=markdown",
+                      "conversation-" + id + ".md");
        };
        var del = document.createElement("button");
        del.textContent = "Delete";
@@ -212,7 +213,13 @@ UI_JS_PANELS = r"""   // ---------------------------------------------------- hi
        form.append("file", files[i]);
        try {
          var resp = await fetch("/api/docs/upload", { method: "POST", body: form });
-         var data = await resp.json();
+         if (resp.status === 401 && typeof onUnauthorized === "function") { onUnauthorized(); return; }
+         var data = {};
+         try { data = await resp.json(); } catch (e) {}
+         if (!resp.ok) {
+           alert(files[i].name + ": " + (data.error || data.detail || ("HTTP " + resp.status)));
+           continue;
+         }
          if (data.error) { alert(files[i].name + ": " + data.error); continue; }
          addSystem(data.result || ("Indexed " + files[i].name));
        } catch (err) {
@@ -251,19 +258,24 @@ UI_JS_PANELS = r"""   // ---------------------------------------------------- hi
      { label: "Search conversations", hint: "history", run: function() { showView("history"); } },
      { label: "Export this conversation", hint: "markdown", run: function() { exportChat(); } },
      { label: "Prompt library", hint: "saved prompts", run: function() { togglePrompts(); } },
-     { label: "Knowledge base", hint: "index documents", run: function() { showView("models"); } },
+     { label: "Knowledge base", hint: "index documents", admin: true, run: function() { showAdminSection("knowledge"); } },
+     { label: "Agents", hint: "what each agent can do", admin: true, run: function() { showAdminSection("agents"); } },
+     { label: "Users", hint: "accounts and roles", admin: true, run: function() { showAdminSection("users"); } },
+     { label: "Cluster & routing", hint: "node health", admin: true, run: function() { showAdminSection("cluster"); } },
      { label: "Toggle theme", hint: "light / dark", run: function() { toggleTheme(); } },
-     { label: "Download backup", hint: "save everything", run: function() { downloadBackup(); } },
-     { label: "Settings", hint: "model and generation", run: function() { toggleSettings(); } },
+     { label: "Download backup", hint: "save everything", admin: true, run: function() { downloadBackup(); } },
+     { label: "Settings", hint: "model and generation", admin: true, run: function() { toggleSettings(); } },
      { label: "Chat", hint: "back to the conversation", run: function() { showView("chat"); } },
-     { label: "Tasks", hint: "scheduled jobs", run: function() { showView("tasks"); } }
+     { label: "Tasks", hint: "scheduled jobs", admin: true, run: function() { showView("tasks"); } }
    ];
    var paletteSel = 0;
 
    function renderPalette() {
      var q = (document.getElementById("paletteInput").value || "").toLowerCase();
      var list = document.getElementById("paletteList");
+     var isAdmin = document.body.dataset.role === "admin";
      var matches = PALETTE_COMMANDS.filter(function(c) {
+       if (c.admin && !isAdmin) return false;  // never expose admin actions to a non-admin
        return !q || c.label.toLowerCase().indexOf(q) >= 0 || c.hint.toLowerCase().indexOf(q) >= 0;
      });
      if (paletteSel >= matches.length) paletteSel = 0;
@@ -372,8 +384,26 @@ UI_JS_PANELS = r"""   // ---------------------------------------------------- hi
 
    // ---------------------------------------------------------- backup ---
 
-   function downloadBackup() {
-     window.location = "/api/backup";
+   async function downloadBackup() {
+     // Fetch + blob-download instead of navigating the tab, so a 403/404/500
+     // shows an alert rather than replacing the whole app with an error body.
+     try {
+       var resp = await fetch("/api/backup");
+       if (resp.status === 401 && typeof onUnauthorized === "function") { onUnauthorized(); return; }
+       if (!resp.ok) {
+         var e = {}; try { e = await resp.json(); } catch (x) {}
+         alert("Backup failed: " + (e.error || e.detail || ("HTTP " + resp.status)));
+         return;
+       }
+       var text = await resp.text();
+       var a = document.createElement("a");
+       a.href = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+       a.download = "backup-" + Date.now() + ".json";
+       document.body.appendChild(a); a.click(); a.remove();
+       URL.revokeObjectURL(a.href);
+     } catch (err) {
+       alert("Backup failed: " + err.message);
+     }
    }
 
    async function restoreBackup(file) {
@@ -399,6 +429,9 @@ UI_JS_PANELS = r"""   // ---------------------------------------------------- hi
      loadDatasetStats();
      loadDocsStats();
      loadProjectStatus();
+     loadUsers();
+     loadAgents();
+     loadCluster();
      try {
        var out = await fetchJSON("/api/models");
        var current = out.data.current;
@@ -441,7 +474,19 @@ UI_JS_PANELS = r"""   // ---------------------------------------------------- hi
          option.textContent = item.id + (item.modified ? "  (" + relativeTime(item.modified) + ")" : "");
          select.appendChild(option);
        });
-       select.value = current.adapter;
+       // Only select an adapter that is actually offered. `current.adapter` is the
+       // REQUESTED choice (often "latest"), which is not in the list on an install
+       // that has never trained one -- assigning it left the dropdown blank and a
+       // subsequent Apply submitted an empty adapter.
+       var wanted = current.adapter;
+       var offered = Array.prototype.map.call(select.options, function(o) { return o.value; });
+       if (offered.indexOf(wanted) < 0) {
+         var opt = document.createElement("option");
+         opt.value = wanted;
+         opt.textContent = wanted + "  (not built yet)";
+         select.insertBefore(opt, select.firstChild);
+       }
+       select.value = wanted;
        document.getElementById("kvSize").value = current.max_kv_size || 0;
      } catch (err) {
        document.getElementById("modelCurrent").textContent = "Could not load models: " + err.message;
@@ -492,12 +537,383 @@ UI_JS_PANELS = r"""   // ---------------------------------------------------- hi
      }
    }
 
+   // ------------------------------------------------------- user admin ---
+
+   async function loadUsers() {
+     var host = document.getElementById("usersList");
+     if (!host) return;
+     try {
+       var out = await fetchJSON("/api/users");
+       var users = out.data.users || [];
+       host.innerHTML = "";
+       if (!users.length) { host.textContent = "No users yet."; return; }
+       users.forEach(function(u) {
+         var row = document.createElement("div");
+         row.className = "row";
+         row.style.alignItems = "center";
+         row.style.padding = "4px 0";
+         var who = document.createElement("div");
+         who.style.flex = "1 1 auto";
+         who.textContent = u.username +
+           (u.display_name && u.display_name !== u.username ? " (" + u.display_name + ")" : "") +
+           (u.source && u.source !== "local" ? "  · " + u.source : "");
+         var pillWrap = document.createElement("div");
+         pillWrap.style.flex = "0 0 auto";
+         var pill = statusPill(u.disabled ? "" : "ok");
+         pill.textContent = u.role + (u.disabled ? " · disabled" : "");
+         pillWrap.appendChild(pill);
+         var actions = document.createElement("div");
+         actions.style.flex = "0 0 auto";
+         actions.style.display = "flex";
+         actions.style.gap = "6px";
+         var roleBtn = document.createElement("button");
+         roleBtn.textContent = u.role === "admin" ? "Make user" : "Make admin";
+         roleBtn.onclick = function() { updateUser(u.id, { role: u.role === "admin" ? "user" : "admin" }); };
+         var disBtn = document.createElement("button");
+         disBtn.textContent = u.disabled ? "Enable" : "Disable";
+         disBtn.onclick = function() { updateUser(u.id, { disabled: !u.disabled }); };
+         var delBtn = document.createElement("button");
+         delBtn.textContent = "Delete";
+         delBtn.onclick = function() {
+           if (window.confirm("Delete user " + u.username + "? Their data stays but they can "
+               + "no longer sign in.")) deleteUser(u.id);
+         };
+         actions.appendChild(roleBtn);
+         actions.appendChild(disBtn);
+         actions.appendChild(delBtn);
+         row.appendChild(who);
+         row.appendChild(pillWrap);
+         row.appendChild(actions);
+         host.appendChild(row);
+       });
+     } catch (err) {
+       host.textContent = "Could not load users: " + err.message;
+     }
+   }
+
+   async function createUser() {
+     var name = (document.getElementById("newUserName").value || "").trim();
+     var pass = document.getElementById("newUserPass").value || "";
+     var role = document.getElementById("newUserRole").value || "user";
+     if (!name || !pass) { alert("Enter a username and a password for the new user."); return; }
+     try {
+       await fetchJSON("/api/users", {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+         body: JSON.stringify({ username: name, password: pass, role: role })
+       });
+       document.getElementById("newUserName").value = "";
+       document.getElementById("newUserPass").value = "";
+       loadUsers();
+     } catch (err) {
+       alert("Could not create user: " + err.message);
+     }
+   }
+
+   async function updateUser(id, patch) {
+     try {
+       await fetchJSON("/api/users/" + encodeURIComponent(id), {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+         body: JSON.stringify(patch)
+       });
+       loadUsers();
+     } catch (err) {
+       alert("Could not update user: " + err.message);
+     }
+   }
+
+   async function deleteUser(id) {
+     try {
+       await fetchJSON("/api/users/" + encodeURIComponent(id), { method: "DELETE" });
+       loadUsers();
+     } catch (err) {
+       alert("Could not delete user: " + err.message);
+     }
+   }
+
+   // --------------------------------------------------- cluster / routing ---
+
+   async function loadCluster() {
+     var host = document.getElementById("clusterNodes");
+     if (host) {
+       try {
+         var out = await fetchJSON("/api/cluster/nodes");
+         var d = out.data;
+         var nodes = d.nodes || [];
+         var lines = [];
+         lines.push("Topology: " + (d.multi_node ? "multi-node" : "single node")
+                    + "   (this node's role: " + (d.node_role || "primary") + ")");
+         nodes.forEach(function(n) {
+           lines.push("");
+           lines.push(n.name + "  [" + n.role + "]  " + n.state + (n.is_local ? "  (local)" : ""));
+           if (n.machine || n.ram_gb) {
+             lines.push("  hardware " + (n.machine || "?")
+                        + (n.cores ? "  " + n.cores + " cores" : "")
+                        + (n.ram_gb ? "  " + n.ram_gb + "GB RAM" : ""));
+           }
+           lines.push("  active " + n.active
+                      + "   latency " + (n.last_latency_ms != null ? n.last_latency_ms + "ms" : "-")
+                      + "   load " + (n.load_ratio != null ? n.load_ratio + "x/core" : "-")
+                      + "   cpu " + (n.cpu_pct != null ? n.cpu_pct + "%" : "n/a")
+                      + "   mem " + (n.mem_pct != null ? n.mem_pct + "%" : "n/a"));
+           lines.push("  caps " + ((n.capabilities || []).join(", ") || "-")
+                      + (n.consecutive_failures ? "   failures " + n.consecutive_failures : "")
+                      + (n.cooldown_remaining_s != null ? "   cooldown " + n.cooldown_remaining_s + "s" : ""));
+           if (n.model) lines.push("  model " + n.model);
+         });
+         host.textContent = lines.join("\n");
+         var sum = document.getElementById("routingSummary");
+         if (sum) {
+           var byNode = (d.routing_summary && d.routing_summary.by_node) || {};
+           var parts = Object.keys(byNode).map(function(node) {
+             var st = byNode[node];
+             var inner = Object.keys(st).map(function(k) { return k + " " + st[k]; }).join(", ");
+             return node + " (" + inner + ")";
+           });
+           sum.textContent = parts.length ? ("Routing totals — " + parts.join("; ")) : "";
+         }
+       } catch (err) {
+         host.textContent = "Could not load cluster: " + err.message;
+       }
+     }
+     var evbox = document.getElementById("routingEvents");
+     if (!evbox) return;
+     try {
+       var eo = await fetchJSON("/api/routing/events?limit=40");
+       var events = eo.data.events || [];
+       if (!events.length) { evbox.textContent = "No routing decisions recorded yet."; return; }
+       evbox.textContent = events.map(function(e) {
+         return (e.created_at || "") + "  " + (e.selected_node || "?")
+                + "  [" + (e.status || "") + "]  " + (e.kind || "")
+                + (e.requested_model ? "  " + e.requested_model : "")
+                + (e.reason ? "  — " + e.reason : "");
+       }).join("\n");
+     } catch (err) {
+       evbox.textContent = "Could not load routing events: " + err.message;
+     }
+   }
+
+   // Open the admin view on a specific section (the view alone defaults to Model).
+   function showAdminSection(name) {
+     window._adminTab = name;
+     showView("models");
+     showAdminTab(name);
+   }
+
+   // Admin sub-tabs: show one section of the admin view at a time.
+   function showAdminTab(name) {
+     window._adminTab = name;
+     document.querySelectorAll("#adminPanels .panel").forEach(function(p) {
+       p.hidden = (p.dataset.mg !== name);
+     });
+     document.querySelectorAll("#adminTabs button").forEach(function(b) {
+       b.classList.toggle("active", b.getAttribute("data-mg-tab") === name);
+     });
+   }
+
+   // -------------------------------------------------------- agents ------ #
+
+   var _agentCaps = [];
+   var _agentRuntime = {};
+
+   async function loadAgentCaps() {
+     try {
+       var out = await fetchJSON("/api/agents/capabilities");
+       _agentCaps = out.data.capabilities || [];
+       _agentRuntime = out.data.runtime || {};
+     } catch (err) { _agentCaps = []; _agentRuntime = {}; }
+   }
+
+   // Render the capability checkboxes into `host`, pre-checking `selected` keys.
+   // Returns a reader for the currently-checked capability keys.
+   function renderCaps(host, selected) {
+     host.innerHTML = "";
+     var sel = {};
+     (selected || []).forEach(function(k) { sel[k] = true; });
+     var boxes = [];
+     if (!_agentCaps.length) {
+       // The catalogue failed to load; say so instead of showing an empty grid
+       // that looks like "this agent has no capabilities to choose from".
+       host.textContent = "Could not load the capability list — refresh to try again.";
+       return function() { return (selected || []).slice(); };
+     }
+     _agentCaps.forEach(function(c) {
+       var row = document.createElement("label");
+       row.className = "cap-item";
+       var cb = document.createElement("input");
+       cb.type = "checkbox"; cb.value = c.key; cb.checked = !!sel[c.key];
+       var note = "";
+       if (c.key === "code_exec" && !(_agentRuntime.allow_shell || _agentRuntime.allow_python)) {
+         note = " (server execution is off)";
+       }
+       if (c.key === "office365" && !_agentRuntime.office365_configured) {
+         note = " (not connected)";
+       }
+       var text = document.createElement("div"); text.className = "cap-text";
+       var lab = document.createElement("div"); lab.className = "cap-label";
+       lab.textContent = c.label + note;
+       var desc = document.createElement("div"); desc.className = "cap-desc";
+       desc.textContent = c.description;
+       text.appendChild(lab); text.appendChild(desc);
+       row.appendChild(cb); row.appendChild(text);
+       host.appendChild(row);
+       boxes.push(cb);
+     });
+     return function() {
+       return boxes.filter(function(b) { return b.checked; })
+                   .map(function(b) { return b.value; });
+     };
+   }
+
+   async function loadAgents() {
+     if (!_agentCaps.length) await loadAgentCaps();
+     var host = document.getElementById("agentsList");
+     if (!host) return;
+     try {
+       var out = await fetchJSON("/api/agents");
+       var agents = out.data.agents || [];
+       host.innerHTML = "";
+       if (!agents.length) host.textContent = "No agents yet — create one below.";
+       agents.forEach(function(a) {
+         var card = document.createElement("div"); card.className = "agent-card";
+         var head = document.createElement("div"); head.className = "agent-head";
+         var name = document.createElement("input");
+         name.type = "text"; name.value = a.name; name.className = "agent-name";
+         var sw = document.createElement("label"); sw.className = "switch";
+         var enc = document.createElement("input"); enc.type = "checkbox"; enc.checked = a.enabled;
+         var sl = document.createElement("span"); sl.className = "slider";
+         sw.appendChild(enc); sw.appendChild(sl); sw.title = "Enabled";
+         head.appendChild(name); head.appendChild(sw);
+         var desc = document.createElement("input");
+         desc.type = "text"; desc.value = a.description || ""; desc.placeholder = "description";
+         desc.className = "agent-desc";
+         var caps = document.createElement("div"); caps.className = "cap-grid";
+         var readCaps = renderCaps(caps, a.capabilities);
+         var actions = document.createElement("div"); actions.className = "row";
+         actions.style.marginTop = "6px";
+         var save = document.createElement("button"); save.className = "primary"; save.textContent = "Save";
+         save.onclick = function() { saveAgent(a.id, name.value, desc.value, readCaps(), enc.checked); };
+         var del = document.createElement("button"); del.textContent = "Delete";
+         del.onclick = function() { if (confirm("Delete agent " + a.name + "?")) deleteAgent(a.id); };
+         actions.appendChild(save); actions.appendChild(del);
+         card.appendChild(head); card.appendChild(desc); card.appendChild(caps); card.appendChild(actions);
+         host.appendChild(card);
+       });
+       var np = document.getElementById("newAgentCaps");
+       if (np) window._newAgentReadCaps = renderCaps(np, []);
+       var pick = document.getElementById("agentRunPick");
+       if (pick) {
+         pick.innerHTML = "";
+         window._agentRunBoxes = [];
+         var enabled = agents.filter(function(a) { return a.enabled; });
+         if (!enabled.length) { pick.textContent = "Enable at least one agent to run."; return; }
+         enabled.forEach(function(a) {
+           var row = document.createElement("label"); row.className = "cap-item";
+           var cb = document.createElement("input"); cb.type = "checkbox"; cb.value = a.id;
+           var text = document.createElement("div"); text.className = "cap-text";
+           var lab = document.createElement("div"); lab.className = "cap-label"; lab.textContent = a.name;
+           var d = document.createElement("div"); d.className = "cap-desc";
+           // Show the same human labels as the capability grid above, not the
+           // internal keys (file_ops, web_api, ...).
+           var labels = (a.capabilities || []).map(function(k) {
+             for (var i = 0; i < _agentCaps.length; i++) {
+               if (_agentCaps[i].key === k) return _agentCaps[i].label;
+             }
+             return k;
+           });
+           d.textContent = labels.join(", ") || "no capabilities";
+           text.appendChild(lab); text.appendChild(d);
+           row.appendChild(cb); row.appendChild(text);
+           pick.appendChild(row);
+           window._agentRunBoxes.push(cb);
+         });
+       }
+     } catch (err) {
+       host.textContent = "Could not load agents: " + err.message;
+     }
+   }
+
+   async function createAgent() {
+     var name = (document.getElementById("newAgentName").value || "").trim();
+     if (!name) { alert("Enter a name for the agent."); return; }
+     var desc = (document.getElementById("newAgentDesc").value || "").trim();
+     var caps = window._newAgentReadCaps ? window._newAgentReadCaps() : [];
+     try {
+       await fetchJSON("/api/agents", { method: "POST",
+         headers: { "Content-Type": "application/json" },
+         body: JSON.stringify({ name: name, description: desc, capabilities: caps }) });
+       document.getElementById("newAgentName").value = "";
+       document.getElementById("newAgentDesc").value = "";
+       loadAgents();
+     } catch (err) { alert("Could not create agent: " + err.message); }
+   }
+
+   async function saveAgent(id, name, description, capabilities, enabled) {
+     try {
+       await fetchJSON("/api/agents/" + encodeURIComponent(id), { method: "POST",
+         headers: { "Content-Type": "application/json" },
+         body: JSON.stringify({ name: name, description: description,
+                                capabilities: capabilities, enabled: enabled }) });
+       loadAgents();
+     } catch (err) { alert("Could not save agent: " + err.message); }
+   }
+
+   async function deleteAgent(id) {
+     try {
+       await fetchJSON("/api/agents/" + encodeURIComponent(id), { method: "DELETE" });
+       loadAgents();
+     } catch (err) { alert("Could not delete agent: " + err.message); }
+   }
+
+   async function runAgents() {
+     var ids = (window._agentRunBoxes || []).filter(function(b) { return b.checked; })
+                 .map(function(b) { return b.value; });
+     var prompt = (document.getElementById("agentRunPrompt").value || "").trim();
+     var out = document.getElementById("agentRunResult");
+     if (!ids.length) { alert("Select at least one agent to run."); return; }
+     if (!prompt) { alert("Enter a task for the agents."); return; }
+     out.textContent = "Running " + ids.length + " agent(s)... this can take a while.";
+     try {
+       var r = await fetchJSON("/api/agents/run", { method: "POST",
+         headers: { "Content-Type": "application/json" },
+         body: JSON.stringify({ prompt: prompt, agent_ids: ids }) });
+       var d = r.data || {};
+       out.innerHTML = "";
+       if (d.skipped) {
+         var warn = document.createElement("div");
+         warn.className = "hint";
+         warn.textContent = d.skipped + " selected agent(s) were not run: at most "
+           + (d.max_agents || "a few") + " run together.";
+         out.appendChild(warn);
+       }
+       if (d.merged) {
+         var m = document.createElement("div"); m.className = "agent-merged";
+         var h = document.createElement("div"); h.className = "cap-label"; h.textContent = "Merged answer";
+         var b = document.createElement("div"); b.className = "agent-answer";
+         renderMarkdown(d.merged, b);
+         m.appendChild(h); m.appendChild(b); out.appendChild(m);
+       }
+       (d.results || []).forEach(function(res) {
+         var box = document.createElement("details"); box.className = "agent-result";
+         var sum = document.createElement("summary");
+         sum.textContent = res.name + " — " + ((res.tools_used || []).join(", ") || "no tools used");
+         var body = document.createElement("div"); body.className = "agent-answer";
+         renderMarkdown(res.answer || "(no answer)", body);
+         box.appendChild(sum); box.appendChild(body); out.appendChild(box);
+       });
+       if (!d.merged && !(d.results || []).length) out.textContent = "No results.";
+     } catch (err) { out.textContent = "Run failed: " + err.message; }
+   }
+
    wireDropZone();
 
    // Restore the saved colour scheme before anything renders.
    try {
-     applyTheme(localStorage.getItem("llm_theme") === "light" ? "light" : "dark");
-   } catch (err) { applyTheme("dark"); }
+     // Default to light: it mirrors the texcel.be brand look. The toggle and
+     // localStorage still let a user switch to (and keep) the dark variant.
+     applyTheme(localStorage.getItem("llm_theme") === "dark" ? "dark" : "light");
+   } catch (err) { applyTheme("light"); }
 
    var _restoreInput = document.getElementById("restoreInput");
    if (_restoreInput) _restoreInput.addEventListener("change", function() {

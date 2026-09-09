@@ -5,37 +5,13 @@ Split out of the original single-file deploy.py; behaviour is unchanged.
 
 from __future__ import annotations
 
-import argparse
-import ast
-import asyncio
-import csv
-import html
-import hashlib
-import json
 import logging
-import math
-import operator
-import os
-import platform
-import random
-import re
-import shutil
-import signal
-import socket
-import sqlite3
-import traceback
-import shlex
 import subprocess
 import sys
-import textwrap
 import threading
 import time
-import urllib.parse
-import uuid
-from dataclasses import dataclass, field, asdict, replace as dataclass_replace
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, Literal
+from typing import Any
 
 from .core import *  # noqa: F401,F403
 from .sysutil import *  # noqa: F401,F403
@@ -76,6 +52,9 @@ class ModelServerManager:
         # Set by stop(). Both readiness waits poll it, so a stop or a retrain no
         # longer blocks behind a start that is 900 seconds from timing out.
         self._cancel = threading.Event()
+        # Cache the last live health-probe result so the UI's 3-second poll does
+        # not trigger a real inference on the model server every time.
+        self._probe_cache: tuple[float, bool] = (0.0, False)
 
     def _build_cmd(self, use_adapter: bool) -> list[str]:
         cmd = [sys.executable, "-m", "mlx_lm.server"]
@@ -261,7 +240,7 @@ class ModelServerManager:
             try:
                 self._log_file.close()
             except Exception:
-                pass
+                pass      # best effort on shutdown; the OS closes it regardless
             self._log_file = None
 
     def _start_internal(self) -> None:
@@ -347,6 +326,22 @@ class ModelServerManager:
                 return resp.status_code == 200
         except Exception:
             return False
+
+    async def health_probe_cached(self, max_age: float = 15.0) -> bool:
+        """A cheap health signal for frequent polling (e.g. the UI status bar).
+
+        Returns the last live-probe result while it is fresher than `max_age`
+        seconds, and only runs a real one-token completion when the cache is
+        stale. This turns a per-3-second inference into one every ~15 seconds,
+        so the status bar no longer competes with real chat for the model.
+        """
+        now = time.time()
+        cached_at, value = self._probe_cache
+        if now - cached_at < max_age:
+            return value
+        value = await self.health_probe() if self.is_alive() else False
+        self._probe_cache = (time.time(), value)
+        return value
 
 
 

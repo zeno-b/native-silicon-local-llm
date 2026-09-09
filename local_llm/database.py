@@ -5,37 +5,16 @@ Split out of the original single-file deploy.py; behaviour is unchanged.
 
 from __future__ import annotations
 
-import argparse
-import ast
-import asyncio
-import csv
-import html
-import hashlib
 import json
 import logging
 import math
-import operator
-import os
-import platform
-import random
 import re
-import shutil
-import signal
-import socket
 import sqlite3
-import traceback
-import shlex
-import subprocess
-import sys
-import textwrap
 import threading
-import time
-import urllib.parse
 import uuid
-from dataclasses import dataclass, field, asdict, replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, Literal
+from typing import Any
 
 from .core import *  # noqa: F401,F403
 from .obslog import *  # noqa: F401,F403
@@ -87,7 +66,8 @@ class Database:
                     model_id TEXT,
                     trained_at TIMESTAMP,
                     source TEXT DEFAULT 'button',
-                    reviewed INTEGER DEFAULT 0
+                    reviewed INTEGER DEFAULT 0,
+                    pending_approval INTEGER DEFAULT 0
                 )
             """)
             # Migration: older databases predate trained_at.
@@ -104,6 +84,13 @@ class Database:
             if "reviewed" not in columns:
                 log("Migrating feedback table: adding reviewed column.")
                 conn.execute("ALTER TABLE feedback ADD COLUMN reviewed INTEGER DEFAULT 0")
+            # A non-admin's rating queues a row instead of approving it: the LoRA
+            # adapter is shared by every user, so unreviewed submissions must not
+            # be able to steer it. See the /api/feedback handler.
+            if "pending_approval" not in columns:
+                log("Migrating feedback table: adding pending_approval column.")
+                conn.execute(
+                    "ALTER TABLE feedback ADD COLUMN pending_approval INTEGER DEFAULT 0")
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_feedback_approved 
                 ON feedback(approved_for_training)
@@ -126,9 +113,12 @@ class Database:
             """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS prompts (
-                    name TEXT PRIMARY KEY,
+                    id INTEGER PRIMARY KEY,
+                    user_id TEXT NOT NULL DEFAULT 'local',
+                    name TEXT NOT NULL,
                     body TEXT NOT NULL,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, name)
                 )
             """)
             conn.execute("""
@@ -371,11 +361,17 @@ class Database:
                 counts TEXT,
                 warnings TEXT,
                 error TEXT,
+                artifacts TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 finished_at TIMESTAMP
             )
         """)
+        # `artifacts` (the exact conversations/docs an import created, so removal
+        # is precise) was added after the table; add it to older imports tables.
+        _imp_cols = {row["name"] for row in conn.execute("PRAGMA table_info(imports)")}
+        if "artifacts" not in _imp_cols:
+            conn.execute("ALTER TABLE imports ADD COLUMN artifacts TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_imports_user ON imports(user_id, created_at DESC)")
 
         # --- Node routing observability ----------------------------------- #
@@ -403,6 +399,24 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_routing_task ON routing_events(task_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_routing_node ON routing_events(selected_node, created_at DESC)")
 
+        # --- Agent profiles (named capability sets) ----------------------- #
+        # An agent is a saved profile: a name, a description, and the set of
+        # capabilities it is allowed to use (JSON list of capability keys, see
+        # config.CAPABILITY_GROUPS). The runtime turns capabilities into a tool
+        # allowlist. Shared across the install (admin-managed), like models.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agents (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                capabilities TEXT NOT NULL DEFAULT '[]',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_agents_name ON agents(name)")
+
         # --- Owner column on every user-owned table ----------------------- #
         # ADD COLUMN ... DEFAULT is constant so existing rows read as the
         # sentinel owner; the explicit UPDATE covers any pre-existing NULLs.
@@ -427,6 +441,12 @@ class Database:
                            ("tasks", "user_id"), ("documents", "user_id")):
             conn.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_{table}_user ON {table}({col})")
+        # The conversation list groups a user's messages by conversation and
+        # orders by recency. Covering all three columns lets SQLite walk the
+        # index instead of building a temporary b-tree over every message the
+        # user has ever sent, which is the one query that grows without bound.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_conv "
+                     "ON messages(user_id, conversation_id, created_at)")
 
         # --- memories: migrate the old (key-only PK) table if present ------ #
         mem_cols = {row["name"] for row in conn.execute("PRAGMA table_info(memories)")}
@@ -451,6 +471,29 @@ class Database:
                 (sentinel,))
             conn.execute("DROP TABLE memories_legacy")
 
+        # --- prompts: same story, name was the sole PRIMARY KEY ------------ #
+        # A global prompt store means every user reads, overwrites and deletes
+        # everyone else's saved prompts, and two users cannot both keep a
+        # "code-review". Rebuild with (user_id, name) unique.
+        prompt_cols = {row["name"] for row in conn.execute("PRAGMA table_info(prompts)")}
+        if prompt_cols and "user_id" not in prompt_cols:
+            log("Migrating prompts to per-user names ((user_id, name) unique).")
+            conn.execute("ALTER TABLE prompts RENAME TO prompts_legacy")
+            conn.execute("""
+                CREATE TABLE prompts (
+                    id INTEGER PRIMARY KEY,
+                    user_id TEXT NOT NULL DEFAULT 'local',
+                    name TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, name)
+                )
+            """)
+            conn.execute(
+                "INSERT INTO prompts (user_id, name, body, updated_at) "
+                "SELECT ?, name, body, updated_at FROM prompts_legacy", (sentinel,))
+            conn.execute("DROP TABLE prompts_legacy")
+
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         conn = self._connection()
         return conn.execute(sql, params)
@@ -467,7 +510,7 @@ class Database:
             try:
                 conn.close()
             except Exception:
-                pass
+                pass      # already closed, or closed from its owning thread
         self._local.conn = None
 
     def seed_demo(self) -> int:
@@ -516,23 +559,23 @@ class Database:
         return [dict(row) for row in rows]
 
     def get_stats(self) -> dict[str, int]:
-        total = self.execute("SELECT COUNT(*) as cnt FROM feedback").fetchone()["cnt"]
-        approved = self.execute("SELECT COUNT(*) as cnt FROM feedback WHERE approved_for_training = 1").fetchone()["cnt"]
-        positive = self.execute("SELECT COUNT(*) as cnt FROM feedback WHERE rating > 0").fetchone()["cnt"]
-        negative = self.execute("SELECT COUNT(*) as cnt FROM feedback WHERE rating < 0").fetchone()["cnt"]
-        corrected = self.execute("SELECT COUNT(*) as cnt FROM feedback WHERE corrected_response IS NOT NULL").fetchone()["cnt"]
-        untrained = self.execute(
-            "SELECT COUNT(*) as cnt FROM feedback "
-            "WHERE approved_for_training = 1 AND trained_at IS NULL"
-        ).fetchone()["cnt"]
-        return {
-            "total": total,
-            "approved": approved,
-            "untrained": untrained,
-            "positive": positive,
-            "negative": negative,
-            "corrected": corrected,
-        }
+        """Feedback counters for the admin status bar.
+
+        One pass with conditional sums rather than six COUNT queries: /api/health
+        polls this every few seconds, and six separate scans of the same table is
+        six times the work for the same numbers. SUM() over an empty table gives
+        NULL, hence the `or 0`.
+        """
+        row = self.execute(
+            "SELECT COUNT(*) AS total,"
+            " SUM(approved_for_training = 1) AS approved,"
+            " SUM(approved_for_training = 1 AND trained_at IS NULL) AS untrained,"
+            " SUM(rating > 0) AS positive,"
+            " SUM(rating < 0) AS negative,"
+            " SUM(corrected_response IS NOT NULL) AS corrected"
+            " FROM feedback").fetchone()
+        return {key: int(row[key] or 0) for key in
+                ("total", "approved", "untrained", "positive", "negative", "corrected")}
 
     def index_document(self, path: str, text: str, title: str = "",
                        chunk_chars: int = 1200, overlap: int = 150,
@@ -712,13 +755,20 @@ class Database:
         owner = ""
         params: list[Any] = [like]
         if user_id is not None:
-            owner = "AND user_id = ?"
+            owner = "AND m.user_id = ?"
             params.append(user_id)
         params.append(limit)
+        # LEFT JOIN the title/pin metadata in one pass. Fetching it per row was an
+        # N+1: a 30-result search issued 31 queries.
         rows = self.execute(
-            f"""SELECT conversation_id, role, content, MAX(created_at) AS created_at
-               FROM messages WHERE content LIKE ? ESCAPE '\\' {owner}
-               GROUP BY conversation_id ORDER BY created_at DESC LIMIT ?""",
+            f"""SELECT m.conversation_id AS conversation_id, m.role AS role,
+                      m.content AS content, MAX(m.created_at) AS created_at,
+                      cm.title AS meta_title, cm.pinned AS meta_pinned
+               FROM messages m
+               LEFT JOIN conversation_meta cm
+                      ON cm.conversation_id = m.conversation_id
+               WHERE m.content LIKE ? ESCAPE '\\' {owner}
+               GROUP BY m.conversation_id ORDER BY created_at DESC LIMIT ?""",
             tuple(params)).fetchall()
         out = []
         for r in rows:
@@ -726,8 +776,12 @@ class Database:
             idx = content.lower().find(query.lower())
             start = max(0, idx - 60)
             snippet = ("..." if start else "") + content[start:start + 200].strip()
+            # Same title/pinned fields the plain list provides: search rows go
+            # through the identical row renderer in the UI.
             out.append({"conversation_id": r["conversation_id"], "role": r["role"],
-                        "snippet": snippet, "created_at": r["created_at"]})
+                        "snippet": snippet, "created_at": r["created_at"],
+                        "title": r["meta_title"] or "",
+                        "pinned": bool(r["meta_pinned"])})
         return out
 
     def export_conversation(self, conversation_id: str, fmt: str = "markdown",
@@ -745,22 +799,36 @@ class Database:
             lines.append("")
         return "\n".join(lines)
 
-    def save_prompt(self, name: str, body: str) -> None:
+    # Prompts are per-user. They were one global store, so on a multi-user
+    # install every user saw, overwrote and deleted everyone else's prompts.
+    # user_id=None keeps the single-user (auth-off) behaviour unscoped.
+    def save_prompt(self, name: str, body: str, user_id: str | None = None) -> None:
         if not (name or "").strip():
             raise ValueError("a prompt needs a name")
         if not (body or "").strip():
             raise ValueError("a prompt needs a body")
         self.execute(
-            "INSERT OR REPLACE INTO prompts (name, body, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
-            (name.strip(), body))
+            "INSERT OR REPLACE INTO prompts (name, body, user_id, updated_at) "
+            "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+            (name.strip(), body, user_id or SENTINEL_LOCAL_USER))
         self.commit()
 
-    def list_prompts(self) -> list[dict]:
-        return [dict(r) for r in self.execute(
-            "SELECT name, body, updated_at FROM prompts ORDER BY name ASC").fetchall()]
+    def list_prompts(self, user_id: str | None = None) -> list[dict]:
+        if user_id is None:
+            rows = self.execute(
+                "SELECT name, body, updated_at FROM prompts ORDER BY name ASC").fetchall()
+        else:
+            rows = self.execute(
+                "SELECT name, body, updated_at FROM prompts WHERE user_id = ? "
+                "ORDER BY name ASC", (user_id,)).fetchall()
+        return [dict(r) for r in rows]
 
-    def delete_prompt(self, name: str) -> bool:
-        cur = self.execute("DELETE FROM prompts WHERE name = ?", (name,))
+    def delete_prompt(self, name: str, user_id: str | None = None) -> bool:
+        if user_id is None:
+            cur = self.execute("DELETE FROM prompts WHERE name = ?", (name,))
+        else:
+            cur = self.execute("DELETE FROM prompts WHERE name = ? AND user_id = ?",
+                               (name, user_id))
         self.commit()
         return cur.rowcount > 0
 
@@ -848,7 +916,10 @@ class Database:
                 continue
         for pr in section("prompts"):
             try:
-                self.save_prompt(pr.get("name", ""), pr.get("body", ""))
+                # Carry the owner across: the export row has it, and dropping it
+                # would restore every user's prompts into the shared library.
+                self.save_prompt(pr.get("name", ""), pr.get("body", ""),
+                                 user_id=pr.get("user_id"))
                 counts["prompts"] += 1
             except Exception:
                 continue
@@ -945,8 +1016,12 @@ class Database:
             "SELECT COUNT(DISTINCT a.user_prompt) FROM feedback a "
             "JOIN feedback b ON a.user_prompt = b.user_prompt "
             "WHERE a.approved_for_training = 1 AND b.rating < 0")
+        # Rows a non-admin submitted that an admin has not cleared for training
+        # yet. Surfaced so the queue is visible rather than silently growing.
+        pending = scalar("SELECT COUNT(*) FROM feedback "
+                         "WHERE approved_for_training = 0 AND pending_approval = 1")
         return {"total": total, "approved": approved, "rejected": rejected,
-                "reviewed": reviewed, "corrected": corrected,
+                "reviewed": reviewed, "corrected": corrected, "pending": pending,
                 "preference_pairs": pref, "by_source": by_source}
 
     def set_reviewed(self, feedback_id: int, reviewed: bool) -> bool:
@@ -954,6 +1029,23 @@ class Database:
                            (1 if reviewed else 0, feedback_id))
         self.commit()
         return cur.rowcount > 0
+
+    def set_approved(self, feedback_id: int, approved: bool) -> bool:
+        """Admin decision on one queued row. Clears pending_approval either way:
+        an explicit reject is a decision too, and should leave the queue."""
+        cur = self.execute(
+            "UPDATE feedback SET approved_for_training = ?, pending_approval = 0 "
+            "WHERE id = ?", (1 if approved else 0, feedback_id))
+        self.commit()
+        return cur.rowcount > 0
+
+    def approve_pending(self) -> int:
+        """Clear the whole queue in one go. Returns how many rows were approved."""
+        cur = self.execute(
+            "UPDATE feedback SET approved_for_training = 1, pending_approval = 0 "
+            "WHERE approved_for_training = 0 AND pending_approval = 1")
+        self.commit()
+        return cur.rowcount
 
     def export_rows(self, approved_only: bool, reviewed_only: bool) -> list[dict]:
         sql = "SELECT * FROM feedback WHERE 1=1"
@@ -989,11 +1081,6 @@ class Database:
         cursor = self.execute("DELETE FROM feedback WHERE id = ?", (feedback_id,))
         self.commit()
         return cursor.rowcount > 0
-
-    def clear_feedback(self) -> int:
-        cursor = self.execute("DELETE FROM feedback")
-        self.commit()
-        return cursor.rowcount
 
     def add_message(
         self,
@@ -1051,12 +1138,6 @@ class Database:
             return True
         return row["user_id"] == user_id
 
-    def conversation_owner(self, conversation_id: str) -> str | None:
-        row = self.execute(
-            "SELECT user_id FROM messages WHERE conversation_id = ? LIMIT 1",
-            (conversation_id,)).fetchone()
-        return row["user_id"] if row else None
-
     def clear_conversation(self, conversation_id: str, user_id: str | None = None) -> int:
         sql = "DELETE FROM messages WHERE conversation_id = ?"
         params: list[Any] = [conversation_id]
@@ -1079,23 +1160,35 @@ class Database:
             f"FROM messages {where} GROUP BY conversation_id ORDER BY last_at DESC LIMIT ?",
             (*params, limit),
         ).fetchall()
+        # Title + pin metadata and the fallback title come from two more queries
+        # PER ROW originally: listing 50 conversations cost 101 queries. Both are
+        # resolved in one extra pass over just the ids on this page.
+        ids = [r["conversation_id"] for r in rows]
+        meta_by_id: dict[str, dict] = {}
+        first_by_id: dict[str, str] = {}
+        if ids:
+            marks = ",".join("?" for _ in ids)
+            for m in self.execute(
+                    f"SELECT conversation_id, title, pinned FROM conversation_meta "
+                    f"WHERE conversation_id IN ({marks})", tuple(ids)).fetchall():
+                meta_by_id[m["conversation_id"]] = dict(m)
+            # One row per conversation: the earliest user message, as a fallback title.
+            for f in self.execute(
+                    f"SELECT conversation_id, content FROM messages WHERE id IN ("
+                    f"  SELECT MIN(id) FROM messages WHERE role = 'user' "
+                    f"  AND conversation_id IN ({marks}) GROUP BY conversation_id)",
+                    tuple(ids)).fetchall():
+                first_by_id[f["conversation_id"]] = f["content"] or ""
         out = []
         for row in rows:
             item = dict(row)
             cid = item["conversation_id"]
-            meta = self.execute(
-                "SELECT title, pinned FROM conversation_meta WHERE conversation_id = ?",
-                (cid,)).fetchone()
-            custom = (meta["title"] if meta else None)
-            item["pinned"] = bool(meta["pinned"]) if meta else False
-            if custom:
-                item["title"] = custom
-            else:
-                # Fall back to the first user message as a readable title.
-                first = self.execute(
-                    "SELECT content FROM messages WHERE conversation_id = ? AND role = 'user' "
-                    "ORDER BY id ASC LIMIT 1", (cid,)).fetchone()
-                item["title"] = ((first["content"] or "").strip()[:90] if first else "") or "(no messages)"
+            meta = meta_by_id.get(cid)
+            custom = (meta or {}).get("title")
+            item["pinned"] = bool((meta or {}).get("pinned"))
+            item["title"] = (custom
+                             or (first_by_id.get(cid, "").strip()[:90])
+                             or "(no messages)")
             out.append(item)
         # Pinned conversations float to the top, newest first within each group.
         out.sort(key=lambda c: (not c["pinned"], c.get("last_at") or ""), reverse=False)
@@ -1251,6 +1344,11 @@ class Database:
     def list_tasks(self) -> list[dict]:
         rows = self.execute("SELECT * FROM tasks ORDER BY created_at DESC").fetchall()
         return [dict(row) for row in rows]
+
+    def count_tasks(self) -> int:
+        """How many tasks exist. /api/health only needs the number, and building
+        a dict per row every few seconds to call len() on it is pure waste."""
+        return self.execute("SELECT COUNT(*) AS cnt FROM tasks").fetchone()["cnt"]
 
     def update_task(self, task_id: str, updates: dict) -> dict | None:
         task = self.get_task(task_id)
@@ -1537,6 +1635,13 @@ class Database:
                                 (role,)).fetchone()["c"]
         return self.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
 
+    def count_enabled_admins(self) -> int:
+        """Admins who can actually log in — the count the lockout guard must use
+        (a disabled admin does not keep you from being locked out)."""
+        return self.execute(
+            "SELECT COUNT(*) AS c FROM users WHERE role = 'admin' AND disabled = 0"
+        ).fetchone()["c"]
+
     def update_user(self, user_id: str, **fields: Any) -> dict | None:
         allowed = {"password_hash", "role", "email", "display_name", "disabled",
                    "username", "oidc_subject", "source"}
@@ -1565,6 +1670,60 @@ class Database:
     def delete_user(self, user_id: str) -> bool:
         cur = self.execute("DELETE FROM users WHERE id = ?", (user_id,))
         self.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        self.commit()
+        return cur.rowcount > 0
+
+    # ------------------------------------------------------------ agents --
+
+    @staticmethod
+    def _agent_row(row) -> dict:
+        d = dict(row)
+        try:
+            d["capabilities"] = json.loads(d.get("capabilities") or "[]")
+        except (TypeError, ValueError):
+            d["capabilities"] = []
+        d["enabled"] = bool(d.get("enabled"))
+        return d
+
+    def create_agent(self, name: str, description: str = "",
+                     capabilities: list | None = None, enabled: bool = True) -> dict:
+        aid = uuid.uuid4().hex
+        self.execute(
+            "INSERT INTO agents (id, name, description, capabilities, enabled) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (aid, name.strip()[:120], (description or "").strip()[:2000],
+             json.dumps(list(capabilities or [])), 1 if enabled else 0))
+        self.commit()
+        return self.get_agent(aid) or {}
+
+    def get_agent(self, agent_id: str) -> dict | None:
+        row = self.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
+        return self._agent_row(row) if row else None
+
+    def list_agents(self) -> list[dict]:
+        return [self._agent_row(r) for r in self.execute(
+            "SELECT * FROM agents ORDER BY name COLLATE NOCASE ASC").fetchall()]
+
+    def update_agent(self, agent_id: str, **fields: Any) -> dict | None:
+        sets, params = [], []
+        if "name" in fields:
+            sets.append("name = ?"); params.append(str(fields["name"]).strip()[:120])
+        if "description" in fields:
+            sets.append("description = ?"); params.append(str(fields["description"] or "").strip()[:2000])
+        if "capabilities" in fields:
+            sets.append("capabilities = ?"); params.append(json.dumps(list(fields["capabilities"] or [])))
+        if "enabled" in fields:
+            sets.append("enabled = ?"); params.append(1 if fields["enabled"] else 0)
+        if not sets:
+            return self.get_agent(agent_id)
+        sets.append("updated_at = ?"); params.append(iso(utc_now()))
+        params.append(agent_id)
+        self.execute(f"UPDATE agents SET {', '.join(sets)} WHERE id = ?", tuple(params))
+        self.commit()
+        return self.get_agent(agent_id)
+
+    def delete_agent(self, agent_id: str) -> bool:
+        cur = self.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
         self.commit()
         return cur.rowcount > 0
 
@@ -1610,12 +1769,13 @@ class Database:
         return self.get_import(import_id) or {}
 
     def update_import(self, import_id: str, **fields: Any) -> None:
-        allowed = {"status", "progress", "counts", "warnings", "error", "finished_at"}
+        allowed = {"status", "progress", "counts", "warnings", "error",
+                   "finished_at", "artifacts"}
         sets, params = [], []
         for key, value in fields.items():
             if key not in allowed:
                 continue
-            if key in ("counts", "warnings") and not isinstance(value, str):
+            if key in ("counts", "warnings", "artifacts") and not isinstance(value, str):
                 value = json.dumps(value, default=str)
             sets.append(f"{key} = ?")
             params.append(value)

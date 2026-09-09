@@ -5,37 +5,8 @@ Split out of the original single-file deploy.py; behaviour is unchanged.
 
 from __future__ import annotations
 
-import argparse
-import ast
-import asyncio
-import csv
-import html
-import hashlib
 import json
-import logging
-import math
-import operator
-import os
-import platform
-import random
 import re
-import shutil
-import signal
-import socket
-import sqlite3
-import traceback
-import shlex
-import subprocess
-import sys
-import textwrap
-import threading
-import time
-import urllib.parse
-import uuid
-from dataclasses import dataclass, field, asdict, replace as dataclass_replace
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, Literal
 
 from .core import *  # noqa: F401,F403
 from .config import *  # noqa: F401,F403
@@ -97,7 +68,9 @@ CODE_OBJECT = re.compile(
 # when paired with a code verb.
 CODE_LANGUAGE = re.compile(
     r"\b(python|py|javascript|js|typescript|ts|rust|go|golang|c\+\+|cpp|c#|java|"
-    r"bash|shell|sh|zsh|ruby|php|perl|sql|html|css|react|node|node\.js)\b",
+    r"bash|shell|sh|zsh|ruby|php|perl|sql|html|css|react|node|node\.js|"
+    r"swift|swiftui|kotlin|dart|flutter|scala|objective-c|objc|lua|r|matlab|"
+    r"powershell|ps1|julia|haskell|elixir|clojure|solidity)\b",
     re.I,
 )
 
@@ -264,6 +237,32 @@ def build_reusable_dataset(rows: list[dict], fmt: str, system_prompt: str = "") 
     return "\n".join(lines) + ("\n" if lines else ""), len(lines)
 
 
+# A short remark ABOUT the previous answer rather than a new question:
+# "doesnt have a main function", "no", "i meant ...", "its not ...". These refer
+# to the conversation, so retrieving documents for them is wrong -- the terms
+# match unrelated indexed material and the model answers from that instead.
+_FOLLOWUP_LEAD = re.compile(
+    r"^\s*(?:no+|nope|nah|yes+|yeah|ok|okay|wrong|incorrect|still|again|but|also|"
+    r"i\s+meant|i\s+mean|that'?s|thats|it'?s|its|you\s+(?:just|didn'?t|did\s+not)|"
+    r"doesn'?t|does\s+not|didn'?t|did\s+not|isn'?t|is\s+not|aren'?t|won'?t|can'?t|"
+    r"cannot|reconsider|redo|retry|nevermind|never\s+mind)\b",
+    re.I,
+)
+
+
+def is_followup_remark(message: str) -> bool:
+    """True for a short comment on the previous turn, not a standalone question.
+
+    Used to keep knowledge-base retrieval from firing on conversational repair
+    ("doesnt have a main function"), where the useful context is the previous
+    exchange, never an indexed document.
+    """
+    text = (message or "").strip()
+    if not text or len(text.split()) > 20:
+        return False
+    return bool(_FOLLOWUP_LEAD.match(text))
+
+
 def is_time_sensitive(message: str) -> bool:
     """True if a question plausibly needs current/external facts to answer well.
 
@@ -417,6 +416,84 @@ def top_result_urls(search_text: str, limit: int) -> list[str]:
     return seen
 
 
+# Result blocks look like "N. Title\n   URL\n   snippet" (see _web_search). This
+# splits a result block into (title, url, snippet) records in engine order.
+_RESULT_HEAD = re.compile(r"^\s*\d+\.\s+(.*)$")
+_STOPWORDS = frozenset(
+    "the a an of to for and or in on at is are be with how what why when who "
+    "which that this from into your you my our their his her its as by".split())
+
+
+def _parse_search_results(search_text: str) -> list[tuple[str, str, str]]:
+    """Parse a web_search result block into (title, url, snippet) records."""
+    records: list[tuple[str, str, str]] = []
+    title = url = ""
+    snippet_lines: list[str] = []
+
+    def flush() -> None:
+        if url:
+            records.append((title, url, " ".join(snippet_lines).strip()))
+
+    for raw in (search_text or "").splitlines():
+        head = _RESULT_HEAD.match(raw)
+        if head:
+            flush()
+            title, url, snippet_lines = head.group(1).strip(), "", []
+            continue
+        urlm = _RESULT_URL.match(raw)
+        if urlm and not url:
+            url = urlm.group(1)
+            continue
+        if raw.strip():
+            snippet_lines.append(raw.strip())
+    flush()
+    return records
+
+
+def _query_tokens(query: str) -> set[str]:
+    toks = re.findall(r"[a-z0-9]+", (query or "").lower())
+    return {t for t in toks if len(t) >= 3 and t not in _STOPWORDS}
+
+
+def rank_result_urls(search_text: str, query: str, limit: int) -> list[str]:
+    """Rerank a web_search result block by relevance before auto-fetching.
+
+    Engine order is a weak prior; this promotes results whose title/snippet
+    actually overlap the question and demotes aggregator/listing hosts, so the
+    bounded number of pages we spend a fetch-and-read on are the most likely to
+    carry the answer. Falls back to engine order when there is nothing to score
+    (no query tokens, or an unparseable block).
+    """
+    records = _parse_search_results(search_text)
+    if not records:
+        return top_result_urls(search_text, limit)
+    tokens = _query_tokens(query)
+
+    def score(title: str, url: str, snippet: str, rank: int) -> float:
+        s = -0.1 * rank  # keep engine order as the tiebreak
+        if tokens:
+            tl = title.lower()
+            sn = snippet.lower()
+            s += 2.0 * sum(1 for t in tokens if t in tl)
+            s += 1.0 * sum(1 for t in tokens if t in sn)
+        if is_low_value_url(url):
+            s -= 5.0
+        return s
+
+    # Sort on (-score, rank) so a higher score wins and engine order breaks ties.
+    scored: list[tuple[float, int, str]] = []
+    for rank, (title, url, snippet) in enumerate(records):
+        scored.append((-score(title, url, snippet, rank), rank, url))
+    scored.sort()
+    out: list[str] = []
+    for _neg, _rank, url in scored:
+        if url not in out:
+            out.append(url)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def chunk_text(text: str, size: int, overlap: int) -> list[str]:
     """Split text into ~size-character chunks with a little overlap.
 
@@ -469,6 +546,112 @@ def quick_tool(message: str) -> tuple[str, dict] | None:
     return None
 
 
+# A URL anywhere in a message, and the words that signal "go read this page and
+# tell me about it" (as opposed to merely mentioning a link). Used to send
+# "summarise https://…" to fetch_url instead of letting the router guess.
+_URL_IN_TEXT = re.compile(r'https?://[^\s<>()\[\]{}"\']+', re.I)
+# Prefix stems with a LEADING word boundary only (no trailing \b): "summar"
+# must match summary/summarize/summarise, so a trailing boundary would break it.
+URL_READ_INTENT = re.compile(
+    r"\b(?:summar|tl;?dr|read|open|fetch|retriev|scrap|extract|explain|describ|"
+    r"analy[sz]e|review|brief|digest|go to|look at|check|"
+    r"what(?:'s| is| are| does| say)|contents? of|summary of)",
+    re.I)
+
+
+def url_read_request(message: str) -> str | None:
+    """The single URL to fetch when a message asks to read/summarise a page.
+
+    A message that is nothing but a URL is handled by quick_tool (it returns the
+    page verbatim). This covers the very common "summarise <url>", "read this:
+    <url>", "what does <url> say", "tl;dr <url>", where the user wants the model
+    to fetch the page and then answer *from* it. Returns None unless there is
+    exactly one URL and a clear read/summarise intent in a short instruction, so
+    an ordinary message that merely mentions a link falls through to the router.
+    """
+    text = (message or "").strip()
+    if not text:
+        return None
+    urls = _URL_IN_TEXT.findall(text)
+    if len(urls) != 1:
+        return None
+    url = urls[0].rstrip('.,;:!?)\'"')
+    rest = _URL_IN_TEXT.sub(" ", text).strip()
+    if not rest:
+        return None  # a bare URL: quick_tool handles it
+    if len(rest.split()) <= 20 and URL_READ_INTENT.search(rest):
+        return url
+    return None
+
+
+# Power-user routing overrides: a leading slash command that forces a lane and
+# bypasses the model router entirely. Deterministic and explicit, so the user is
+# never surprised by the router's judgement when they have already made the call.
+# Lanes: "web_search" (force a search), "answer" (never search; own knowledge +
+# knowledge base), "kb" (answer, but say the knowledge base is the source).
+_OVERRIDE = re.compile(
+    r"^\s*/(search|web|websearch|nosearch|no-search|answer|local|kb|docs)\b[ \t]*",
+    re.I)
+_OVERRIDE_LANE = {
+    "search": "web_search", "web": "web_search", "websearch": "web_search",
+    "nosearch": "answer", "no-search": "answer", "answer": "answer", "local": "answer",
+    "kb": "kb", "docs": "kb",
+}
+
+
+def routing_override(message: str) -> tuple[str, str] | None:
+    """Parse a leading /command override. Returns (lane, cleaned_message) or None.
+
+    The command is stripped from the message so the downstream tool or the model
+    sees only the real request ("/search foo bar" -> ("web_search", "foo bar")).
+    """
+    m = _OVERRIDE.match(message or "")
+    if not m:
+        return None
+    lane = _OVERRIDE_LANE[m.group(1).lower().replace("-", "")]
+    rest = (message[m.end():]).strip()
+    return lane, rest
+
+
+# Unambiguous "search the web" imperatives. Unlike TIME_SENSITIVE (a soft hint
+# that a lookup might help), these are direct commands to search, so they route
+# straight to web_search with no model-router call. Kept strict: a bare
+# "search X" often means the attached codebase, so a web marker or a
+# search-engine name is required -- except when the verb IS a search engine.
+_SEARCH_LEAD = re.compile(
+    r"^\s*(?:please\s+)?(?:can|could|would)?\s*(?:you\s+)?"
+    r"(?:"
+    r"web[- ]?search(?:\s+for)?|"
+    r"search\s+(?:the\s+)?(?:web|internet|online)(?:\s+for)?|"
+    r"search\s+up|"
+    r"google|bing|duckduckgo|ddg"
+    r")\b[:,]?\s+",
+    re.I)
+# A trailing "... online" / "on the web" that turns a plain lookup into a search.
+_ONLINE_TRAIL = re.compile(r"\b(?:online|on the web|on the internet)\b\s*[.?!]*$", re.I)
+_LOOKUP_LEAD = re.compile(r"^\s*(?:please\s+)?(?:find|look\s+up|search\s+for)\b\s+", re.I)
+
+
+def web_search_request(message: str) -> str | None:
+    """The query to search for when a message is an explicit web-search command.
+
+    Covers "search the web for X", "google X", "web search X", and "find/look up
+    X online". Returns None for anything not unambiguously a web search, so an
+    ordinary question still goes through the model router.
+    """
+    text = (message or "").strip()
+    if not text or len(text) > 400:
+        return None
+    m = _SEARCH_LEAD.match(text)
+    if m:
+        return text[m.end():].strip(" .?!\t") or None
+    # "find X online" / "look up X on the web": a lookup verb with a web marker.
+    if _LOOKUP_LEAD.match(text) and _ONLINE_TRAIL.search(text):
+        q = _LOOKUP_LEAD.sub("", text, count=1)
+        return _ONLINE_TRAIL.sub("", q).strip(" .?!\t") or None
+    return None
+
+
 # Backwards-compatible alias. Older call sites and tests refer to fast_path_call;
 # it now covers only the deterministic shortcuts. The prev_user parameter is kept
 # for signature compatibility but is unused, because follow-up resolution ("look
@@ -487,6 +670,15 @@ __all__ = [
     'CODE_OBJECT',
     'REASONING_SIGNAL',
     'TIME_SENSITIVE',
+    'URL_READ_INTENT',
+    '_URL_IN_TEXT',
+    'url_read_request',
+    'routing_override',
+    'web_search_request',
+    '_OVERRIDE',
+    '_SEARCH_LEAD',
+    '_ONLINE_TRAIL',
+    '_LOOKUP_LEAD',
     '_CODE_FRAMING',
     '_LOW_VALUE_HOST',
     '_LOW_VALUE_PATH',
@@ -510,6 +702,12 @@ __all__ = [
     'is_substantive',
     'is_thin_page',
     'is_time_sensitive',
+    'is_followup_remark',
+    '_FOLLOWUP_LEAD',
     'quick_tool',
     'top_result_urls',
+    'rank_result_urls',
+    '_parse_search_results',
+    '_query_tokens',
+    '_RESULT_HEAD',
 ]

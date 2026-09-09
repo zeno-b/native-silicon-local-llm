@@ -21,7 +21,6 @@ the ``imports`` table so the admin Settings UI can show status and retry.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -87,6 +86,10 @@ class ImportManager:
         counts = {"conversations": 0, "messages": 0, "knowledge_docs": 0,
                   "skills": 0, "files": 0, "duplicates": 0}
         warnings: list[str] = []
+        # The exact conversations and knowledge docs this import created, so that
+        # removing THIS import deletes only its own artifacts (never the user's
+        # other imports).
+        artifacts: dict = {"conversations": [], "docs": [], "prompts": []}
         staging = self._staging(import_id)
         extract_dir = staging / "extracted"
         try:
@@ -102,14 +105,14 @@ class ImportManager:
             conversations, projects, prefs = self._discover(extract_dir, warnings)
 
             self.db.update_import(import_id, status="storing", progress=65)
-            self._store_conversations(user_id, conversations, counts, warnings)
-            self._store_projects(user_id, projects, counts, warnings)
+            self._store_conversations(user_id, conversations, counts, warnings, artifacts)
+            self._store_projects(user_id, projects, counts, warnings, artifacts)
             self._store_preferences(user_id, prefs, counts, warnings)
-            self._attach_files(user_id, extract_dir, counts, warnings)
+            self._attach_files(user_id, extract_dir, counts, warnings, artifacts)
 
             self.db.update_import(
                 import_id, status="completed", progress=100, counts=counts,
-                warnings=warnings, finished_at=iso(utc_now()))
+                warnings=warnings, artifacts=artifacts, finished_at=iso(utc_now()))
             log_event(_import_log, 20, "import.completed", import_id=import_id,
                       user_id=user_id, **counts)
         except Exception as exc:
@@ -117,22 +120,28 @@ class ImportManager:
             self.db.update_import(import_id, status="failed", error=message,
                                   counts=counts, warnings=warnings,
                                   finished_at=iso(utc_now()))
-            log_event(_import_log, 40, "import.failed", import_id=import_id,
-                      user_id=user_id, error=message)
+            # A rejected hostile/invalid archive (ImportError_: zip-slip, zip
+            # bomb, oversize, not-a-zip) is the guard doing its job -> WARNING.
+            # Only an unexpected processing crash is an ERROR worth alerting on.
+            rejected = isinstance(exc, ImportError_)
+            log_event(_import_log, 30 if rejected else 40,
+                      "import.rejected" if rejected else "import.failed",
+                      import_id=import_id, user_id=user_id, error=message)
         finally:
             # Extracted tree can be large; keep only the original upload for retry.
             try:
                 if extract_dir.exists():
                     shutil.rmtree(extract_dir, ignore_errors=True)
             except Exception:
-                pass
+                pass      # cleanup only; the import result already stands
         return counts
 
     # ---- hardened extraction --------------------------------------------- #
     def _safe_extract(self, zip_path: Path, dest: Path, warnings: list[str]) -> None:
         dest.mkdir(parents=True, exist_ok=True)
         dest_resolved = dest.resolve()
-        total_uncompressed = 0
+        total_uncompressed = 0   # declared (header) sizes, for the pre-check
+        actual_written = 0       # real bytes written, the authoritative aggregate
         file_count = 0
         with zipfile.ZipFile(zip_path) as zf:
             infos = zf.infolist()
@@ -174,7 +183,10 @@ class ImportManager:
                 file_count += 1
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(info) as src, open(target, "wb") as out:
-                    # Stream-copy with a hard byte cap as a second bomb guard.
+                    # Stream-copy counting ACTUAL bytes, not the declared header
+                    # size: a crafted zip can understate file_size to slip past
+                    # the pre-check. Enforce both the per-file cap and the running
+                    # aggregate cap on real bytes written.
                     remaining = self.config.import_max_file_bytes
                     while True:
                         chunk = src.read(65536)
@@ -186,9 +198,18 @@ class ImportManager:
                             target.unlink(missing_ok=True)
                             warnings.append(f"truncated entry exceeding size cap: {name}")
                             break
+                        actual_written += len(chunk)
+                        if actual_written > self.config.import_max_uncompressed_bytes:
+                            out.close()
+                            target.unlink(missing_ok=True)
+                            raise ImportError_(
+                                "archive expands beyond the uncompressed limit while "
+                                f"extracting ({self.config.import_max_uncompressed_bytes} "
+                                "bytes, IMPORT_MAX_UNCOMPRESSED_BYTES); refusing "
+                                "(possible zip bomb)")
                         out.write(chunk)
         log_event(_import_log, 20, "import.extracted", files=file_count,
-                  uncompressed_bytes=total_uncompressed)
+                  declared_bytes=total_uncompressed, actual_bytes=actual_written)
 
     # ---- discovery / parsing --------------------------------------------- #
     def _discover(self, root: Path, warnings: list[str]) -> tuple[list, list, dict]:
@@ -212,16 +233,27 @@ class ImportManager:
             else:
                 # Unknown JSON that still looks like conversations.
                 if isinstance(data, list) and data and isinstance(data[0], dict) and (
-                        "chat_messages" in data[0] or "messages" in data[0]):
+                        "chat_messages" in data[0] or "messages" in data[0]
+                        or "mapping" in data[0]):
                     conversations.extend(self._parse_conversations(data, warnings))
         return conversations, projects, prefs
 
     @staticmethod
     def _msg_text(msg: dict) -> str:
-        """Extract text from a Claude message (top-level text or content parts)."""
+        """Text of one message, across export dialects.
+
+        Claude puts it in `text` or a `content` list; OpenAI/DeepSeek wrap it as
+        content={"parts": [...]}; some exports use a bare string. Anything whose
+        parts are non-text (images, tool payloads) contributes nothing.
+        """
         if isinstance(msg.get("text"), str) and msg["text"].strip():
             return msg["text"]
         parts = msg.get("content") or []
+        if isinstance(parts, dict):
+            # OpenAI/DeepSeek: {"content_type": "text", "parts": ["..."]}
+            parts = parts.get("parts") or parts.get("text") or []
+            if isinstance(parts, str):
+                parts = [parts]
         chunks = []
         if isinstance(parts, list):
             for part in parts:
@@ -233,6 +265,59 @@ class ImportManager:
             chunks.append(parts)
         return "\n".join(c for c in chunks if c).strip()
 
+    @staticmethod
+    def _messages_from_mapping(mapping: dict) -> list[dict]:
+        """Flatten an OpenAI/DeepSeek-style `mapping` graph into ordered messages.
+
+        Those exports store the thread as a node graph keyed by id, not a list, so
+        a parser that only looks for `messages`/`chat_messages` finds nothing and
+        silently drops every conversation. Walk parent -> children from the root,
+        then append any orphans in timestamp order.
+        """
+        nodes = {k: v for k, v in mapping.items() if isinstance(v, dict)}
+        if not nodes:
+            return []
+        roots = [k for k, v in nodes.items() if not v.get("parent")] or [next(iter(nodes))]
+        order: list[str] = []
+        seen: set = set()
+        stack = list(roots)
+        while stack:
+            nid = stack.pop(0)
+            if nid in seen or nid not in nodes:
+                continue
+            seen.add(nid)
+            order.append(nid)
+            kids = [c for c in (nodes[nid].get("children") or []) if c in nodes]
+            stack = kids + stack                      # follow the branch we are on
+        rest = [k for k in nodes if k not in seen]
+
+        def _when(node_id: str):
+            msg = nodes[node_id].get("message") or {}
+            return msg.get("create_time") or msg.get("created_at") or 0
+
+        rest.sort(key=_when)
+        order.extend(rest)
+        out = []
+        for nid in order:
+            msg = nodes[nid].get("message")
+            if isinstance(msg, dict):
+                out.append(msg)
+        return out
+
+    @staticmethod
+    def _msg_role(msg: dict) -> str:
+        """user | assistant | other, across dialects (Claude sender, OpenAI author.role)."""
+        author = msg.get("author")
+        raw = (msg.get("sender") or msg.get("role")
+               or (author.get("role") if isinstance(author, dict) else "")
+               or "")
+        raw = str(raw).lower()
+        if raw in ("assistant", "ai", "claude", "model", "bot", "gpt", "grok", "deepseek"):
+            return "assistant"
+        if raw in ("human", "user"):
+            return "user"
+        return raw or "user"
+
     def _parse_conversations(self, data: Any, warnings: list[str]) -> list[dict]:
         items = data if isinstance(data, list) else data.get("conversations", []) \
             if isinstance(data, dict) else []
@@ -241,23 +326,31 @@ class ImportManager:
             if not isinstance(conv, dict):
                 continue
             source_id = str(conv.get("uuid") or conv.get("id") or uuid.uuid4().hex)
-            title = (conv.get("name") or conv.get("title") or "").strip()
+            title = (conv.get("name") or conv.get("title")
+                     or conv.get("conversation_title") or "").strip()
             raw_msgs = conv.get("chat_messages") or conv.get("messages") or []
+            if not raw_msgs and isinstance(conv.get("mapping"), dict):
+                raw_msgs = self._messages_from_mapping(conv["mapping"])
             messages = []
             for msg in raw_msgs:
                 if not isinstance(msg, dict):
                     continue
-                sender = (msg.get("sender") or msg.get("role") or "").lower()
-                role = "assistant" if sender in ("assistant", "ai", "claude") else "user"
+                role = self._msg_role(msg)
+                # A browsable transcript is the human/assistant exchange; system
+                # and tool frames are plumbing and would read as the user talking.
+                if role not in ("user", "assistant"):
+                    continue
                 text = self._msg_text(msg)
                 if not text:
                     continue
                 messages.append({"role": role, "content": text,
-                                 "created_at": msg.get("created_at")})
+                                 "created_at": msg.get("created_at") or msg.get("create_time")})
             if messages:
                 out.append({"source_id": source_id,
                             "title": title or (messages[0]["content"][:80]),
-                            "created_at": conv.get("created_at"),
+                            "created_at": (conv.get("created_at")
+                                           or conv.get("create_time")
+                                           or conv.get("inserted_at")),
                             "messages": messages})
         return out
 
@@ -292,9 +385,12 @@ class ImportManager:
 
     # ---- storage / integration ------------------------------------------- #
     def _store_conversations(self, user_id: str, conversations: list[dict],
-                             counts: dict, warnings: list[str]) -> None:
+                             counts: dict, warnings: list[str], artifacts: dict) -> None:
+        owner = _slug(user_id)
         for conv in conversations:
-            conversation_id = f"claude-{conv['source_id'][:24]}"
+            # Conversation ids and KB paths are namespaced by owner so two users
+            # importing the same Claude uuid never collide or clobber each other.
+            conversation_id = f"claude-{owner}-{conv['source_id'][:24]}"
             # Dedup: if this user already has this imported conversation, skip.
             if not self.db.can_access_conversation(conversation_id, user_id):
                 counts["duplicates"] += 1
@@ -314,36 +410,45 @@ class ImportManager:
                 self.db.set_conversation_title(conversation_id,
                                                f"[imported] {conv['title']}"[:120])
             except Exception:
-                pass
+                pass      # an untitled import is still a usable import
             counts["conversations"] += 1
+            artifacts["conversations"].append(conversation_id)
             # Index the whole conversation as one retrievable knowledge document.
+            doc_path = f"claude-history/{owner}/{conv['source_id'][:24]}.md"
             try:
                 indexed = self.db.index_document(
-                    f"claude-history/{conv['source_id'][:24]}.md",
+                    doc_path,
                     (conv["title"] + "\n\n" + "\n\n".join(body_parts)),
                     title=f"[imported] {conv['title']}"[:120], user_id=user_id)
                 if indexed:
                     counts["knowledge_docs"] += 1
+                    artifacts["docs"].append(doc_path)
             except Exception as exc:
                 warnings.append(f"could not index conversation {conv['source_id']}: {exc}")
 
     def _store_projects(self, user_id: str, projects: list[dict],
-                        counts: dict, warnings: list[str]) -> None:
+                        counts: dict, warnings: list[str], artifacts: dict) -> None:
+        owner = _slug(user_id)
         for proj in projects:
             # Project instructions are reusable skills -> saved prompts.
             if proj.get("instructions"):
                 try:
-                    self.db.save_prompt(f"[imported] {proj['name']}"[:120],
-                                        proj["instructions"])
+                    name = f"[imported] {proj['name']}"[:120]
+                    # Owned by the importer: imported artefacts are private to
+                    # them, and prompt names are unique per user, so two people
+                    # importing the same project must not collide.
+                    self.db.save_prompt(name, proj["instructions"], user_id=user_id)
                     counts["skills"] += 1
+                    artifacts["prompts"].append(name)
                 except Exception as exc:
                     warnings.append(f"could not save project prompt {proj['name']}: {exc}")
             for doc in proj.get("docs", []):
                 try:
-                    path = f"claude-projects/{_slug(proj['name'])}/{_slug(doc['name'])}.md"
+                    path = f"claude-projects/{owner}/{_slug(proj['name'])}/{_slug(doc['name'])}.md"
                     if self.db.index_document(path, doc["text"],
                                               title=doc["name"], user_id=user_id):
                         counts["knowledge_docs"] += 1
+                        artifacts["docs"].append(path)
                 except Exception as exc:
                     warnings.append(f"could not index project doc {doc.get('name')}: {exc}")
 
@@ -357,8 +462,9 @@ class ImportManager:
                 warnings.append(f"could not store preference {key}: {exc}")
 
     def _attach_files(self, user_id: str, root: Path,
-                      counts: dict, warnings: list[str]) -> None:
+                      counts: dict, warnings: list[str], artifacts: dict) -> None:
         """Index supporting text artifacts (not the JSON we already parsed)."""
+        owner = _slug(user_id)
         for path in root.rglob("*"):
             if not path.is_file():
                 continue
@@ -373,31 +479,43 @@ class ImportManager:
                 if not text.strip():
                     continue
                 rel = path.relative_to(root)
+                doc_path = f"claude-files/{owner}/{rel}"
                 try:
-                    if self.db.index_document(f"claude-files/{rel}", text[:200000],
+                    if self.db.index_document(doc_path, text[:200000],
                                               title=path.name, user_id=user_id):
                         counts["knowledge_docs"] += 1
+                        artifacts["docs"].append(doc_path)
                 except Exception as exc:
                     warnings.append(f"could not index file {rel}: {exc}")
 
     def remove_import(self, import_id: str, user_id: str | None = None) -> bool:
-        """Delete an import record, its imported conversations, and its KB docs."""
+        """Delete THIS import's record and exactly the conversations and KB docs
+        it created — never another of the user's imports."""
         record = self.db.get_import(import_id)
         if not record:
             return False
         owner = record["user_id"]
         if user_id is not None and owner != user_id:
             return False
-        # Remove conversations + KB docs created by this owner's Claude imports.
-        for row in self.db.execute(
-                "SELECT DISTINCT conversation_id FROM messages "
-                "WHERE user_id = ? AND conversation_id LIKE 'claude-%'",
-                (owner,)).fetchall():
-            self.db.clear_conversation(row["conversation_id"], user_id=owner)
-        for prefix in ("claude-history/", "claude-projects/", "claude-files/"):
-            for doc in self.db.document_stats(user_id=owner).get("items", []):
-                if str(doc.get("path", "")).startswith(prefix):
-                    self.db.remove_document(doc["path"])
+        artifacts = record.get("artifacts")
+        if isinstance(artifacts, str):
+            try:
+                artifacts = json.loads(artifacts)
+            except Exception:
+                artifacts = None
+        artifacts = artifacts or {}
+        # Remove precisely the artifacts recorded for this import.
+        for conversation_id in artifacts.get("conversations", []):
+            self.db.clear_conversation(conversation_id, user_id=owner)
+        for path in artifacts.get("docs", []):
+            self.db.remove_document(path)
+        for prompt_name in artifacts.get("prompts", []):
+            # Scoped to the owner: an unscoped delete would take every user's
+            # prompt of that name, and imported names are far from unique.
+            try:
+                self.db.delete_prompt(prompt_name, user_id=owner)
+            except Exception:
+                pass          # best effort: a missing prompt must not abort removal
         staging = self._staging(import_id)
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)

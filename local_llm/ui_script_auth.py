@@ -25,14 +25,18 @@ UI_JS_AUTH = r"""
        showLogin(info);
        return;
      }
-     hideLogin();
      var user = info.user || { role: "admin", username: "local" };
+     // Apply the role BEFORE revealing the app, so admin-only chrome does not
+     // pop in a frame after the rest of the UI.
      applyRole(user);
+     hideLogin();
      runDataBoot(user.role === "admin");
      if (user.role === "admin") loadImports();
    }
 
    function showLogin(info) {
+     // Leave the boot state (nothing shown) for the login box, in one step.
+     document.body.classList.remove("booting");
      document.body.classList.add("locked");
      var oidc = document.getElementById("oidcBtn");
      if (oidc) oidc.style.display = info && info.oidc_enabled ? "" : "none";
@@ -41,16 +45,57 @@ UI_JS_AUTH = r"""
    }
 
    function hideLogin() {
+     document.body.classList.remove("booting");
      document.body.classList.remove("locked");
    }
 
    function applyRole(user) {
      document.body.dataset.role = user.role || "user";
      var chip = document.getElementById("userChip");
-     if (chip) chip.textContent = (user.username || "user") + " · " + (user.role || "user");
+     if (chip) chip.textContent = user.username || "local";
+     var info = document.getElementById("acctInfo");
+     if (info) {
+       info.innerHTML = "";
+       var line = document.createElement("div");
+       var who = document.createElement("strong");
+       who.textContent = user.username || "local";
+       line.appendChild(who);
+       line.appendChild(document.createTextNode(" · " + (user.role || "user")));
+       info.appendChild(line);
+       if (!window.AUTH_ENABLED) {
+         var note = document.createElement("div");
+         note.textContent = "Single-user mode — sign-in is off. Start the server with "
+           + "AUTH_ENABLED=1 to turn on accounts, roles and logout.";
+         info.appendChild(note);
+       }
+     }
      var logout = document.getElementById("logoutBtn");
+     // With auth disabled there is no session to end, so hide the logout action
+     // (the account menu still explains the single-user state above).
      if (logout) logout.style.display = window.AUTH_ENABLED ? "" : "none";
    }
+
+   function toggleAcct() {
+     var pop = document.getElementById("acctPop");
+     if (pop) pop.classList.toggle("hidden");
+   }
+
+   // Reveal/hide a password field, flipping the little show/hide button's label.
+   function togglePw(id, btn) {
+     var el = document.getElementById(id);
+     if (!el) return;
+     var reveal = el.type === "password";
+     el.type = reveal ? "text" : "password";
+     if (btn) btn.textContent = reveal ? "hide" : "show";
+   }
+
+   // Close the account menu when clicking anywhere outside it.
+   document.addEventListener("click", function(e) {
+     var menu = document.getElementById("acctMenu");
+     var pop = document.getElementById("acctPop");
+     if (!menu || !pop || pop.classList.contains("hidden")) return;
+     if (!e.target.closest || !e.target.closest("#acctMenu")) pop.classList.add("hidden");
+   });
 
    function runDataBoot(isAdmin) {
      refreshHealth();
@@ -81,6 +126,19 @@ UI_JS_AUTH = r"""
      } catch (err) {
        if (status) status.textContent = "Login error: " + err.message;
      }
+   }
+
+   // A protected request returned 401 while we thought we were signed in: the
+   // session expired, was revoked by an admin (disable / role change / password
+   // reset all drop sessions), or was ended in another tab. Return to the login
+   // screen instead of leaving a dead app on screen with silently failing calls.
+   function onUnauthorized() {
+     if (!window.AUTH_ENABLED) return;                       // auth off: nothing to do
+     if (document.body.classList.contains("locked")) return; // already on login
+     if (window._healthTimer) { clearInterval(window._healthTimer); window._healthTimer = null; }
+     var err = document.getElementById("loginError");
+     if (err) err.textContent = "Your session ended. Please sign in again.";
+     showLogin({ oidc_enabled: window.OIDC_ENABLED });
    }
 
    function loginKey(e) { if (e.key === "Enter") { e.preventDefault(); doLogin(); } }
@@ -154,7 +212,7 @@ UI_JS_AUTH = r"""
      var inp = document.getElementById("importFile");
      var status = document.getElementById("importStatus");
      if (!inp || !inp.files || !inp.files[0]) {
-       if (status) status.textContent = "Choose a Claude export .zip first.";
+       if (status) status.textContent = "Choose a chat export .zip first.";
        return;
      }
      var file = inp.files[0];

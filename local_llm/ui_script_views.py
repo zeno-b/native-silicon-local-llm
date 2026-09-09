@@ -38,6 +38,8 @@ UI_JS_VIEWS = r"""   // --------------------------------------------------------
        loadModels();
        loadModelLog();
        modelLogTimer = setInterval(loadModelLog, 4000);
+       // Default to the Model sub-tab (or the last one viewed).
+       if (typeof showAdminTab === "function") showAdminTab(window._adminTab || "models");
      }
    }
 """
