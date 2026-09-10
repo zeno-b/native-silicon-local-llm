@@ -22,7 +22,7 @@ ORDER = [
     "ui_script_tasks", "ui_script_models", "ui_script_auth", "ui_script_panels",
     "ui", "config", "model_server", "training",
     "websearch", "calculator", "tools", "llm", "model_client", "textutil",
-    "agent", "tasks", "auth", "cluster", "claude_import", "api",
+    "taskstate", "agent", "tasks", "auth", "cluster", "claude_import", "api",
     "diagnostics", "selftest", "cli",
 ]
 

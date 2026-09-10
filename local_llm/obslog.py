@@ -203,9 +203,13 @@ def redact_text(text: str | None) -> str:
     if not text:
         return "" if text is None else text
     out = str(text)
-    out = _KV_SECRET.sub(lambda m: f"{m.group(1)}{m.group(2)}{_REDACT}", out)
+    # Token shapes FIRST. The key/value pass replaces only the value up to the
+    # next space, so on "Authorization: Bearer abc123..." it consumed the word
+    # "Bearer" and left the token itself in the clear -- and with the word gone,
+    # the Bearer shape below no longer matched it either.
     for pattern in _TOKEN_SHAPES:
         out = pattern.sub(_REDACT, out)
+    out = _KV_SECRET.sub(lambda m: f"{m.group(1)}{m.group(2)}{_REDACT}", out)
     return out
 
 

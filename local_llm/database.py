@@ -111,6 +111,18 @@ class Database:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # The active task and its artifact, one row per conversation. Kept
+            # OUT of the messages table on purpose: this is state, not
+            # transcript, and it has to survive exactly the trimming that
+            # removes the messages it was derived from.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS conversation_task_state (
+                    conversation_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL DEFAULT 'local',
+                    state TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS prompts (
                     id INTEGER PRIMARY KEY,
@@ -1138,6 +1150,48 @@ class Database:
             return True
         return row["user_id"] == user_id
 
+    # --- Active task state ------------------------------------------------- #
+    # The structured task/artifact record for a conversation (see taskstate.py).
+    # Stored as one JSON blob rather than columns: the shape is owned by
+    # TaskState and adding a field there must not need a migration here.
+
+    def save_task_state(self, conversation_id: str, state: dict,
+                        user_id: str | None = None) -> None:
+        if not conversation_id:
+            return
+        self.execute(
+            "INSERT INTO conversation_task_state (conversation_id, user_id, state, "
+            "updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(conversation_id) DO UPDATE SET state = excluded.state, "
+            "user_id = excluded.user_id, updated_at = CURRENT_TIMESTAMP",
+            (conversation_id, user_id or SENTINEL_LOCAL_USER,
+             json.dumps(state, ensure_ascii=False, default=str)))
+        self.commit()
+
+    def load_task_state(self, conversation_id: str,
+                        user_id: str | None = None) -> dict | None:
+        """The stored task state, or None. Owner-scoped like get_messages."""
+        if not conversation_id:
+            return None
+        sql = "SELECT state FROM conversation_task_state WHERE conversation_id = ?"
+        params: list[Any] = [conversation_id]
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
+        row = self.execute(sql, tuple(params)).fetchone()
+        if not row:
+            return None
+        try:
+            data = json.loads(row["state"])
+        except (ValueError, TypeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def clear_task_state(self, conversation_id: str) -> None:
+        self.execute("DELETE FROM conversation_task_state WHERE conversation_id = ?",
+                     (conversation_id,))
+        self.commit()
+
     def clear_conversation(self, conversation_id: str, user_id: str | None = None) -> int:
         sql = "DELETE FROM messages WHERE conversation_id = ?"
         params: list[Any] = [conversation_id]
@@ -1146,6 +1200,10 @@ class Database:
             params.append(user_id)
         cursor = self.execute(sql, tuple(params))
         self.execute("DELETE FROM tool_calls WHERE conversation_id = ?", (conversation_id,))
+        # Clearing the transcript clears the task: leaving the row behind would
+        # brief the model on an artifact the user has just deleted.
+        self.execute("DELETE FROM conversation_task_state WHERE conversation_id = ?",
+                     (conversation_id,))
         self.commit()
         return cursor.rowcount
 
@@ -1217,6 +1275,34 @@ class Database:
         row = self.execute("SELECT title FROM conversation_meta WHERE conversation_id = ?",
                            (conversation_id,)).fetchone()
         return row["title"] if row else None
+
+    def skills_used(self, conversation_id: str | None, limit: int = 20) -> list[str]:
+        """Skill names loaded in a conversation, most recent first.
+
+        Derived from tool_calls rather than a new column: every load_skill call
+        is already persisted with its arguments, so attribution needs no schema
+        change and works retroactively on conversations that predate the
+        learning loop. This is what lets a rating -- which arrives minutes after
+        the turn, from a different request -- be credited to the procedures that
+        produced the answer.
+        """
+        if not conversation_id:
+            return []
+        rows = self.execute(
+            "SELECT args FROM tool_calls WHERE conversation_id = ? AND name = 'load_skill' "
+            "AND (error IS NULL OR error = '') ORDER BY id DESC LIMIT ?",
+            (conversation_id, max(1, int(limit))),
+        ).fetchall()
+        names: list[str] = []
+        for row in rows:
+            try:
+                args = json.loads(row["args"] or "{}")
+            except Exception:
+                continue
+            name = str(args.get("name") or "").strip()
+            if name and name not in names:
+                names.append(name)
+        return names
 
     def log_tool_call(
         self,

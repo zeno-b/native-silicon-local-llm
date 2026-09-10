@@ -17,29 +17,113 @@ from .config import *  # noqa: F401,F403
 from .tools import *  # noqa: F401,F403
 
 
-def note_prefix(prompt: str) -> None:
+def note_prefix(prompt: str, lane: str = "tools") -> None:
+    """Track the cached prompt prefix, per lane.
+
+    There are two stable prefixes, not one: the tool-calling prompt and the
+    prose-only prompt used on an answer-routed turn. Keying the check per lane
+    means ordinary alternation between them is not reported as the prefix
+    changing (and does not bump a generation counter every turn) -- a real
+    change is an edit to the system prompt or the tool set within one lane.
+    """
     digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
-    if PREFIX_STATE["hash"] == digest:
+    lanes = PREFIX_STATE.setdefault("lanes", {})
+    state = lanes.setdefault(lane, {"hash": None, "changed_at": None, "generation": 0})
+    if state["hash"] == digest:
         return
-    first = PREFIX_STATE["hash"] is None
-    PREFIX_STATE["hash"] = digest
-    PREFIX_STATE["changed_at"] = iso(utc_now())
-    PREFIX_STATE["generation"] += 1
+    first = state["hash"] is None
+    state["hash"] = digest
+    state["changed_at"] = iso(utc_now())
+    state["generation"] += 1
+    if lane == "tools":
+        # Mirror the tool lane at the top level: /api telemetry and the UI have
+        # read those keys since before there was a second lane.
+        PREFIX_STATE["hash"] = state["hash"]
+        PREFIX_STATE["changed_at"] = state["changed_at"]
+        PREFIX_STATE["generation"] = state["generation"]
     if not first:
         log(
-            "Agent prompt prefix changed (system prompt or tool set). Any cached "
-            "prefix is now invalid and the next few steps will re-prefill in full.",
+            f"Agent prompt prefix changed ({lane} lane: system prompt or tool set). "
+            "Any cached prefix for that lane is now invalid and the next few steps "
+            "will re-prefill in full.",
             logging.WARNING,
         )
 
 
+# NOTE on wording: this used to end "give your final answer", immediately after
+# describing a pair of XML tags. A 3B model completed the symmetry and wrapped
+# its reply in <final_answer> tags, or labelled it "Final answer:" -- measured at
+# roughly one reply in eight. Saying "the answer itself" and forbidding a label
+# costs a few tokens and removes the invitation. unwrap_answer still cleans the
+# output, because prompt wording is a suggestion, not a guarantee.
 REASONING_INSTRUCTION = (
     "\n\nThink before you answer. Begin your reply with your reasoning enclosed in "
     "<think> and </think> tags: work through the problem step by step, consider "
     "edge cases, and question your assumptions there. After the closing </think> "
-    "tag, give your final answer (or, if you are calling a tool, the single JSON "
-    "object). Put ONLY reasoning inside the tags and never the tool JSON."
+    "tag, give the answer itself (or, if you are calling a tool, the single JSON "
+    "object) with no heading, no label and no tags around it. Put ONLY reasoning "
+    "inside the tags and never the tool JSON."
 )
+
+
+# The same instruction for the prose lane, with the tool-call clause removed:
+# mentioning a "single JSON object" at the very end of the prompt is the most
+# available thing in the model's context when it starts writing.
+PROSE_REASONING_INSTRUCTION = (
+    "\n\nThink before you answer. Begin your reply with your reasoning enclosed in "
+    "<think> and </think> tags: work through the problem step by step, consider "
+    "edge cases, and question your assumptions there. After the closing </think> "
+    "tag, give the answer itself in plain text, with no heading, no label and no "
+    "tags around it. Put ONLY reasoning inside the tags."
+)
+
+
+SKILL_PREAMBLE = (
+    "\n\nYOUR SKILLS (name and summary only). Call load_skill with a name to read "
+    "the procedure BEFORE doing that kind of task; do not guess one you have a "
+    "skill for.\n"
+)
+
+
+def project_block(registry: ToolRegistry) -> str:
+    """Project instruction files, or "". Safe to call with anything."""
+    try:
+        return registry.project_context()
+    except Exception as exc:      # a hostile or unreadable file cannot break a turn
+        log(f"Project context unavailable: {exc}", logging.WARNING)
+        return ""
+
+
+def skills_block(registry: ToolRegistry) -> str:
+    """The catalogue lines for the prompt, or "" when there is nothing to add.
+
+    This is the visible half of progressive disclosure and the only part the
+    prompt pays for. Returns "" on a fresh install, so a machine with no skills
+    spends not one token on the feature.
+
+    Takes no query on purpose: the block is part of the system prompt, and a
+    block that varied with the message would change the prefix every turn and
+    cost a full re-prefill. Relevance selection lives in search_skills, where it
+    is paid for only when used.
+    """
+    config = getattr(registry, "config", None)
+    library = getattr(registry, "skills", None)
+    if library is None or config is None or not getattr(config, "skills_enabled", False):
+        return ""
+    if "load_skill" not in registry.names():
+        return ""          # tools disabled: advertising skills would be a lie
+    try:
+        catalogue = library.catalogue(limit=config.skills_in_prompt)
+        hidden = library.overflowing(config.skills_in_prompt)
+    except Exception as exc:      # a broken skill file must never break a turn
+        log(f"Skill catalogue unavailable: {exc}", logging.WARNING)
+        return ""
+    if not catalogue:
+        return ""
+    block = SKILL_PREAMBLE + catalogue
+    if hidden:
+        block += (f"\n({hidden} more not listed: use search_skills to find them.)")
+    return block
 
 
 def build_agent_system_prompt(base_prompt: str, registry: ToolRegistry,
@@ -52,9 +136,42 @@ def build_agent_system_prompt(base_prompt: str, registry: ToolRegistry,
         required = ", ".join(tool["required"]) or "none"
         lines.append(f"- {tool['name']}: {tool['description']}\n  args: {params}\n  required: {required}")
     prompt = f"{base_prompt}\n\n{TOOL_PROTOCOL}" + "\n".join(lines)
+    prompt += project_block(registry)
+    prompt += skills_block(registry)
     if reasoning:
         prompt += REASONING_INSTRUCTION
-    note_prefix(prompt)
+    note_prefix(prompt, lane="tools")
+    return prompt
+
+
+def build_plain_system_prompt(base_prompt: str, reasoning: bool = False,
+                              registry: ToolRegistry | None = None) -> str:
+    """The prompt for a turn that will not call a tool.
+
+    The tool protocol plus every tool spec is ~1500 tokens of a 4096-token
+    window, and its first instruction is "reply with a single JSON object and
+    nothing else". Once routing has decided the turn needs no tool, that text
+    only costs context and invites the failure it describes: a request to write
+    a C++ program answered with "{}". This lane says nothing about tools at all.
+    """
+    prompt = base_prompt
+    # Skills belong on THIS lane most of all. The prose lane is where the model
+    # answers from its own knowledge, which is exactly where a written-down
+    # procedure beats a 3B model's recall. The registry is optional so callers
+    # that have no tools at all still work.
+    if registry is not None:
+        prompt += project_block(registry)
+        block = skills_block(registry)
+        if block:
+            # One extra sentence, because this lane is told nothing about tools:
+            # without it the model has a list it has no way to act on.
+            prompt += block + (
+                "\nTo read one, reply with exactly this and nothing else: "
+                '{"tool": "load_skill", "args": {"name": "<skill-name>"}}'
+            )
+    if reasoning:
+        prompt += PROSE_REASONING_INSTRUCTION
+    note_prefix(prompt, lane="prose")
     return prompt
 
 
@@ -218,6 +335,40 @@ def parse_tool_call(text: str, known: set[str] | None = None) -> tuple[str, dict
     return name, args
 
 
+# Keys that only ever belong to the tool-call protocol. A reply made up of
+# nothing but these (or of nothing at all) is an unfilled tool call.
+_CALL_ONLY_KEYS = frozenset(
+    {"tool", "tool_name", "name", "args", "arguments", "parameters", "action"})
+
+
+def is_degenerate_tool_call(text: str) -> bool:
+    """True if the reply is a malformed tool call rather than an answer.
+
+    "{}" -- or {"args": {}}, or {"action": "answer"} echoed back from the router
+    -- is a tool call the model never filled in. parse_tool_call rightly refuses
+    to execute it, and the loop then treated the raw text as the reply: a request
+    for a C++ program that arrived as "{}". A JSON object carrying real content
+    keys is somebody asking for JSON, so it is left alone.
+    """
+    visible = strip_reasoning(text or "").strip()
+    if not visible:
+        return False
+    fenced = re.fullmatch(r"```(?:json)?\s*(\{.*\})\s*```", visible, re.S)
+    if fenced:
+        visible = fenced.group(1).strip()
+    if not (visible.startswith("{") and visible.endswith("}")):
+        return False
+    try:
+        parsed = json.loads(visible)     # the WHOLE reply must be one object
+    except Exception:
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    if parse_tool_call(visible) is not None:
+        return False                     # a real call: the caller decides
+    return all(str(k).lower() in _CALL_ONLY_KEYS for k in parsed)
+
+
 @dataclass
 class GenerationStats:
     """What one model call actually cost.
@@ -291,6 +442,9 @@ async def has_internet(recheck_after: float = 30.0) -> bool:
 # Re-exported explicitly: the original file was one flat namespace, so private
 # helpers (leading underscore) must cross module boundaries too.
 __all__ = [
+    'SKILL_PREAMBLE',
+    'project_block',
+    'skills_block',
     'GenerationStats',
     'OPEN_THINK',
     'REASONING_INSTRUCTION',
@@ -299,6 +453,10 @@ __all__ = [
     '_CONNECTIVITY',
     'build_agent_system_prompt',
     'extract_json_object',
+    'is_degenerate_tool_call',
+    '_CALL_ONLY_KEYS',
+    'build_plain_system_prompt',
+    'PROSE_REASONING_INSTRUCTION',
     'has_internet',
     'note_prefix',
     'parse_tool_call',

@@ -518,6 +518,7 @@ UI_BODY = r"""</style>
          <button onclick="retrain()" data-tip="Fine-tune the model on your thumbs-up/down feedback so far (LoRA)." title="Retrain on feedback">Retrain on feedback</button>
        </div>
        <div class="hint">Runs a LoRA fine-tune from your approved answers.</div>
+       <div class="hint" id="retrainRecipe">&nbsp;</div>
        </div>
      </details>
      <details class="sgroup">

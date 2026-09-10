@@ -10,6 +10,7 @@ import html
 import json
 import logging
 import os
+import re
 import traceback
 import subprocess
 import time
@@ -62,6 +63,7 @@ def _define_api_models() -> None:
     """
     global ChatRequest, FeedbackRequest, ChatResponse, ConfigRequest, ToolRequest
     global MemoryRequest, TaskRequest, TaskUpdateRequest, ModelSelectRequest
+    global SkillRequest
     if ChatRequest is not None:
         return
     from pydantic import BaseModel, Field
@@ -79,6 +81,16 @@ def _define_api_models() -> None:
         assistant_response: str = Field(..., min_length=1)
         rating: int = Field(0, ge=-1, le=1)
         corrected_response: str | None = None
+        # Which conversation this rating is about, so the procedures the answer
+        # actually used can be credited or blamed. Optional: an older client, or
+        # a rating typed against a pasted answer, still works -- it just cannot
+        # attribute the outcome to a skill.
+        conversation_id: str | None = Field(None, max_length=64)
+
+    class SkillRequest(BaseModel):  # noqa: F811
+        name: str = Field(..., min_length=1, max_length=64)
+        description: str = Field(..., min_length=1, max_length=300)
+        body: str = Field(..., min_length=1, max_length=20000)
 
     class ChatResponse(BaseModel):  # noqa: F811
         answer: str
@@ -207,6 +219,13 @@ def create_app(
     app.state.router = router
     app.state.node_registry = node_registry
     app.state.importer = importer
+    # Exposed so a test (or an admin tool) can reach the loop the chat handlers
+    # use; the handlers close over this same instance.
+    app.state.agent = agent
+    # The registry owns the skill library, the checkpoint store and the MCP
+    # connections, all of which have endpoints above. Exposing it here is what
+    # lets those be inspected and tested without reaching into a closure.
+    app.state.tool_registry = registry
 
     # Admission control for model generations. Each in-flight generation holds
     # its own KV cache in the same unified memory as the weights, so an
@@ -932,6 +951,11 @@ def create_app(
                 "model_port": config.model_port,
                 "model_process_alive": model_manager.is_alive(),
                 "retrain": retrain_manager.status,
+                # What the last export actually contained (feedback vs tool
+                # traces vs rehearsal) and the recipe the live adapter was
+                # trained with, so a regression is traceable to a run.
+                "retrain_corpus": retrain_manager.last_export,
+                "adapter_meta": adapter_meta(ADAPTER_DIR),
                 "prefix": dict(PREFIX_STATE),
                 "stats": counters["stats"],
                 "ram_gb": round(TOTAL_RAM_GB),
@@ -1436,6 +1460,22 @@ def create_app(
         rows = db.get_messages(conversation_id, limit=config.history_turns * 2, user_id=user_id)
         return conversation_id, [{"role": r["role"], "content": r["content"]} for r in rows]
 
+    def clean_reply(text: str) -> str:
+        """What the user should actually see, on the lanes with no agent loop.
+
+        The agent lane already does this: it splits the <think> block out to its
+        own view and unwraps any protocol scaffolding before yielding the final
+        event. The two plain lanes did neither, so with the default settings
+        (agent off, reasoning visible) a plain chat stored the whole chain of
+        thought in the conversation -- where it came back as history on the next
+        turn -- and showed any "Final answer:" label to the user.
+
+        Falls back to the raw text if cleaning leaves nothing, which happens when
+        a reply was cut off inside its own reasoning block.
+        """
+        cleaned = unwrap_answer(strip_reasoning(text or ""))
+        return cleaned or (text or "")
+
     def overrides(request) -> tuple[int, float]:
         max_tokens = request.max_tokens or config.max_tokens
         temperature = config.temperature if request.temperature is None else request.temperature
@@ -1462,13 +1502,20 @@ def create_app(
             log(f"auto-title skipped: {exc}", logging.DEBUG)
 
     def note_implicit_feedback(conversation_id: str, message: str,
-                               user_id: str | None = None) -> str | None:
+                               user_id: str | None = None) -> dict | None:
         """Turn a short "good job" / "no, wrong" into feedback on the prior answer.
 
         Praise stores the previous (prompt, answer) pair as an approved training
         example; a rejection stores it as a bad answer (rating -1, not approved),
         which is excluded from LoRA training but kept for future preference
-        tuning. Returns a short label for a UI notice, or None.
+        tuning.
+
+        Returns {"label", "sign", "prompt", "answer"} so the caller can act on a
+        rejection NOW. Storing a row was all this used to do, and a row a
+        rejection is excluded from training means nothing changed for the user:
+        "no c++ just an empty json?" was answered as a brand-new question while
+        the rejected answer sat in the history as a worked example. See
+        retry_message below.
         """
         sign = classify_implicit_feedback(message)
         if sign is None:
@@ -1493,8 +1540,23 @@ def create_app(
         except Exception as exc:
             log(f"implicit feedback not recorded: {exc}", logging.DEBUG)
             return None
-        return "approved the previous answer for training" if sign > 0 else \
-               "marked the previous answer as a bad example"
+        return {
+            "sign": sign,
+            "prompt": prompt,
+            "answer": answer,
+            "label": ("approved the previous answer for training" if sign > 0 else
+                      "that answer was rejected; retrying the original request"),
+        }
+
+    def retry_message(feedback: dict | None, message: str) -> str:
+        """The message to send the model, given any implicit feedback on the
+        previous turn. Unchanged unless the previous answer was rejected."""
+        if not feedback or feedback.get("sign", 0) >= 0:
+            return message
+        if not str(feedback.get("prompt") or "").strip():
+            return message
+        return rejection_retry_message(feedback["prompt"], feedback.get("answer") or "",
+                                       message)
 
     @app.post("/api/chat")
     async def chat(request: ChatRequest, user: dict = USER):
@@ -1516,10 +1578,21 @@ def create_app(
             use_agent = True
         elif not use_agent and config.project_dir and is_code_request(request.message):
             use_agent = True  # codebase edits need the tool loop
+        elif not use_agent and is_continue_request(request.message):
+            # The continuation lane lives in the agent. A short "go on" is not
+            # substantive by the test above, so without this it went down the
+            # plain lane and was answered as a new question -- the truncated
+            # artifact it was meant to resume never came into it.
+            use_agent = True
 
         # Recorded before generating, so a failed or empty run still leaves the
-        # question in the transcript instead of silently dropping the turn.
-        note_implicit_feedback(conversation_id, request.message, uid)
+        # question in the transcript instead of silently dropping the turn. The
+        # transcript keeps what the user typed; the model is asked to redo the
+        # rejected request (retry_message).
+        fb = note_implicit_feedback(conversation_id, request.message, uid)
+        for_model = retry_message(fb, request.message)
+        if for_model != request.message:
+            use_agent = True
         db.add_message(conversation_id, "user", request.message, user_id=uid)
         tasks.note_chat_activity()
         tasks.chat_in_flight += 1
@@ -1541,7 +1614,7 @@ def create_app(
                 trace: list[dict] = []
                 error: str | None = None
                 async for event in agent.run_iterating(
-                    request.message, history, conversation_id, max_tokens, temperature
+                    for_model, history, conversation_id, max_tokens, temperature
                 ):
                     if event["type"] == "final":
                         answer = event["answer"]
@@ -1573,6 +1646,7 @@ def create_app(
                 answer, stats = await model_client.complete_with_stats(
                     messages, max_tokens, temperature, conversation_id=conversation_id
                 )
+                answer = clean_reply(answer)
                 trace = []
 
             db.add_message(
@@ -1628,6 +1702,22 @@ def create_app(
             use_agent = True
         elif not use_agent and config.project_dir and is_code_request(request.message):
             use_agent = True  # codebase edits need the tool loop
+        elif not use_agent and is_continue_request(request.message):
+            # The continuation lane lives in the agent. A short "go on" is not
+            # substantive by the test above, so without this it went down the
+            # plain lane and was answered as a new question -- the truncated
+            # artifact it was meant to resume never came into it.
+            use_agent = True
+
+        # A short "no, wrong" is feedback on the PREVIOUS answer: record it, and
+        # re-ask that request with the complaint attached instead of answering
+        # the complaint as a new question. Resolved before the generator so the
+        # start event and the log report the lane the turn actually takes.
+        fb = await asyncio.to_thread(note_implicit_feedback, conversation_id,
+                                     request.message, uid)
+        for_model = retry_message(fb, request.message)
+        if for_model != request.message:
+            use_agent = True
 
         async def sse(event: dict) -> str:
             return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
@@ -1660,15 +1750,12 @@ def create_app(
                 return
             try:
                 yield await sse({"type": "start", "conversation_id": conversation_id, "agent": use_agent})
-                # Turn a short "good job" / "no, wrong" into feedback on the
-                # prior answer before recording this message as the new turn.
-                fb_label = await asyncio.to_thread(note_implicit_feedback, conversation_id, request.message, uid)
-                if fb_label:
-                    yield await sse({"type": "notice", "info": True, "message": fb_label})
+                if fb:
+                    yield await sse({"type": "notice", "info": True, "message": fb["label"]})
                 await asyncio.to_thread(db.add_message, conversation_id, "user", request.message, user_id=uid)
                 if use_agent:
                     async for event in agent.run_iterating(
-                        request.message, history, conversation_id, max_tokens, temperature
+                        for_model, history, conversation_id, max_tokens, temperature
                     ):
                         yield await sse(event)
                         if event["type"] == "final":
@@ -1707,14 +1794,25 @@ def create_app(
                     ):
                         answer_parts.append(token)
                         yield await sse({"type": "token", "token": token, "step": 1})
-                    answer = "".join(answer_parts)
+                    # Tokens streamed raw above so the reasoning is visible as
+                    # it happens; the final event carries the cleaned text, and
+                    # the UI replaces the streamed body with it. Same contract
+                    # as the agent lane.
+                    answer = clean_reply("".join(answer_parts))
                     yield await sse({"type": "usage", "step": 1, **plain_stats.as_event()})
                     await asyncio.to_thread(
                         db.log_metric,
                         "chat_stream_gen", plain_stats.total_ms, 200, stats=plain_stats,
                         model=config.model, step=1, conversation_id=conversation_id, user_id=uid,
                     )
-                    yield await sse({"type": "final", "answer": answer, "steps": 1, "trace": []})
+                    # Carry the cost of the turn on the final event: the footer
+                    # under the answer reads these, and this lane has no tools,
+                    # so generation wall-clock is the whole turn.
+                    yield await sse({"type": "final", "answer": answer, "steps": 1,
+                                     "trace": [],
+                                     "prompt_tokens": plain_stats.prompt_tokens,
+                                     "completion_tokens": plain_stats.completion_tokens,
+                                     "elapsed_ms": round(plain_stats.total_ms, 1)})
 
                 if answer:
                     await asyncio.to_thread(
@@ -1774,8 +1872,15 @@ def create_app(
             return JSONResponse(
                 {"error": f"could not apply settings: {type(exc).__name__}: {exc}"},
                 status_code=400)
+        saved: list[str] = []
         if changed:
-            log(f"Config updated from web UI: {', '.join(changed)}")
+            # Persist BEFORE anything else can fail: the whole point is that the
+            # change outlives this process. Only what apply() reported as
+            # changed is written, so a clamped or rejected value is never stored
+            # at face value.
+            saved = config.save_settings(changed)
+            log(f"Config updated from web UI: {', '.join(changed)}"
+                + (f" (saved: {', '.join(saved)})" if saved else ""))
             # Re-apply structured logging when its settings change at runtime.
             # (Routing factors are read live by the router, so they need no
             # re-sync; changing the node topology needs a restart.)
@@ -1965,6 +2070,101 @@ def create_app(
         except ValueError as exc:
             return JSONResponse(content={"error": str(exc)}, status_code=404)
 
+    @app.get("/api/mcp")
+    def mcp_status(_a: dict = ADMIN):
+        """What the MCP servers are doing, including why one is not working.
+
+        A server that failed is otherwise invisible: its tools simply are not
+        there, which looks identical to not having configured it.
+        """
+        return {"configured": bool(config.mcp_servers), "servers": MCP.status()}
+
+    # --- Checkpoints -------------------------------------------------------- #
+    # Rolling back is a HUMAN action, so it is an endpoint and not a tool. An
+    # agent that can undo its own writes can also undo yours, and "the model
+    # decided to revert your file" is not a failure mode worth introducing.
+
+    @app.get("/api/checkpoints")
+    def list_checkpoints(limit: int = Query(20, ge=1, le=200), _a: dict = ADMIN):
+        return {
+            "checkpoints": [c.as_dict() for c in registry.checkpoints.list(limit)],
+            "enabled": config.checkpoints_enabled,
+            "keep": config.checkpoint_keep,
+        }
+
+    @app.post("/api/checkpoints/{checkpoint_id}/rollback")
+    def rollback_checkpoint(checkpoint_id: str, _a: dict = ADMIN):
+        checkpoint = registry.checkpoints.get(checkpoint_id)
+        if checkpoint is None:
+            return JSONResponse({"error": f"no checkpoint {checkpoint_id!r}"},
+                                status_code=404)
+        restored, problems = registry.checkpoints.rollback(checkpoint_id)
+        # Files restored underneath the tools mean the "changed this session"
+        # list is now wrong; drop the ones that went back.
+        for rel in restored:
+            registry.changed_files.discard(rel)
+        log(f"Rolled back checkpoint {checkpoint_id}: {len(restored)} file(s) restored"
+            + (f", {len(problems)} problem(s)" if problems else ""))
+        return {"rolled_back": checkpoint_id, "restored": restored,
+                "problems": problems}
+
+    # --- Skills ------------------------------------------------------------ #
+    # Procedural memory is written by the model, which is exactly why it needs
+    # to be inspectable and editable by a human: a skill the agent authored
+    # after a rated turn is the one thing in this system that changes its own
+    # behaviour without anybody reading it first.
+
+    @app.get("/api/skills")
+    def list_skills(user: dict = USER):
+        library = registry.skills
+        return {
+            "skills": [skill.as_dict() for skill in library.list()],
+            "stats": library.stats(),
+            "enabled": config.skills_enabled,
+            "autolearn": config.skills_autolearn,
+            "in_prompt": config.skills_in_prompt,
+        }
+
+    @app.get("/api/skills/{name}")
+    def read_skill(name: str, user: dict = USER):
+        skill = registry.skills.get(name)
+        if skill is None:
+            return JSONResponse({"error": f"no skill named {name!r}"}, status_code=404)
+        return {"skill": skill.as_dict(), "body": skill.body}
+
+    @app.post("/api/skills")
+    def write_skill(request: SkillRequest, _a: dict = ADMIN):
+        # Admin-only: a skill is loaded into the prompt of every user on this
+        # machine, so writing one is closer to editing the system prompt than to
+        # storing a note.
+        #
+        # Path-shaped characters are REFUSED here rather than sanitised away.
+        # slugify() would happily turn "../escape" into the perfectly safe
+        # "escape" -- contained, but silently storing something under a name
+        # nobody asked for. The model-facing save_skill tool stays forgiving,
+        # because a small model mangles names and a rejected skill is lost; an
+        # explicit API call is a different contract.
+        if not re.fullmatch(r"[A-Za-z0-9 _-]{1,64}", request.name or ""):
+            return JSONResponse(
+                {"error": "a skill name may contain only letters, digits, spaces, "
+                          "hyphens and underscores"},
+                status_code=400)
+        skill = registry.skills.save(request.name, request.description, request.body)
+        if skill is None:
+            return JSONResponse(
+                {"error": "could not save: the name must be short kebab-case, the "
+                          "body must not be empty, and the library may be at its cap"},
+                status_code=400)
+        return {"saved": skill.as_dict()}
+
+    @app.delete("/api/skills/{name}")
+    def retire_skill(name: str, _a: dict = ADMIN):
+        # Retired, not deleted: a skill that misfired is exactly what someone
+        # will want to read afterwards.
+        if not registry.skills.retire(name, "retired from the API"):
+            return JSONResponse({"error": f"no skill named {name!r}"}, status_code=404)
+        return {"retired": name}
+
     @app.get("/api/memory")
     def list_memory(
         limit: int = Query(50, ge=1, le=500),
@@ -2013,6 +2213,30 @@ def create_app(
         guarded_thread(model_manager.restart).start()
         return {"status": "restarting", "max_kv_size": config.max_kv_size}
 
+    async def _learn_in_background(user_prompt: str, answer: str,
+                                    correction: str, used: list[str]) -> None:
+        """Author or refine a skill after a rating, off the request path.
+
+        Goes through the generation gate like any other model call: on an 8GB
+        machine an unmetered background generation is a second KV cache next to
+        whatever the user is doing now. If the gate is full, learning is skipped
+        rather than queued -- the next rating will do it, and a slow chat is a
+        worse outcome than a skill written later.
+        """
+        try:
+            await generation_gate.acquire()
+        except GenerationBusy:
+            log("Skipped skill learning: the model is busy.", logging.DEBUG)
+            return
+        try:
+            note = await agent.learn_from_turn(user_prompt, answer, correction, used)
+            if note:
+                log(f"Learning from feedback: {note}")
+        except Exception as exc:
+            log(f"Background skill learning failed: {exc}", logging.WARNING)
+        finally:
+            generation_gate.release()
+
     @app.post("/api/feedback")
     async def feedback(request: FeedbackRequest, user: dict = USER):
         # A thumbs-up or a correction normally marks the row for training. From a
@@ -2048,6 +2272,26 @@ def create_app(
         )
         db.commit()
 
+        # Close the learning loop. A rating is the only honest signal this
+        # project has about whether an answer was any good, and it is already
+        # what gates the training corpus (train_tool_quality="rated"), so it is
+        # the right trigger for procedural memory too. Outcomes are recorded
+        # synchronously (model-free, instant); authoring is a model call and
+        # runs in the background so a thumbs-up never waits on generation.
+        skills_touched = db.skills_used(request.conversation_id)
+        learning: dict = {"skills_used": skills_touched, "retired": []}
+        if config.skills_enabled:
+            good = request.rating > 0 and not (request.corrected_response or "").strip()
+            if skills_touched:
+                learning["retired"] = agent.record_skill_outcomes(skills_touched, good)
+            if config.skills_autolearn and wanted:
+                asyncio.create_task(_learn_in_background(
+                    request.user_prompt or "",
+                    request.assistant_response or "",
+                    (request.corrected_response or "").strip(),
+                    skills_touched,
+                ))
+
         # Auto-retrain check
         if config.auto_retrain_threshold > 0:
             untrained = db.get_untrained_count()
@@ -2060,6 +2304,7 @@ def create_app(
             "approved_for_training": bool(approved),
             "pending_approval": bool(pending),
             "session_id": session_id,
+            "learning": learning,
         }
 
     @app.post("/api/retrain")

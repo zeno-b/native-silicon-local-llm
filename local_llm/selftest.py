@@ -87,7 +87,8 @@ def selftest() -> int:
     _expected = set() if not __package__ else {
         "core", "obslog", "database", "sysutil", "ui", "config", "model_server",
         "training", "websearch", "calculator", "tools", "llm", "model_client",
-        "textutil", "agent", "tasks", "auth", "cluster", "claude_import", "api",
+        "textutil", "taskstate", "agent", "tasks", "auth", "cluster",
+        "claude_import", "api",
         "diagnostics", "selftest", "cli",
     }
     _found = {p.stem for p in _pkg_dir.glob("*.py")} - {"__init__", "__main__"}
@@ -113,8 +114,11 @@ def selftest() -> int:
             for _node in _ast.walk(_tree):
                 if isinstance(_node, _ast.Name):
                     (_used if isinstance(_node.ctx, _ast.Load) else _bound).add(_node.id)
-                elif isinstance(_node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
-                    _bound.add(_node.name)
+                elif isinstance(_node, (_ast.FunctionDef, _ast.AsyncFunctionDef,
+                                        _ast.Lambda)):
+                    # A lambda has parameters but no name of its own.
+                    if not isinstance(_node, _ast.Lambda):
+                        _bound.add(_node.name)
                     _args = _node.args
                     for _a in _args.args + _args.kwonlyargs + _args.posonlyargs:
                         _bound.add(_a.arg)
@@ -1130,6 +1134,20 @@ def selftest() -> int:
     if sample.as_event()["estimated"] is not True:
         failures.append("stats without server usage were not marked estimated")
 
+    # Every generating lane inside Agent.run must fold its cost into the turn
+    # totals, or the footer under the answer under-reports: the reasoning,
+    # map/reduce and synthesis lanes each own a GenerationStats and used to
+    # report nothing. Source-level, because there is no fake model client here.
+    import inspect as _inspect
+    from . import agent as _agent_mod
+    _src = _inspect.getsource(_agent_mod.Agent.run)
+    _owned = set(re.findall(r"(\w+) = GenerationStats\(\)", _src))
+    _counted = set(re.findall(r"account\((\w+)\)", _src))
+    _missing = sorted(_owned - _counted)
+    if _missing:
+        failures.append("Agent.run lanes not counted towards the turn total: "
+                        + ", ".join(_missing))
+
     catalog = model_catalog(Config(model="someone/custom-model"))
     if not any(entry["current"] and entry["id"] == "someone/custom-model" for entry in catalog):
         failures.append("model_catalog did not include the model currently in use")
@@ -1759,6 +1777,83 @@ def selftest() -> int:
                 failures.append(f"{_name} import leaked a system frame into the transcript")
         _pdb.close()
 
+    # ---------------------------------------------------------------- #
+    # The "{}" turn: an unfilled tool call must never be shown as an answer,
+    # the answer lane must not carry the tool protocol, and prompt + reply must
+    # fit the context window.
+    # ---------------------------------------------------------------- #
+    for _txt in ("{}", '{"args": {}}', '{"action": "answer"}', "```json\n{}\n```",
+                 "<think>hmm</think>\n{}"):
+        if not is_degenerate_tool_call(_txt):
+            failures.append(f"{_txt!r} should be recognised as an unfilled tool call")
+    for _txt in ('{"port": 8080}', '{"tool": "web_search", "args": {"query": "x"}}',
+                 "#include <iostream>", "", "Here is JSON: {} and more text"):
+        if is_degenerate_tool_call(_txt):
+            failures.append(f"{_txt!r} should NOT be treated as an unfilled tool call")
+
+    _lncfg = Config()
+    _lnag = Agent(_lncfg, ToolRegistry(_lncfg), ModelClient(_lncfg))
+    _tool_base, _ = _lnag.build_base([], "write a basic c++ crud program", 1536)
+    _prose_base, _ = _lnag.build_base([], "write a basic c++ crud program", 1536,
+                                      tools=False)
+    _tool_sys = _tool_base[0]["content"]
+    _prose_sys = _prose_base[0]["content"]
+    if "You can call tools" not in _tool_sys:
+        failures.append("the tool lane lost the tool protocol")
+    # The user's own base prompt may say "tools" in passing; what must be gone
+    # is the protocol, the "single JSON object" instruction and the tool list.
+    if ("You can call tools" in _prose_sys or "single JSON object" in _prose_sys
+            or "- web_search:" in _prose_sys):
+        failures.append("the prose lane still carries the tool protocol")
+    if messages_tokens(_prose_base) >= messages_tokens(_tool_base) - 800:
+        failures.append("the prose lane did not actually shrink the prompt "
+                        f"({messages_tokens(_tool_base)} -> {messages_tokens(_prose_base)})")
+
+    # The reported turn: a 2759-token prompt asking for 1536 reply tokens of a
+    # 4096-token window. The clamp must bring the total back inside it.
+    _clcli = ModelClient(_lncfg)
+    _mid = [{"role": "user", "content": "x" * 11000}]
+    if _clcli.reply_budget(_mid, 1536) + messages_tokens(_mid) > _lncfg.context_size:
+        failures.append("reply budget was not clamped to the context window")
+    if _clcli.reply_budget([{"role": "user", "content": "hi"}], 256) != 256:
+        failures.append("reply budget was clamped when the prompt easily fits")
+    # A prompt that alone exceeds the window cannot be rescued by the clamp; it
+    # must still return the floor rather than a negative or zero budget.
+    _over = [{"role": "user", "content": "x" * (_lncfg.context_size * 4)}]
+    if _clcli.reply_budget(_over, 1536) != _lncfg.min_max_tokens:
+        failures.append("an over-window prompt did not fall back to the token floor")
+
+    # Retrieval must fire on subject words, and stay out of a code request that
+    # does not point at the user's own files.
+    if rag_query_tokens("write a basic c++ crud program") != {"crud"}:
+        failures.append("RAG query tokens still include intent verbs")
+    if refers_to_project("write a basic c++ crud program"):
+        failures.append("a plain code request was read as a project reference")
+    if not refers_to_project("fix the bug in local_llm/agent.py"):
+        failures.append("a file path was not read as a project reference")
+    with tempfile.TemporaryDirectory() as _gatetmp:
+        _gdb = Database(Path(_gatetmp) / "g.db")
+        if _gdb.fts_enabled:
+            _gdb.index_document("d/notes.md",
+                                "How to write a program: any program, basic steps.", "n")
+            _gcfg = Config()
+            _gag = Agent(_gcfg, ToolRegistry(_gcfg, _gdb), ModelClient(_gcfg))
+            if _gag.with_retrieved_context("write a basic c++ crud program") != \
+                    "write a basic c++ crud program":
+                failures.append("retrieval fired on a plain code request")
+            if _gag.with_retrieved_context("what does notes.md say about steps?", 64) != \
+                    "what does notes.md say about steps?":
+                failures.append("retrieval ignored the caller's character budget")
+        _gdb.close()
+
+    # A rejection re-asks the original request instead of answering the remark.
+    _retry = rejection_retry_message("write a basic c++ crud program", "{}",
+                                     "no c++ just an empty json?")
+    if not _retry.startswith("write a basic c++ crud program"):
+        failures.append("a rejection did not re-ask the original request")
+    if "REJECTED" not in _retry or "no c++" not in _retry:
+        failures.append("a rejection did not carry the complaint to the model")
+
     if failures:
         for failure in failures:
             print(f"FAIL  {failure}")
@@ -1781,6 +1876,7 @@ def selftest() -> int:
     print("PASS  'summarise/read <url>' routes to fetch_url (no more link refusal)")
     print("PASS  agents: capability->tool mapping, office365 stubs, profile CRUD")
     print("PASS  import works for Claude, OpenAI, DeepSeek and xAI exports")
+    print("PASS  no empty-JSON answers, prose answer lane, clamped reply budget")
     return 0
 
 

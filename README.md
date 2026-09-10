@@ -23,8 +23,10 @@ splitting it into bounded steps, slowing down rather than crashing.
 - [Microsoft Entra ID / OIDC](#microsoft-entra-id--oidc)
 - [Conversation history import](#conversation-history-import)
 - [Agents, knowledge and skills](#agents-knowledge-and-skills)
+- [Feedback and LoRA retraining](#feedback-and-lora-retraining)
 - [Agent profiles and capabilities](#agent-profiles-and-capabilities)
 - [Office 365 (Microsoft Graph)](#office-365-microsoft-graph)
+- [Multi-turn task continuity](#multi-turn-task-continuity)
 - [Performance and resource limits](#performance-and-resource-limits)
 - [Logging and debugging](#logging-and-debugging)
 - [Automatic Mac Mini / Mac Studio routing](#automatic-mac-mini--mac-studio-routing)
@@ -189,6 +191,8 @@ every variable with placeholders. Highlights:
 | Cluster/routing | `NODE_ROLE`, `NODE_NAME`, `STUDIO_NODE_URL`, `NODE_TOKEN`, `ROUTE_MAX_ACTIVE`, `ROUTE_QUEUE_DEPTH`, `ROUTE_CPU_PCT`, `ROUTE_LOAD_RATIO`, `ROUTE_MEM_PCT`, `ROUTE_SLA_MS`, `ROUTE_COOLDOWN_S`, `LARGE_MODEL_MARKERS`, `HEARTBEAT_INTERVAL`, `HEARTBEAT_TIMEOUT`, `NODE_PROBE_TIMEOUT` |
 | Admission control | `MAX_CONCURRENT_GENERATIONS`, `GENERATION_QUEUE_DEPTH`, `MAX_CONCURRENT_TASKS`, `AGENT_RUN_TIMEOUT` |
 | Agent/tools | `AGENT_ENABLED`, `AGENT_MAX_STEPS`, `AGENT_TOOLS`, `CODE_MAX_TOKENS`, `PROJECT_DIR`, `ALLOW_SHELL`, `ALLOW_PYTHON` |
+| Task continuity | `TASK_STATE_ENABLED`, `TASK_ARTIFACT_CHARS`, `DRIFT_CHECK_ENABLED`, `ARTIFACT_REPLY_HEADROOM`, `DEBUG_PROMPTS` (see [Multi-turn task continuity](#multi-turn-task-continuity)) |
+| Training | `TRAIN_MIN_EXAMPLES`, `TRAIN_EPOCHS`, `TRAIN_ITERS`, `TRAIN_LR`, `TRAIN_SEQ_LEN`, `TRAIN_BATCH_SIZE`, `TRAIN_NUM_LAYERS`, `TRAIN_FINE_TUNE_TYPE`, `TRAIN_LORA_RANK`, `TRAIN_TOOL_RATIO`, `TRAIN_TOOL_QUALITY`, `TRAIN_REPLAY_RATIO`, `TRAIN_VAL_SPLIT`, `TRAIN_VAL_CHECK`, `TRAIN_TIMEOUT`, `TRAIN_MAX_BACKUPS`, `AUTO_RETRAIN_THRESHOLD` (see [Feedback and LoRA retraining](#feedback-and-lora-retraining)) |
 | Import | `IMPORT_MAX_ZIP_BYTES`, `IMPORT_MAX_FILES`, `IMPORT_MAX_UNCOMPRESSED_BYTES`, `IMPORT_MAX_FILE_BYTES` |
 | Search | `SEARCH_RESULTS` (provider is locked to DuckDuckGo Lite) |
 | Networking | `ALLOWED_ORIGINS` (extra CORS origins behind a proxy; `*` is refused) |
@@ -364,6 +368,83 @@ a tool, not writing routing rules.
 
 ---
 
+## Feedback and LoRA retraining
+
+Thumbs-up, thumbs-down and corrections collect into a training corpus; **Retrain
+on feedback** (or `AUTO_RETRAIN_THRESHOLD`) fine-tunes a LoRA adapter on it with
+`mlx_lm.lora`, then restarts the model server on the result. A non-admin's rating
+never enters the shared corpus by itself — it queues for approval first.
+
+### The recipe is derived from the corpus, not fixed
+
+At batch size 1 a constant iteration count means the number of *epochs* is set by
+however much unrelated data happens to be in the corpus: 300 iterations is ~19
+epochs over the 16-example minimum (memorisation, and a model that gets worse at
+everything else) and well under one epoch once tool traces are included (rows the
+optimiser never sees). Epochs are held constant instead:
+
+```
+iters = ceil(train_examples / TRAIN_BATCH_SIZE) * TRAIN_EPOCHS
+        clamped to [TRAIN_MIN_ITERS, TRAIN_MAX_ITERS]
+```
+
+Set `TRAIN_ITERS` to a non-zero value to pin the count manually; `0` (the
+default) derives it.
+
+### A run has to prove itself before it is promoted
+
+`mlx-lm` measures the first validation loss **before** any weight update, so the
+first reading is that model's pre-training score on the held-out rows. With
+`TRAIN_VAL_CHECK=1` (default) the run is judged against it:
+
+- Held-out loss ended worse than it started (beyond `TRAIN_VAL_TOLERANCE`) → the
+  adapter is discarded, the previous one is restored, and the feedback rows stay
+  unconsumed so a later, larger run picks them up again.
+- `TRAIN_PROMOTE_BEST=1` (default) promotes the best-scoring periodic checkpoint
+  rather than the last one, which is early stopping after the fact and costs
+  nothing — `mlx-lm` has already written the checkpoints.
+- The recipe and both losses are written to `adapters/latest/training_meta.json`
+  and surfaced in `GET /api/status`, so a regression is traceable to a run.
+
+Without this the only failure the adapter backup protects against is a non-zero
+exit code, and a run that converges on garbage exits 0.
+
+### What actually goes into the corpus
+
+| Source | Control | Notes |
+|--------|---------|-------|
+| Approved feedback | `TRAIN_MIN_EXAMPLES` (16) | The **only** thing the minimum-examples gate counts. Tool traces and rehearsal rows pad the corpus; they are not the signal. |
+| Tool-call traces | `TRAIN_TOOL_RATIO` (3.0), `TRAIN_TOOL_QUALITY` (`rated`) | The model's own output fed back as ground truth, so it is capped at a multiple of the human rows and, by default, restricted to conversations whose answer a human approved. `error IS NULL` alone means "did not raise", not "was correct". `TRAIN_TOOL_QUALITY=all` restores the unfiltered behaviour. |
+| Rehearsal / replay | `TRAIN_REPLAY_RATIO` (0.15) | The standard defence against catastrophic forgetting: this share of the *final* mixed set is drawn from `data/sft/replay.jsonl` and shuffled throughout (a block at the end is a second mini-finetune, not rehearsal). A starter set is seeded on the first run — edit it to match your own general use. |
+| Held out | `TRAIN_VAL_SPLIT` (0.1) | Written to `valid.jsonl` and `test.jsonl`, never trained on. |
+
+### Sequence length truncates the *answer*
+
+Every example carries the full system prompt (~270 tokens as shipped), and
+`mlx-lm` truncates an over-long sequence rather than dropping it — so a short
+window trains the model to stop mid-answer. `TRAIN_SEQ_LEN` defaults to 1024 and
+examples that still do not fit are dropped at export
+(`TRAIN_DROP_OVER_LENGTH=1`) with a count in the log, rather than silently cut.
+Over-length rows are *not* marked as consumed, so raising the window brings them
+back. A warning fires when the system prompt has eaten more than a third of the
+window.
+
+### Operational limits
+
+`TRAIN_TIMEOUT` (2h) kills a hung trainer, which would otherwise leave the model
+server stopped indefinitely with the UI stuck on "Training LoRA adapter".
+`TRAIN_MAX_BACKUPS` (5) bounds `adapters/backups/`; periodic checkpoints are
+cleared after each run and excluded from backups, so neither directory grows by
+one checkpoint set per retrain forever.
+
+LoRA shape (`TRAIN_LORA_RANK`, `TRAIN_LORA_SCALE`, `TRAIN_LORA_DROPOUT`) is
+passed through a generated `data/sft/lora_config.yaml`, because `mlx-lm` takes it
+through a config file rather than flags. Every optional flag is probed against
+`mlx_lm.lora --help` first; if that cannot be read at all the run is **refused**
+rather than silently falling back to `mlx-lm`'s own defaults.
+
+---
+
 ## Agent profiles and capabilities
 
 A **profile** is a named agent with an explicit capability set. Capabilities are
@@ -422,6 +503,77 @@ These tools are **registered only when the credentials are configured**. Left
 unset, they are absent from the tool list rather than present-and-failing: the
 model never sees them, which also saves roughly 130 tokens of prefill on every
 agent step. `O365_CLIENT_SECRET` is redacted everywhere, like every other secret.
+
+---
+
+## Multi-turn task continuity
+
+Task identity used to live only in the transcript, and the transcript is the
+thing that gets trimmed. A Bash disk-diagnostic script asked for in turn one was
+the oldest message in the window, so by turn three the model saw nothing but
+"add more checks and error handling" — no language, no platform, no script — and
+answered with unrelated Python. [`local_llm/taskstate.py`](local_llm/taskstate.py)
+makes the task an explicit object instead:
+
+    conversation history -> TaskState -> current artifact -> relevant context -> LLM
+
+- **The active task is structured state.** Task type, language, platform, the
+  original objective, the accumulated requirements, the user's corrections, the
+  current artifact with a version and a complete/truncated flag, and the latest
+  request. It is rebuilt deterministically from the conversation on every turn
+  (regex and signature matching, no extra model call) and persisted per
+  conversation in `conversation_task_state`, so it also survives the process,
+  the history-turns limit and a fully trimmed window.
+- **The artifact is state, not a message.** Every lane records the code it
+  produced through one exit point, so the current script has a version rather
+  than being reconstructed from old messages. The brief rides on the current
+  user turn, which `trim_to_context` never drops: trimming can evict any amount
+  of old conversation and still cannot remove the task or the file.
+- **The prompt says what the task is.** An `ACTIVE TASK` block (type, language,
+  platform, artifact name/version, objective, requirements, corrections, latest
+  request, the artifact itself, and the rules for the reply) is placed
+  immediately before the user's words.
+- **Budgets follow the task, not the wording.** "add more checks" names no
+  language and no code object, so the old heuristic gave it the 512-token chat
+  budget for a request to re-emit a whole script. A follow-up on a code task now
+  gets `CODE_MAX_TOKENS`, and at least the artifact's own size plus
+  `ARTIFACT_REPLY_HEADROOM`, clamped so prompt + reply + margin still fits the
+  window. Where the artifact cannot fit alongside its own regeneration, the
+  brief omits the middle, says so, and asks for changed sections only.
+- **"Continue" resumes a specific artifact.** The continuation lane states the
+  contract (this is Bash, this file, this platform, the block is still open,
+  do not change topic or restart) instead of leaving the model to infer the task
+  from its own truncated output, keeps the original objective as the anchor, and
+  can resume from the stored artifact even when the partial answer has already
+  been trimmed out of the visible history.
+- **Drift is caught, not shipped.** After generation, an answer whose every code
+  block is a language the task is not (Python where the task is Bash, HTML where
+  it is SQL) is regenerated once with a corrective prompt; a second drift asks
+  the user rather than returning unrelated output. The check is deliberately
+  narrow — prose, unlabelled fences and mixed replies that include the right
+  language are left alone.
+- **Corrections are state updates.** "stop you were asked a bash script" retargets
+  the language and artifact type and is quoted back in the brief under
+  `CORRECTIONS FROM THE USER`, rather than being just another message. A drifted
+  answer is never adopted as the current artifact.
+- **A real task switch still works.** "now forget that; write a python script"
+  resets the task; "add SMART checks" does not.
+- **Retrieval and skills stand down mid-task.** The knowledge-base query ORs
+  every term, so "checks"/"error"/"handling" matched indexed Python documents and
+  injected them into a shell-script conversation. While a code task is active
+  with an artifact, the artifact is the context: retrieval and skill autoload are
+  suppressed unless the message points at the project.
+- **Invented commands are pushed back on.** For a code task the rules block
+  states the platform and forbids inventing command-line options or output field
+  names, requires defensive parsing of another command's output, and asks for a
+  comment where behaviour is version-dependent. With `--allow-shell` it also
+  offers a read-only verification pass. Continuity does not make output correct
+  on its own; this is the safeguard, not a guarantee.
+
+Settings: `TASK_STATE_ENABLED` (default 1), `TASK_ARTIFACT_CHARS` (8000),
+`DRIFT_CHECK_ENABLED` (1), `ARTIFACT_REPLY_HEADROOM` (640), `CODE_MAX_TOKENS`
+(1536). All are live-mutable from `/api/config`. `TASK_STATE_ENABLED=0` restores
+the previous behaviour exactly.
 
 ---
 
@@ -484,7 +636,18 @@ Structured, aggregation-ready logging lives in
   (redacted, truncated text). Change it live to `disabled` to stop content logging.
 - **Secret redaction.** A redaction filter scrubs authorization headers, API keys,
   bearer/JWT tokens, passwords and cookies from log messages **and** structured
-  fields; tool args/results are redacted before they are stored.
+  fields; tool args/results are redacted before they are stored. Token shapes are
+  matched before key/value pairs, so `Authorization: Bearer <token>` loses the
+  token and not just the word "Bearer".
+- **Prompt tracing.** `DEBUG_PROMPTS=1` adds a `prompt.assembled` DEBUG event for
+  every model call: the lane (tools / prose / continuation / drift-retry / forced),
+  the task summary, the artifact version, the generation id, the requested and
+  effective reply budgets, the temperature, how much history was trimmed, and the
+  prompt itself. The prompt text still obeys `LOG_CHAT_CONTENT`, so it is a
+  fingerprint at the `metadata` default and redacted text only at `full` — turning
+  tracing on never starts writing conversation text on its own. Paired with
+  `turn.start` and `router.decision` (same domain, `agent`), this is what makes the
+  semantic context the model received visible, rather than only token counts.
 - **Routing decisions.** Every node-selection decision is logged and persisted to
   the `routing_events` table (`GET /api/routing/events`, `GET /api/cluster/nodes`)
   — see the next section.
@@ -726,6 +889,10 @@ enforced or configurable in the code, not just advice.
       LoRA corpus by itself: it waits in **Models → Training data → approve
       queued** (`POST /api/feedback/approve-pending`). Leave
       `AUTO_RETRAIN_THRESHOLD=0` unless you want retraining to fire unattended.
+- [ ] Check `adapters/latest/training_meta.json` after a retrain: it records the
+      recipe and the held-out loss before and after. A run that made the model
+      worse is rolled back automatically (`TRAIN_VAL_CHECK=1`), but the numbers
+      are what tell you whether the corpus is big enough yet.
 
 **Capability**
 
@@ -760,8 +927,9 @@ Two complementary suites, both runnable without a model server:
 # getElementById target present, no unescaped innerHTML).
 python3 deploy.py --selftest
 
-# 29 HTTP integration tests (auth flows, login throttling, RBAC blocking,
-# cross-user isolation, per-user prompt isolation, the training-approval gate,
+# 45 HTTP integration and training tests (auth flows, login throttling, RBAC
+# blocking, cross-user isolation, per-user prompt isolation, the derived
+# training recipe, the corpus gates, val-loss rollback, the training-approval gate,
 # CORS wildcard refusal, generation admission control, agent CRUD and capability
 # gating, import, node-token gating, concurrency, backward-compatible auth-off).
 python3 tests/test_app.py            # standalone runner

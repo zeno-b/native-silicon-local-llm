@@ -767,7 +767,20 @@ UI_JS_CHAT = r"""
            var bits = [];
            if (event.tools_used && event.tools_used.length) bits.push(event.tools_used.join(", "));
            bits.push((event.steps || 1) + " step" + ((event.steps || 1) === 1 ? "" : "s"));
-           bits.push(Math.round((event.elapsed_ms || 0) / 100) / 10 + "s");
+           // Cost of the turn, in the shape a local runner prints it:
+           // "2048 tok - 100.4s - 20 tok/s". tok is what the model generated
+           // across every step, and the rate is against wall-clock, so on an
+           // agent turn it includes the time tools took -- which is the number
+           // you actually waited, not the decode speed of one step (that is in
+           // the usage rows under Performance).
+           var secs = (event.elapsed_ms || 0) / 1000;
+           var tok = event.completion_tokens || 0;
+           if (tok) bits.push(tok + " tok");
+           bits.push(secs.toFixed(1) + "s");
+           if (tok && secs > 0) {
+             var tps = tok / secs;
+             bits.push((tps >= 10 ? Math.round(tps) : tps.toFixed(1)) + " tok/s");
+           }
            if (event.truncated) bits.push("continued from summary");
            meta.textContent = bits.join(" \u00b7 ");
            stopActivity(trace);
@@ -896,6 +909,17 @@ UI_JS_CHAT = r"""
      }
    }
 
+   function reportLearning(learning) {
+     // Skill authoring happens in the background AFTER this response, so this
+     // reports only what is known synchronously: which procedures the answer
+     // used, and any that were retired for a bad track record.
+     if (!learning) return;
+     var used = learning.skills_used || [];
+     if (used.length) addSystem("Credited skill(s): " + used.join(", "));
+     var gone = learning.retired || [];
+     if (gone.length) addSystem("Retired skill(s) for a poor record: " + gone.join(", "));
+   }
+
    async function vote(userPrompt, assistantResponse, rating) {
      try {
        var out = await fetchJSON("/api/feedback", {
@@ -905,10 +929,13 @@ UI_JS_CHAT = r"""
            user_prompt: userPrompt,
            assistant_response: assistantResponse,
            rating: rating,
-           corrected_response: null
+           corrected_response: null,
+           // So the server can credit the skills this answer actually used.
+           conversation_id: conversationId
          })
        });
        addSystem(out.data.status || "Feedback saved.");
+       reportLearning(out.data.learning);
      } catch (err) {
        addSystem("Feedback error: " + err.message);
      }
@@ -925,10 +952,12 @@ UI_JS_CHAT = r"""
            user_prompt: userPrompt,
            assistant_response: assistantResponse,
            rating: 1,
-           corrected_response: corrected
+           corrected_response: corrected,
+           conversation_id: conversationId
          })
        });
        addSystem(out.data.status || "Correction saved.");
+       reportLearning(out.data.learning);
      } catch (err) {
        addSystem("Correction error: " + err.message);
      }
@@ -1054,6 +1083,26 @@ UI_JS_CHAT = r"""
        var retrain = (data.retrain && data.retrain.message) || "idle";
        if (retrain !== "idle") brief.push("retrain: " + retrain);
        else detail.push("Retrain idle");
+       // What the live adapter was actually trained on, and whether the run
+       // improved the held-out loss. Without this a bad adapter is invisible.
+       var recipe = document.getElementById("retrainRecipe");
+       if (recipe) {
+         var meta = data.adapter_meta;
+         if (meta && meta.trained_at) {
+           var c = meta.counts || {};
+           var line = "Live adapter: " + (c.feedback || 0) + " feedback, "
+                    + (c.tool || 0) + " tool, " + (c.replay || 0) + " rehearsal \u2014 "
+                    + ((meta.plan && meta.plan.iters) || "?") + " iterations, "
+                    + meta.trained_at.slice(0, 10) + ".";
+           if (meta.val_loss_baseline != null && meta.val_loss_final != null) {
+             line += " Held-out loss " + meta.val_loss_baseline.toFixed(3)
+                   + " \u2192 " + meta.val_loss_final.toFixed(3) + ".";
+           }
+           recipe.textContent = line;
+         } else {
+           recipe.textContent = "No trained adapter yet \u2014 the base model is live.";
+         }
+       }
        if (data.stats) {
          brief.push(data.stats.untrained + " untrained");
          detail.push("Feedback: " + data.stats.total + " total, "

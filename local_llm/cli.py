@@ -49,9 +49,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT)
     parser.add_argument("--model-port", type=int, default=int(os.environ.get("MODEL_PORT", "8080")))
     parser.add_argument("--web-port", type=int, default=int(os.environ.get("WEB_PORT", "8000")))
+    # 0 (the default) derives the iteration count from --train-epochs and the
+    # size of the exported corpus; a non-zero value pins it.
     parser.add_argument("--train-iters", type=int, default=None)
+    parser.add_argument("--train-epochs", type=float, default=None)
     parser.add_argument("--train-lr", default=None)
     parser.add_argument("--train-seq-len", default=None)
+    parser.add_argument("--train-batch-size", type=int, default=None)
+    parser.add_argument("--train-replay-ratio", type=float, default=None,
+                        help="Share of the final training set drawn from data/sft/replay.jsonl.")
+    parser.add_argument("--train-tool-ratio", type=float, default=None,
+                        help="Cap tool-call examples at this multiple of the approved feedback rows.")
+    parser.add_argument("--train-tool-quality", choices=["rated", "all"], default=None,
+                        help="'rated' keeps only traces from conversations a human approved.")
+    parser.add_argument("--train-val-check", dest="train_val_check", action="store_const", const=True, default=None,
+                        help="Roll back a run whose held-out loss ended worse (default).")
+    parser.add_argument("--no-train-val-check", dest="train_val_check", action="store_const", const=False,
+                        help="Promote the adapter without checking it against the held-out split.")
+    parser.add_argument("--train-timeout", type=float, default=None)
     parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("MAX_TOKENS", "512")))
     parser.add_argument("--auto-retrain-threshold", type=int, default=int(os.environ.get("AUTO_RETRAIN_THRESHOLD", "0")))
 
@@ -135,8 +150,15 @@ def build_config(args) -> Config:
         "model_port": args.model_port,
         "web_port": args.web_port,
         "train_iters": args.train_iters,
+        "train_epochs": args.train_epochs,
         "train_lr": args.train_lr,
         "train_seq_len": args.train_seq_len,
+        "train_batch_size": args.train_batch_size,
+        "train_replay_ratio": args.train_replay_ratio,
+        "train_tool_ratio": args.train_tool_ratio,
+        "train_tool_quality": args.train_tool_quality,
+        "train_val_check": args.train_val_check,
+        "train_timeout": args.train_timeout,
         "max_tokens": args.max_tokens,
         "auto_retrain_threshold": args.auto_retrain_threshold,
         "context_size": args.context_size,
@@ -261,6 +283,21 @@ def main() -> None:
     config.model_port = get_free_port(config.model_port)
     config.web_port = get_free_port(config.web_port, exclude={config.model_port})
 
+    # Restore settings saved from the UI before anything reports a value, so the
+    # banner and every downstream default reflect what the user actually set
+    # rather than the environment default they overrode. These deliberately win
+    # over environment variables; the log line makes that visible.
+    _restored = config.load_saved()
+    if _restored:
+        log(f"Restored {len(_restored)} saved setting(s) from "
+            f"{config.settings_path()}: " + ", ".join(
+                f"{name}={getattr(config, name)!r}" if not isinstance(
+                    getattr(config, name), str) or len(str(getattr(config, name))) < 40
+                else name
+                for name in sorted(_restored)))
+        log("These override the environment. Delete that file to go back to "
+            "the .env / default values.")
+
     # Announce the model and where the RAM-based default came from, so it is
     # obvious on a new machine why a particular model was chosen.
     if os.environ.get("MODEL_ID"):
@@ -276,6 +313,14 @@ def main() -> None:
         log(f"Context: {config.context_size} tokens "
             f"(auto-sized for {TOTAL_RAM_GB:.0f}GB RAM; large prompts chunk above "
             f"~{int(config.context_size * config.chunk_trigger_ratio)} tokens)")
+    # Prefill peak, not KV size, is what fails a Metal command buffer on a small
+    # machine, and a failed command buffer kills the model server's generation
+    # thread for good. Say what the caps are so a machine that starts stalling
+    # can be diagnosed from the boot log alone.
+    log(f"Backend memory caps: prefill {config.prefill_step_size} tokens/pass, "
+        f"prompt cache {config.prompt_cache_size} prefixes / "
+        f"{config.prompt_cache_bytes // 1024 ** 2}MB, "
+        f"{config.decode_concurrency} decode + {config.prompt_concurrency} prefill slots")
 
     db = Database(DB_PATH)
     registry = ToolRegistry(config, db)
@@ -333,6 +378,16 @@ def main() -> None:
         kv_bits=config.kv_bits, kv_group_size=config.kv_group_size,
         quantized_kv_start=config.quantized_kv_start,
         prompt_cache_dir=config.prompt_cache_dir,
+        prefill_step_size=config.prefill_step_size,
+        prompt_cache_size=config.prompt_cache_size,
+        prompt_cache_bytes=config.prompt_cache_bytes,
+        decode_concurrency=config.decode_concurrency,
+        prompt_concurrency=config.prompt_concurrency,
+        probe_interval=config.watchdog_probe_interval,
+        probe_timeout=config.watchdog_probe_timeout,
+        probe_failures=config.watchdog_probe_failures,
+        max_restarts=config.watchdog_max_restarts,
+        restart_window=config.watchdog_restart_window,
     )
     retrain_manager = RetrainManager(db, model_manager, config)
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from typing import Any, AsyncGenerator
@@ -185,6 +186,44 @@ class ModelClient:
             return "the model server ran out of memory"
         return f"a generation error ({name})"
 
+    def reply_budget(self, messages: list[dict], max_tokens: int | None = None,
+                     quiet: bool = False) -> int:
+        """The reply budget this prompt can actually afford.
+
+        prompt + max_tokens must fit n_ctx. Nothing enforced that: a 2759-token
+        prompt asking for 1536 reply tokens against a 4096-token window is a
+        4295-token request, and what the backend does with the overflow (shift,
+        truncate, refuse) is its business, not something the answer should
+        depend on. Clamp here, once, where the real message list is known.
+        """
+        wanted = max_tokens or self.config.max_tokens
+        room = self.config.context_size - messages_tokens(messages) - CONTEXT_SAFETY_MARGIN
+        if room >= wanted:
+            return wanted
+        clamped = max(self.config.min_max_tokens, room)
+        if not quiet:
+            log(f"reply budget clamped {wanted} -> {clamped}: prompt is "
+                f"{messages_tokens(messages)} tokens of a {self.config.context_size}-token "
+                "context. The prompt is the thing to shrink.", logging.WARNING)
+        return clamped
+
+    def request_timeout(self, messages: list[dict], max_tokens: int | None = None) -> float:
+        """Read timeout for a NON-streaming completion.
+
+        On a stream the read timeout is the gap between chunks, which is what
+        stall_timeout is written to mean. On a single POST there are no chunks,
+        so the very same number silently becomes a cap on total generation time:
+        a healthy server producing a 1536-token reply at ~16 tok/s needs ~96
+        seconds and was cut off at 60, then reported through classify_error as
+        "the model stalled (no output in time)" -- a false diagnosis that also
+        triggered the shrink-and-retry loop. Scale with the work requested
+        instead, against a pessimistic floor rate, keeping stall_timeout as the
+        allowance for prefill and queueing before the first token.
+        """
+        budget = self.reply_budget(messages, max_tokens)
+        derived = self.config.stall_timeout + (budget / self.config.decode_floor_tps)
+        return min(self.config.max_generation_timeout, derived)
+
     def payload(
         self,
         messages: list[dict],
@@ -197,7 +236,7 @@ class ModelClient:
             "messages": messages,
             "stream": stream,
             "temperature": self.config.temperature if temperature is None else temperature,
-            "max_tokens": max_tokens or self.config.max_tokens,
+            "max_tokens": self.reply_budget(messages, max_tokens),
         }
         # mlx_lm.server reads these from the request body; they are not OpenAI
         # parameters. They are OMITTED by default: on recent mlx-lm the
@@ -272,7 +311,8 @@ class ModelClient:
                 if self.cluster is not None and node is not None:
                     self.cluster.begin(node)
                 try:
-                    timeout = httpx.Timeout(self.config.stall_timeout, connect=15.0, pool=15.0)
+                    timeout = httpx.Timeout(
+                        self.request_timeout(messages, max_tokens), connect=15.0, pool=15.0)
                     client = self._client()
                     resp = await client.post(url, headers=headers, timeout=timeout,
                                              json=self.payload(messages, False, max_tokens, temperature))
@@ -369,6 +409,10 @@ class ModelClient:
                 if self.cluster is not None and node is not None:
                     self.cluster.begin(node)
                 try:
+                    # stall_timeout is correct HERE and only here: on a stream
+                    # the read timeout is the gap between chunks, so it detects
+                    # silence rather than capping total generation time. See
+                    # request_timeout for the non-streaming path.
                     timeout = httpx.Timeout(self.config.stall_timeout, connect=15.0, pool=15.0)
                     client = self._client()
                     async with client.stream(

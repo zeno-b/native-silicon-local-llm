@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -210,6 +212,77 @@ def adapter_fits(path: Path, model_id: str) -> bool:
     return recorded is None or recorded == model_id
 
 
+# Written beside the adapter at the end of a successful run: the recipe and the
+# measured losses that produced it. This is what makes a retrain auditable after
+# the fact ("why is the model worse since Tuesday?") and what lets the next run
+# notice that the system prompt it was conditioned on has since changed.
+ADAPTER_META_FILE = "training_meta.json"
+
+
+def adapter_meta(path: Path) -> dict:
+    """The recorded recipe/metrics for an adapter, or {} for one predating this."""
+    try:
+        data = json.loads((path / ADAPTER_META_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_adapter_meta(path: Path, meta: dict) -> None:
+    try:
+        (path / ADAPTER_META_FILE).write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except OSError as exc:
+        log(f"Could not record the adapter training metadata: {exc}", logging.WARNING)
+
+
+# mlx-lm writes a periodic checkpoint per --save-every as
+# 0000100_adapters.safetensors alongside the final adapters.safetensors. Nothing
+# deletes them, so without this both the live adapter directory and every
+# copytree backup of it grow by one checkpoint set per retrain, forever.
+_CHECKPOINT_RE = re.compile(r"^\d{7}_adapters\.safetensors$")
+
+
+def adapter_checkpoints(path: Path) -> list[tuple[int, Path]]:
+    """(iteration, file) for every mlx-lm periodic checkpoint in an adapter dir."""
+    if not path.exists():
+        return []
+    found = [(int(f.name.split("_", 1)[0]), f)
+             for f in path.iterdir() if _CHECKPOINT_RE.match(f.name)]
+    return sorted(found)
+
+
+def clear_adapter_checkpoints(path: Path) -> int:
+    """Drop the periodic checkpoints, keeping the promoted adapters.safetensors."""
+    removed = 0
+    for _, f in adapter_checkpoints(path):
+        try:
+            f.unlink()
+            removed += 1
+        except OSError as exc:
+            log(f"Could not remove stale checkpoint {f}: {exc}", logging.DEBUG)
+    return removed
+
+
+def prune_adapter_backups(keep: int) -> int:
+    """Keep the newest `keep` backups, delete the rest. keep <= 0 disables pruning."""
+    if keep <= 0 or not ADAPTER_BACKUP_DIR.exists():
+        return 0
+    # Names are UTC timestamps, so a plain reverse sort is newest-first.
+    backups = sorted((d.name for d in ADAPTER_BACKUP_DIR.iterdir() if d.is_dir()),
+                     reverse=True)
+    removed = 0
+    for name in backups[keep:]:
+        stale = ADAPTER_BACKUP_DIR / name
+        try:
+            shutil.rmtree(stale)
+            removed += 1
+            log(f"Pruned old adapter backup {name}")
+        except OSError as exc:
+            log(f"Could not prune adapter backup {stale}: {exc}", logging.WARNING)
+    return removed
+
+
 def list_adapters() -> list[dict]:
     """Every adapter that can be loaded: the live one plus every backup."""
     entries: list[dict] = []
@@ -333,13 +406,17 @@ def model_catalog(config: "Config") -> list[dict]:
 # helpers (leading underscore) must cross module boundaries too.
 __all__ = [
     'ADAPTER_BASE_FILE',
+    'ADAPTER_META_FILE',
     'DEFAULT_MODEL_CATALOG',
     'LOG_FILES',
     'StartupCancelled',
     'adapter_base',
+    'adapter_checkpoints',
     'adapter_fits',
+    'adapter_meta',
     'adapter_ready',
     'add_if_supported',
+    'clear_adapter_checkpoints',
     'get_free_port',
     'help_cmd',
     'hf_cache_dir',
@@ -347,10 +424,12 @@ __all__ = [
     'model_catalog',
     'model_is_cached',
     'port_open',
+    'prune_adapter_backups',
     'resolve_adapter',
     'resolve_adapter_quietly',
     'tail_log',
     'wait_for_model_ready',
     'wait_for_port',
     'write_adapter_base',
+    'write_adapter_meta',
 ]

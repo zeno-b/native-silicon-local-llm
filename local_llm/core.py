@@ -31,6 +31,10 @@ _MODULE_DIR = Path(__file__).resolve().parent
 ROOT = _MODULE_DIR.parent if (_MODULE_DIR / "__init__.py").exists() else _MODULE_DIR
 DATA_DIR = ROOT / "data"
 SFT_DIR = DATA_DIR / "sft"
+# Rehearsal ("replay") corpus, mixed into every fine-tune so the adapter keeps a
+# general-capability anchor instead of collapsing onto a few dozen feedback rows.
+# User-editable: anything valid in train.jsonl is valid here.
+REPLAY_FILE = SFT_DIR / "replay.jsonl"
 EXPORTS_DIR = DATA_DIR / "exports"
 LOG_DIR = ROOT / "logs"
 ADAPTER_DIR = ROOT / "adapters" / "latest"
@@ -126,6 +130,42 @@ def _default_fetch_cap(ram_gb: float) -> int:
     if ram_gb >= 14:
         return 10000
     return 6000
+
+
+def _default_prefill_step(ram_gb: float) -> int:
+    """Tokens the model server prefills per forward pass.
+
+    mlx-lm defaults to 2048, which makes any prompt shorter than that a SINGLE
+    forward pass. On 8GB the activations for a ~1200-token pass, on top of the
+    weights and the resident prompt caches, are enough to fail the Metal command
+    buffer with kIOGPUCommandBufferCallbackErrorOutOfMemory -- which kills the
+    server's generation thread for the rest of that process's life, not just the
+    one request. Smaller passes trade a little prefill throughput for a much
+    lower peak. Override with PREFILL_STEP_SIZE.
+    """
+    if ram_gb >= 48:
+        return 2048
+    if ram_gb >= 24:
+        return 1024
+    return 512
+
+
+def _default_prompt_cache_bytes(ram_gb: float) -> int:
+    """Ceiling on the KV bytes the model server's prompt cache may hold.
+
+    A turn sends a router prompt, a triage prompt and an answer prompt, each a
+    different prefix, so an uncapped radix cache accumulates a resident KV
+    sequence per lane per turn in the same unified memory as the weights. The
+    cap is what stops a long session from squeezing prefill out of memory.
+    Override with PROMPT_CACHE_BYTES.
+    """
+    if ram_gb >= 48:
+        return 4 * 1024 ** 3
+    if ram_gb >= 24:
+        return 2 * 1024 ** 3
+    if ram_gb >= 14:
+        return 1024 ** 3
+    return 512 * 1024 ** 2
 
 
 def _default_concurrent_generations(ram_gb: float) -> int:
@@ -474,7 +514,9 @@ TOOL_PROTOCOL = textwrap.dedent("""\
     - You will then receive a message beginning with TOOL RESULT. Read it before
       deciding what to do next.
     - When you have enough information, either reply in plain text with no JSON,
-      or call final_answer with your complete answer.
+      or call final_answer with your complete answer. In a plain-text reply the
+      text IS the answer: never add a "Final answer:" label or a
+      <final_answer> tag around it.
     - Never invent tool output, and never say you searched, read or ran anything
       unless a TOOL RESULT above shows it.
     - If a tool returns an error, fix the arguments and try once more, or answer
@@ -490,7 +532,12 @@ TOOL_PROTOCOL = textwrap.dedent("""\
 # server-side prompt cache keys on. When it changes, every cached prefix on the
 # machine becomes worthless. That is invisible otherwise: you edit the system
 # prompt in the UI, latency doubles, and nothing says why.
-PREFIX_STATE: dict[str, Any] = {"hash": None, "changed_at": None, "generation": 0}
+# Two lanes now share this machine's prompt cache: the tool-calling prompt and
+# the prose-only prompt used on a turn routing has already decided needs no
+# tool. Each has its own stable prefix, so each is tracked separately under
+# "lanes"; the top-level keys mirror the tool lane for existing consumers.
+PREFIX_STATE: dict[str, Any] = {"hash": None, "changed_at": None, "generation": 0,
+                                "lanes": {}}
 
 
 
@@ -512,6 +559,7 @@ __all__ = [
     'DEFAULT_MODEL',
     'DEFAULT_SYSTEM_PROMPT',
     'EXPORTS_DIR',
+    'REPLAY_FILE',
     'LOG_DIR',
     'PREFIX_STATE',
     'REQUIRED_MODULES',
@@ -528,6 +576,8 @@ __all__ = [
     '_default_context_for_ram',
     '_default_fetch_cap',
     '_default_concurrent_generations',
+    '_default_prefill_step',
+    '_default_prompt_cache_bytes',
     'GenerationBusy',
     'GenerationGate',
     '_default_model_for_ram',

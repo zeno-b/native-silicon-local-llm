@@ -61,7 +61,14 @@ CODE_OBJECT = re.compile(
     r"\b(script|scripts|function|functions|program|programme|code|class|classes|"
     r"method|methods|module|snippet|regex|regexp|cli|parser|app|application|"
     r"component|query|loop|algorithm|algorithms|unit ?tests?|test|tests|api|"
-    r"endpoint|schema|decorator|generator|command|one[- ]?liner)\b",
+    r"endpoint|schema|decorator|generator|command|one[- ]?liner|"
+    # Systems-programming objects. "write a mouse driver ... in c" matched no
+    # object and no language, so it was not treated as code: it got the 512-token
+    # chat budget and was cut off mid-function. Deliberately excludes ambiguous
+    # business words (service, interface, library) whose false positives would
+    # skip the router on a genuine lookup question.
+    r"driver|drivers|daemon|makefile|header|headers|struct|shader|firmware|"
+    r"binding|bindings|wrapper|middleware|dockerfile|kernel module)\b",
     re.I,
 )
 # Programming languages and runtimes worth treating as a code signal on their own
@@ -73,6 +80,13 @@ CODE_LANGUAGE = re.compile(
     r"powershell|ps1|julia|haskell|elixir|clojure|solidity)\b",
     re.I,
 )
+# C, which cannot go in CODE_LANGUAGE as a bare \bc\b without matching "vitamin
+# c" and every stray initial. These are the phrasings that unambiguously mean
+# the language.
+CODE_C_LANGUAGE = re.compile(
+    r"(?i)\b(?:in|using|with|of)\s+c\b(?!\+|#|\w)|\bansi\s+c\b|\bpure\s+c\b|"
+    r"\bc\s*(?:89|90|99|11|17|23)\b|"
+    r"\bc\s+(?:program|programme|code|source|function|header|library|driver|app)\b")
 
 
 # A code request that plausibly depends on external or current information, so
@@ -148,6 +162,27 @@ def classify_implicit_feedback(message: str) -> int | None:
     if short and _NEG_LEAD.match(m):
         return -1
     return None
+
+
+def rejection_retry_message(prompt: str, answer: str, complaint: str) -> str:
+    """What to send the model after the user rejects an answer.
+
+    A rejection is about the PREVIOUS request, so the request is re-asked with
+    the complaint attached. Answering the complaint as a fresh question is how
+    "no c++ just an empty json?" produced a second empty JSON object: the model
+    was asked about the remark, not about the C++ program, while the rejected
+    answer sat in the history as the only worked example in sight. Naming it as
+    rejected is the point.
+    """
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return (complaint or "").strip()
+    rejected = " ".join((answer or "").split())[:300] or "(empty)"
+    return (f"{prompt}\n\n[Your previous answer to this was REJECTED by the user, who "
+            f"said: \"{(complaint or '').strip()}\". The rejected answer was: {rejected}\n"
+            "Answer the original request again, in full, in plain text, fixing what "
+            "they complained about. Do not repeat the rejected answer, and do not "
+            "reply with JSON.]")
 
 
 def build_reusable_dataset(rows: list[dict], fmt: str, system_prompt: str = "") -> tuple[str, int]:
@@ -327,6 +362,128 @@ def is_reasoning_question(message: str) -> bool:
     return len(text) >= 80 or clauses >= 2
 
 
+# Protocol scaffolding a model wraps its answer in, which must never reach the
+# user. Two shapes, both measured on this hardware rather than guessed at:
+#
+#   <final_answer>...</final_answer>     an XML tag invented by symmetry with the
+#                                        <think>...</think> tags the reasoning
+#                                        instruction asks for
+#   **Answer**: ...  /  Final answer: ...  a label, sometimes dressed as markdown
+#
+# Both come from the same place: an instruction that describes XML tags and then
+# says "give your final answer". The prompt no longer phrases it that way, but a
+# 3B model treats prompt wording as a suggestion, so the output is cleaned too.
+_ANSWER_TAG = re.compile(
+    r"(?is)\A\s*<\s*(final[_ ]?answer|answer|response|output)\s*>\s*(.*?)"
+    r"(?:\s*<\s*/\s*\1\s*>\s*)?\Z")
+# A label at the very START of the reply only. A mid-text "Answer:" is somebody
+# formatting their prose, and rewriting that would be worse than the leak.
+#
+# Two forms, because the model produces both: an inline label ending in a colon,
+# and a markdown heading on its own line. The heading form requires the word
+# "final", since a bare "## Answer" section heading is plausibly the user's own
+# structure whereas "## Final Answer" is the protocol talking.
+_ANSWER_LABEL = re.compile(
+    r"(?i)\A\s*(?:#{1,6}\s*)?(?:\*\*|__)?\s*final[_ ]?answer\s*(?:\*\*|__)?\s*[:\-]\s*"
+    r"|\A\s*(?:#{1,6}\s*)?(?:\*\*|__)\s*answer\s*(?:\*\*|__)\s*[:\-]\s*")
+_ANSWER_HEADING = re.compile(
+    r"(?i)\A\s*(?:#{1,6}\s*|\*\*|__)\s*final[_ ]?answer\s*(?:\*\*|__)?\s*:?[ \t]*\r?\n+")
+
+
+def unwrap_answer(text: str) -> str:
+    """Strip protocol scaffolding a model wrapped its answer in.
+
+    Applied where an answer becomes the reply, not where it is generated, so
+    every lane is covered by one rule: the tool loop, the prose lane, the
+    continuation, a subagent's result and the plain non-agent chat all end up
+    here.
+
+    Conservative by design. Tags are removed only when one WRAPS the whole
+    reply, and a label only at the very start, because "<final_answer>" inside
+    an answer about XML, or an "Answer:" halfway down a formatted reply, are the
+    user's content rather than protocol noise.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return cleaned
+    for _ in range(3):        # a tag inside a label, or the reverse
+        before = cleaned
+        match = _ANSWER_TAG.match(cleaned)
+        if match:
+            cleaned = match.group(2).strip()
+        cleaned = _ANSWER_HEADING.sub("", cleaned, count=1)
+        cleaned = _ANSWER_LABEL.sub("", cleaned, count=1).strip()
+        # A JSON object whose only content is the answer. parse_tool_call
+        # ignores it (no tool name) so it used to be shown to the user raw.
+        if cleaned.startswith("{") and cleaned.endswith("}"):
+            try:
+                parsed = json.loads(cleaned)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                keys = {str(k).lower() for k in parsed}
+                if keys and keys <= {"answer", "final_answer", "response", "text"}:
+                    values = [str(v) for v in parsed.values() if isinstance(v, str)]
+                    if values:
+                        cleaned = "\n".join(values).strip()
+        # A dangling close tag left by a wrapper whose open tag was in the
+        # reasoning block, or by truncation.
+        cleaned = re.sub(
+            r"(?is)\s*<\s*/\s*(final[_ ]?answer|answer|response|output)\s*>\s*\Z",
+            "", cleaned).strip()
+        if cleaned == before:
+            break
+    return cleaned or (text or "").strip()
+
+
+# The visible marker appended to a reply that hit the token budget. It is the
+# ONLY durable record that an answer was cut off: the conversation stores the
+# text, not the finish_reason, so a "continue" arriving in a later request has
+# nothing else to go on. Generation and detection therefore share one definition,
+# and the pattern is loose about the punctuation so notes written by an older
+# build still match.
+TRUNCATION_NOTE = re.compile(r"\n*\[cut off at the \d+-token reply limit[^\]]*\]\s*$")
+
+
+def truncation_note(limit: int) -> str:
+    """The marker note_if_cut appends. Keep in sync with TRUNCATION_NOTE."""
+    return (f"\n\n[cut off at the {limit}-token reply limit \u2014 raise "
+            "\"Max tokens\" in Settings, or ask me to continue]")
+
+
+def was_truncated(text: str) -> bool:
+    """True if this stored assistant message ends in the truncation marker."""
+    return bool(TRUNCATION_NOTE.search(text or ""))
+
+
+def strip_truncation_note(text: str) -> str:
+    """Drop the marker.
+
+    Called on the way INTO every prompt as well as on the continuation path: the
+    marker is UI copy addressed to the user ("raise Max tokens in Settings"), and
+    feeding it back as conversation invites the model to imitate it.
+    """
+    return TRUNCATION_NOTE.sub("", text or "").rstrip()
+
+
+# A short "carry on" follow-up. Loose about wording, strict about length: the
+# caller requires that the previous answer was ACTUALLY truncated as well, so
+# both signals must agree before a turn is treated as a continuation and a long
+# instruction that merely opens with "continue" is never hijacked.
+CONTINUE_REQUEST = re.compile(
+    r"(?i)^\s*(?:please\s+|ok(?:ay)?[,\s]+|yes[,\s]+|and\s+)?"
+    r"(?:continue|carry\s+on|keep\s+going|go\s+on|go\s+ahead|resume|"
+    r"finish\s+(?:it|that|this|up)?|the\s+rest|rest\s+of\s+it|more)\b")
+
+
+def is_continue_request(message: str) -> bool:
+    """True for a short "continue" style follow-up. Pair with was_truncated."""
+    text = (message or "").strip()
+    if not text or len(text) > 80:
+        return False
+    return bool(CONTINUE_REQUEST.match(text))
+
+
 def is_code_request(message: str) -> bool:
     """True if the message asks to write, fix, or modify code.
 
@@ -340,7 +497,7 @@ def is_code_request(message: str) -> bool:
         return True
     has_verb = bool(CODE_INTENT.search(text))
     has_object = bool(CODE_OBJECT.search(text))
-    has_language = bool(CODE_LANGUAGE.search(text))
+    has_language = bool(CODE_LANGUAGE.search(text) or CODE_C_LANGUAGE.search(text))
     # A code verb plus an object or a language ("write a python script"), or a
     # language and an object together even without an imperative verb ("python
     # script to pull CVEs"), both count as a code request.
@@ -453,6 +610,51 @@ def _parse_search_results(search_text: str) -> list[tuple[str, str, str]]:
 def _query_tokens(query: str) -> set[str]:
     toks = re.findall(r"[a-z0-9]+", (query or "").lower())
     return {t for t in toks if len(t) >= 3 and t not in _STOPWORDS}
+
+
+# Words that carry intent but no topic. They are fine for reranking search
+# results (every candidate there already matches the query), but as a
+# knowledge-base overlap signal they are noise: "write a basic c++ crud program"
+# shares "write" and "program" with almost any indexed document, which is how an
+# unrelated 4KB reference block got prepended to a request to write C++.
+# Retrieval must fire on subject words or not at all.
+_RAG_GENERIC = frozenset(
+    "write writing wrote create creating creation make making made build "
+    "building built generate generating generation implement implementing "
+    "code coding program programme script snippet function example examples "
+    "basic simple quick small full complete short long new please help show "
+    "give tell explain need want like about thing things stuff way ways "
+    "some any all more most best good nice fix fixing add adding use using "
+    "work works working try trying get getting got let lets".split())
+
+
+def rag_query_tokens(query: str) -> set[str]:
+    """Subject tokens of a query, for deciding whether retrieval has anything to
+    contribute. Intent verbs and filler are dropped; see _RAG_GENERIC."""
+    return {t for t in _query_tokens(query) if t not in _RAG_GENERIC}
+
+
+# The user pointing at their own material: their project, a repo, a path, a
+# filename. A code request WITHOUT any of these ("write a basic c++ crud
+# program") wants code from the model's own knowledge, and pulling indexed
+# documents into it only spends context and derails the answer.
+_PROJECT_REFERENCE = re.compile(
+    r"(\bthis (?:project|repo|repository|codebase|file|function|class|module|"
+    r"script|code|bug|error|test|package)\b"
+    r"|\b(?:my|our) (?:project|repo|repository|codebase|code ?base|code|file|"
+    r"files|script|scripts|module|function|class|tests?)\b"
+    r"|\b(?:in|from|of|open|read|edit|patch|review) (?:the )?(?:file|files|repo|"
+    r"repository|codebase|project)\b"
+    r"|\b[\w-]+\.(?:py|js|ts|tsx|jsx|rs|go|c|h|cc|cpp|hpp|cs|java|rb|php|swift|"
+    r"kt|sh|zsh|sql|html|css|json|toml|yaml|yml|md|txt|ipynb)\b"
+    r"|[~.]?/[\w.-]+/[\w.-]+)",
+    re.I,
+)
+
+
+def refers_to_project(message: str) -> bool:
+    """True if the message points at the user's own files, repo or project."""
+    return bool(_PROJECT_REFERENCE.search(message or ""))
 
 
 def rank_result_urls(search_text: str, query: str, limit: int) -> list[str]:
@@ -664,8 +866,16 @@ def fast_path_call(message: str, prev_user: str | None = None) -> tuple[str, dic
 # Re-exported explicitly: the original file was one flat namespace, so private
 # helpers (leading underscore) must cross module boundaries too.
 __all__ = [
+    'CODE_C_LANGUAGE',
     'CODE_INTENT',
     'CODE_LANGUAGE',
+    'CONTINUE_REQUEST',
+    'TRUNCATION_NOTE',
+    'is_continue_request',
+    'unwrap_answer',
+    'truncation_note',
+    'was_truncated',
+    'strip_truncation_note',
     'CODE_NEEDS_LOOKUP',
     'CODE_OBJECT',
     'REASONING_SIGNAL',
@@ -693,6 +903,7 @@ __all__ = [
     'build_reusable_dataset',
     'chunk_text',
     'classify_implicit_feedback',
+    'rejection_retry_message',
     'code_search_topic',
     'extractable_text_len',
     'fast_path_call',
@@ -709,5 +920,9 @@ __all__ = [
     'rank_result_urls',
     '_parse_search_results',
     '_query_tokens',
+    'rag_query_tokens',
+    '_RAG_GENERIC',
+    'refers_to_project',
+    '_PROJECT_REFERENCE',
     '_RESULT_HEAD',
 ]
