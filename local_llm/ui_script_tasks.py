@@ -387,7 +387,9 @@ UI_JS_TASKS = r"""   // --------------------------------------------------------
        if (event.type === "start") {
          feedLine("started by " + event.trigger + " on " + event.model);
        } else if (event.type === "context") {
-         feedLine("trimmed " + event.dropped + " old messages to fit the context");
+         feedLine((typeof event.kept === "number" && typeof event.total === "number")
+           ? ("context window full: kept " + event.kept + " of " + event.total + " earlier messages")
+           : ("trimmed " + event.dropped + " old messages to fit the context"));
        } else if (event.type === "step") {
          partial = null;
          feedLine("step " + event.step + " of " + event.max_steps);

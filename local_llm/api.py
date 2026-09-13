@@ -1460,6 +1460,35 @@ def create_app(
         rows = db.get_messages(conversation_id, limit=config.history_turns * 2, user_id=user_id)
         return conversation_id, [{"role": r["role"], "content": r["content"]} for r in rows]
 
+    def has_active_task(conversation_id: str, user_id: str) -> bool:
+        """True when this conversation has code under construction.
+
+        Cheap and best-effort: a failure here must never fail a chat turn, and
+        the worst outcome of a False is the behaviour that already shipped.
+        """
+        if not config.task_state_enabled or not conversation_id:
+            return False
+        try:
+            stored = db.load_task_state(conversation_id, user_id)
+        except Exception as exc:
+            log(f"task-state probe failed: {exc}", logging.DEBUG)
+            return False
+        return bool(stored and stored.get("task_type")
+                    and (stored.get("artifact") or stored.get("objective")))
+
+    def plain_lane_answer(text: str, stats, limit: int) -> str:
+        """Clean a plain-lane reply and mark it when it hit the token budget.
+
+        The agent lane appends this marker and the continuation lane keys off
+        it; the plain lane did neither, so an answer cut off here had no marker,
+        was_truncated said False, and "continue" was answered as a brand-new
+        question with the half-written file nowhere in sight.
+        """
+        answer = clean_reply(text)
+        if answer and getattr(stats, "finish_reason", "") == "length":
+            answer += truncation_note(limit, limit, config.context_size)
+        return answer
+
     def clean_reply(text: str) -> str:
         """What the user should actually see, on the lanes with no agent loop.
 
@@ -1576,8 +1605,19 @@ def create_app(
             use_agent = True
         elif not use_agent and config.knowledge_triage and is_substantive(request.message):
             use_agent = True
-        elif not use_agent and config.project_dir and is_code_request(request.message):
-            use_agent = True  # codebase edits need the tool loop
+        elif not use_agent and is_code_request(request.message):
+            # Code needs the agent lane whether or not a project is attached.
+            # The plain lane below has no task state, no artifact, no code reply
+            # budget, no truncation marker and no code check: it is the pipeline
+            # as it was before any of that existed, and a code request answered
+            # there is cut off mid-function with nothing to continue from.
+            use_agent = True
+        elif not use_agent and has_active_task(conversation_id, uid):
+            # Mid-task, every message belongs to the agent lane even when it
+            # looks like chit-chat: "add more checks" carries no language and no
+            # code object, and the whole point of the task state is that it does
+            # not have to.
+            use_agent = True
         elif not use_agent and is_continue_request(request.message):
             # The continuation lane lives in the agent. A short "go on" is not
             # substantive by the test above, so without this it went down the
@@ -1619,6 +1659,14 @@ def create_app(
                     if event["type"] == "final":
                         answer = event["answer"]
                         trace = event.get("trace", [])
+                        # The final event carries the turn's totals. Dropping
+                        # them left this endpoint reporting "usage": null for
+                        # every agent turn while the streaming one reported it.
+                        stats = GenerationStats(
+                            prompt_tokens=event.get("prompt_tokens", 0),
+                            completion_tokens=event.get("completion_tokens", 0),
+                            total_ms=float(event.get("elapsed_ms", 0.0)),
+                        )
                     elif event["type"] == "usage":
                         db.log_metric(
                             "agent_step", event["total_ms"], 200,
@@ -1646,7 +1694,7 @@ def create_app(
                 answer, stats = await model_client.complete_with_stats(
                     messages, max_tokens, temperature, conversation_id=conversation_id
                 )
-                answer = clean_reply(answer)
+                answer = plain_lane_answer(answer, stats, max_tokens)
                 trace = []
 
             db.add_message(
@@ -1700,8 +1748,19 @@ def create_app(
             use_agent = True
         elif not use_agent and config.knowledge_triage and is_substantive(request.message):
             use_agent = True
-        elif not use_agent and config.project_dir and is_code_request(request.message):
-            use_agent = True  # codebase edits need the tool loop
+        elif not use_agent and is_code_request(request.message):
+            # Code needs the agent lane whether or not a project is attached.
+            # The plain lane below has no task state, no artifact, no code reply
+            # budget, no truncation marker and no code check: it is the pipeline
+            # as it was before any of that existed, and a code request answered
+            # there is cut off mid-function with nothing to continue from.
+            use_agent = True
+        elif not use_agent and has_active_task(conversation_id, uid):
+            # Mid-task, every message belongs to the agent lane even when it
+            # looks like chit-chat: "add more checks" carries no language and no
+            # code object, and the whole point of the task state is that it does
+            # not have to.
+            use_agent = True
         elif not use_agent and is_continue_request(request.message):
             # The continuation lane lives in the agent. A short "go on" is not
             # substantive by the test above, so without this it went down the
@@ -1798,7 +1857,8 @@ def create_app(
                     # it happens; the final event carries the cleaned text, and
                     # the UI replaces the streamed body with it. Same contract
                     # as the agent lane.
-                    answer = clean_reply("".join(answer_parts))
+                    answer = plain_lane_answer("".join(answer_parts), plain_stats,
+                                               max_tokens)
                     yield await sse({"type": "usage", "step": 1, **plain_stats.as_event()})
                     await asyncio.to_thread(
                         db.log_metric,

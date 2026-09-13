@@ -24,6 +24,7 @@ without scrolling a single enormous file:
     llm             prompt assembly and tool-call parsing
     model_client    HTTP client for the model server
     textutil        classifiers, chunking, routing heuristics
+    codecheck       structural and real-parser checks on generated code
     agent           the agent loop
     tasks           scheduled runs
     api             the FastAPI app

@@ -16,7 +16,7 @@ import ast
 from pathlib import Path
 
 ORDER = [
-    "core", "obslog", "database", "sysutil",
+    "core", "obslog", "codecheck", "database", "sysutil",
     # UI parts must precede ui.py, which assembles HTML_PAGE from them.
     "ui_styles", "ui_markup", "ui_script_chat", "ui_script_views",
     "ui_script_tasks", "ui_script_models", "ui_script_auth", "ui_script_panels",

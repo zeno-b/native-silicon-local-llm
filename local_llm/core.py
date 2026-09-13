@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import platform
+import re
 import subprocess
 import sys
 import textwrap
@@ -500,6 +501,43 @@ def trim_to_context(
     return [system, *pinned, *kept, user], dropped
 
 
+# --------------------------------------------------------------------------- #
+# Query tokenisation. Lives here rather than in textutil because skills.py needs
+# it too and cannot import textutil: textutil -> tools -> skills already.
+# --------------------------------------------------------------------------- #
+
+_STOPWORDS = frozenset(
+    "the a an of to for and or in on at is are be with how what why when who "
+    "which that this from into your you my our their his her its as by".split())
+
+
+def _query_tokens(query: str) -> set[str]:
+    toks = re.findall(r"[a-z0-9]+", (query or "").lower())
+    return {t for t in toks if len(t) >= 3 and t not in _STOPWORDS}
+
+
+# Words that carry intent but no topic. They are fine for reranking search
+# results (every candidate there already matches the query), but as a
+# knowledge-base overlap signal they are noise: "write a basic c++ crud program"
+# shares "write" and "program" with almost any indexed document, which is how an
+# unrelated 4KB reference block got prepended to a request to write C++.
+# Retrieval must fire on subject words or not at all.
+_RAG_GENERIC = frozenset(
+    "write writing wrote create creating creation make making made build "
+    "building built generate generating generation implement implementing "
+    "code coding program programme script snippet function example examples "
+    "basic simple quick small full complete short long new please help show "
+    "give tell explain need want like about thing things stuff way ways "
+    "some any all more most best good nice fix fixing add adding use using "
+    "work works working try trying get getting got let lets".split())
+
+
+def rag_query_tokens(query: str) -> set[str]:
+    """Subject tokens of a query, for deciding whether retrieval has anything to
+    contribute. Intent verbs and filler are dropped; see _RAG_GENERIC."""
+    return {t for t in _query_tokens(query) if t not in _RAG_GENERIC}
+
+
 def timezone_utc():
     return timezone.utc
 
@@ -594,5 +632,9 @@ __all__ = [
     'run_cmd',
     'timezone_utc',
     'trim_to_context',
+    '_STOPWORDS',
+    '_RAG_GENERIC',
+    '_query_tokens',
+    'rag_query_tokens',
     'utc_now',
 ]

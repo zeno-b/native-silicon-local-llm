@@ -28,6 +28,7 @@ from typing import Any
 
 from .core import *  # noqa: F401,F403
 from .textutil import *  # noqa: F401,F403
+from .codecheck import definitions, looks_damaged
 
 
 # --------------------------------------------------------------------------- #
@@ -46,6 +47,10 @@ _LANG_ALIASES = {
     "node.js": "javascript", "nodejs": "javascript",
     "typescript": "typescript", "ts": "typescript",
     "rust": "rust", "golang": "go",
+    # Bare "c" is safe HERE because canonical_language only ever sees a code
+    # fence's info string, never prose. detect_language keeps refusing it in
+    # free text, where "c" is an initial far more often than a language.
+    "c": "c", "objective-c": "c", "objc": "c",
     "c++": "c++", "cpp": "c++", "cxx": "c++",
     "c#": "c#", "csharp": "c#",
     "java": "java", "ruby": "ruby", "php": "php", "perl": "perl",
@@ -135,10 +140,38 @@ def canonical_language(name: str | None) -> str:
     return _LANG_ALIASES.get(text, "")
 
 
-def detect_language(text: str) -> str:
-    """The language a message is about, or "" when it names none."""
+# The single-letter languages, which _LANG_IN_TEXT deliberately refuses: a bare
+# "c" or "go" in prose is a word far more often than a language. After an
+# explicit preposition, in a message that is already about code, it is not
+# ambiguous -- and "port it to c" being unreadable is what pinned a whole
+# session to PowerShell while the user kept asking for C.
+_BARE_LANG_AFTER_PREP = re.compile(
+    r"(?i)\b(?:in|into|to|using|as|toward[s]?)\s+(c|go|r)\b(?![\w+#])")
+
+_BARE_LANG_CANON = {"c": "c", "go": "go", "r": "r"}
+
+
+def detect_language(text: str, allow_bare: bool = False) -> str:
+    """The language a message is about, or "" when it names none.
+
+    `allow_bare` opens the single-letter languages ("port it to c"). It is off
+    by default because detect_language runs on every message, including ones
+    that have nothing to do with code, and "I need to go" must not retarget a
+    task to Golang. Callers that already know the message is a port or a
+    correction turn it on.
+    """
     match = _LANG_IN_TEXT.search(text or "")
-    return _LANG_ALIASES.get(match.group(1).lower().replace("  ", " "), "") if match else ""
+    if match:
+        return _LANG_ALIASES.get(match.group(1).lower().replace("  ", " "), "")
+    # CODE_C_LANGUAGE is already tuned to the phrasings that unambiguously mean
+    # the C language ("in c", "ansi c", "a c program"), so it needs no opt-in.
+    if CODE_C_LANGUAGE.search(text or ""):
+        return "c"
+    if allow_bare:
+        bare = _BARE_LANG_AFTER_PREP.search(text or "")
+        if bare:
+            return _BARE_LANG_CANON.get(bare.group(1).lower(), "")
+    return ""
 
 
 def detect_platform(text: str) -> str:
@@ -162,8 +195,13 @@ def extract_code_blocks(text: str) -> list[tuple[str, str]]:
 # Signature evidence per language. Deliberately narrow: this decides whether an
 # answer contradicts the active task, so a guess is worse than a shrug.
 _SIGNATURES: list[tuple[str, re.Pattern]] = [
+    # Shell-specific variable forms only. A bare `$name` is shared with
+    # PowerShell, and counting it here is what let a PowerShell module score as
+    # much shell evidence as it did PowerShell evidence and come back
+    # unidentified -- which in turn let a real drift through unnoticed.
     ("bash", re.compile(r"^#!.*\b(bash|sh|zsh)\b|^\s*(?:fi|esac|done)\s*$|"
-                        r"\[\[\s|\$\{?[A-Za-z_#@?]|^\s*local\s+\w+=|"
+                        r"\[\[\s|\$\{\w|\$[(@*?#]|\$\d|"
+                        r"^\s*local\s+\w+=|"
                         r"^\s*(?:function\s+)?\w+\s*\(\)\s*\{", re.M)),
     ("python", re.compile(r"^#!.*\bpython|^\s*(?:from\s+[\w.]+\s+)?import\s+[\w.]|"
                           r"^\s*def\s+\w+\s*\(.*\)\s*(?:->[^:]+)?:|^\s*class\s+\w+"
@@ -176,10 +214,36 @@ _SIGNATURES: list[tuple[str, re.Pattern]] = [
     ("html", re.compile(r"<!DOCTYPE\s+html|<html[\s>]|<div[\s>]|<body[\s>]", re.I)),
     ("go", re.compile(r"^\s*package\s+\w+|^\s*func\s+\w+\s*\(|\bfmt\.Print", re.M)),
     ("rust", re.compile(r"^\s*fn\s+\w+\s*\(|\blet\s+mut\s+|println!\(", re.M)),
-    ("c++", re.compile(r"#include\s*<\w+>|\bstd::\w+|\bint\s+main\s*\(", re.M)),
+    # C and C++ share a family (same_language), so telling them apart never
+    # changes a drift verdict -- but it decides the file extension and what the
+    # notice says, and calling a plain C program "c++" is how a drift message
+    # came to name a language the user had never mentioned.
+    ("c++", re.compile(r"\bstd::\w+|#include\s*<(?:iostream|vector|string|map|"
+                       r"memory|algorithm)>|\bnullptr\b|\btemplate\s*<|"
+                       r"\bnamespace\s+\w+|\bpublic:|\bcout\s*<<", re.M)),
+    ("c", re.compile(r"#include\s*<(?:stdio|stdlib|string|unistd|errno|"
+                     r"sys/\w+)\.h>|\bprintf\s*\(|\bmalloc\s*\(|"
+                     r"\btypedef\s+struct\b|\bsize_t\b", re.M)),
     ("java", re.compile(r"\bpublic\s+(?:static\s+)?(?:class|void)\b|\bSystem\.out\.", re.M)),
-    ("powershell", re.compile(r"^\s*(?:Get|Set|New|Remove)-\w+|\$PSVersionTable", re.M)),
+    # Verb-Noun cmdlets are the most distinctive thing about PowerShell and they
+    # appear mid-line far more often than at the start of one, which is why
+    # anchoring to the line start left a module scoring no higher than the
+    # generic `$var` shell signature and coming back unidentified.
+    ("powershell", re.compile(r"\b(?:Get|Set|New|Remove|Start|Stop|Write|Test|"
+                              r"Invoke|Import|Export|Select|Where|ForEach|Add|"
+                              r"Clear|Restart|ConvertTo|ConvertFrom)-[A-Z]\w+|"
+                              r"\$PSVersionTable|\$PSItem|\bparam\s*\(\s*\[|"
+                              r"-ErrorAction\b|\[string\]\s*\$|"
+                              r"^\s*function\s+\w+-\w+", re.M)),
+    ("json", re.compile(r'^\s*[\[{]\s*$|^\s*"[\w-]+"\s*:\s*(?:"|\d|\[|\{|true|'
+                        r'false|null)', re.M)),
 ]
+
+# How much clearer the winner has to be than the runner-up. A classifier whose
+# verdict gates a corrective regeneration has to shrug more readily than it
+# guesses: it called a C program "c++" and a C program "json" in one session,
+# and each wrong verdict cost a full regeneration and a question to the user.
+SIGNATURE_MARGIN = 2
 
 
 def code_language(code: str) -> str:
@@ -201,8 +265,20 @@ def code_language(code: str) -> str:
         return ""
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     best, count = ranked[0]
-    if len(ranked) > 1 and ranked[1][1] >= count:
-        return ""                      # tied: no honest verdict
+    if len(ranked) > 1:
+        runner = ranked[1][1]
+        # Not just "ahead": clearly ahead. One stray `int main(` in a shell
+        # script should not outvote four lines of shell. Either twice the
+        # evidence or two clear hits more, so the rule does not become brittle
+        # once both languages have several signals.
+        if count < runner * SIGNATURE_MARGIN and count - runner < SIGNATURE_MARGIN:
+            # Two members of the same family both scoring is agreement, not a
+            # tie: `#include <stdio.h>` and `std::string` in one file is still
+            # a C-family file, and the stronger reading wins.
+            if not same_language(best, ranked[1][0]):
+                return ""
+        if count < 2 and runner >= 1:
+            return ""                  # a single hit each way decides nothing
     return best
 
 
@@ -218,10 +294,27 @@ _FILENAME = re.compile(r"\b([A-Za-z0-9][\w.-]{0,60}\.(?:sh|bash|zsh|py|js|ts|rs|
                        r"dart|lua|ps1|yaml|yml|json|tf|mk))\b")
 
 
+# Lines that name someone ELSE's file. Reading one as the artifact's own name is
+# how a C program came to be called "stdio.h" for the rest of a session.
+_IMPORT_LINE = re.compile(
+    r"(?im)^\s*(?:#\s*(?:include|import)\b|(?:from|import)\s|"
+    r"using\s+\w|require\s*\(|\.\s*load\b|source\s+|Import-Module\b)")
+
+
 def detect_filename(text: str) -> str:
-    """A filename the conversation itself named, so the artifact keeps its name."""
-    match = _FILENAME.search(text or "")
-    return match.group(1) if match else ""
+    """A filename the conversation itself named, so the artifact keeps its name.
+
+    Import and include lines are skipped: `#include <stdio.h>` names a system
+    header, not the file being written, and adopting it puts a name in the brief
+    that the model then tries to live up to.
+    """
+    for line in (text or "").split("\n"):
+        if _IMPORT_LINE.match(line):
+            continue
+        match = _FILENAME.search(line)
+        if match:
+            return match.group(1)
+    return ""
 
 
 # --------------------------------------------------------------------------- #
@@ -229,9 +322,16 @@ def detect_filename(text: str) -> str:
 # --------------------------------------------------------------------------- #
 
 # An explicit "drop what we were doing".
+# Anchored where anchoring is what distinguishes abandoning the task from
+# editing it. "use a hashtable INSTEAD OF the array" is one of the commonest
+# ways to ask for a small change, and it was resetting the state: objective,
+# requirements, corrections and artifact discarded, and the database row
+# deleted. A reset is a leading statement about the job as a whole.
 _RESET = re.compile(r"(?i)\b(forget\s+(?:that|it|this|the\s+\w+|about\s+\w+)|"
                     r"new\s+task|different\s+task|start\s+over|scrap\s+(?:that|it)|"
-                    r"change\s+of\s+plan|instead\s+of\s+(?:that|the\s+\w+))\b")
+                    r"change\s+of\s+plan)\b|"
+                    r"^\s*(?:ok(?:ay)?[,\s]+|no[,\s]+)?instead\s+of\s+"
+                    r"(?:that|this|it|all\s+that)\b")
 
 # Creating something new, as opposed to changing what exists.
 _CREATE_VERB = re.compile(r"(?i)\b(write|create|generate|build|implement|produce|"
@@ -253,12 +353,66 @@ _MODIFY_LEAD = re.compile(
 # A correction of the assistant's last answer. "stop you were asked a bash
 # script" is not another conversational turn: it is a state update, and it has
 # to be treated as one or the model apologises and drifts again.
+# A correction becomes a permanent, HIGHEST-PRIORITY line in the brief, so a
+# false positive here is expensive and never expires. "stop" and "no" therefore
+# have to be the LEADING word -- the user interrupting -- rather than any
+# occurrence: "add a stop button", "make it stop on the first error" and "the
+# script should stop when the disk is full" are all ordinary feature requests,
+# and all three were being filed as corrections of a mistake nobody made.
 _CORRECTION = re.compile(
-    r"(?i)(\bstop\b|\byou\s+(?:were\s+asked|asked|wrote|gave|produced|switched)|"
+    r"(?i)^\s*(?:stop\b|no[,!.\s]+(?:i|it|that|the|we)\b)|"
+    r"(\byou\s+(?:were\s+asked|asked|wrote|gave|produced|switched)|"
     r"\bi\s+(?:asked|said|wanted|requested)\b|\bthat'?s?\s+not\b|\bthats\s+not\b|"
     r"\bnot\s+what\s+i\b|\bwrong\s+(?:language|file|script|thing)\b|"
-    r"\bno[,!.\s]+(?:i|it|that|the|we)\b|\bwe\s+(?:were|are)\s+(?:doing|working)\b|"
+    r"\bwe\s+(?:were|are)\s+(?:doing|working)\b|"
     r"\bgo\s+back\s+to\b|\bback\s+to\s+the\b|\bunrelated\b)")
+
+
+# Re-expressing the SAME job in another language. "port it to c" is neither a
+# new task (the objective and every requirement still stand) nor a modification
+# (the language is exactly what changes), and classifying it as the latter is
+# what kept a PowerShell task active through four consecutive requests for C.
+#
+# The object between the verb and the preposition is restricted to a reference
+# to the artifact, so "convert the output to json" -- a change to what the code
+# PRODUCES -- is not read as a change to what the code IS WRITTEN IN.
+_PORT_REQUEST = re.compile(
+    r"(?i)\b(?:port|re-?port|convert|translate|rewrite|re-?write|re-?implement|"
+    r"reimplement|migrate|re-?do)\s+"
+    r"(?:(?:it|this|that|them|these|those|everything|all\s+of\s+(?:it|this|that)|"
+    # "the script", "the whole thing", "the powershell module": up to two words
+    # of qualifier before a noun that means the artifact. The noun list is the
+    # gate -- "convert the OUTPUT to json" changes what the code produces, not
+    # what it is written in, and must not match.
+    r"the\s+(?:\w+\s+){0,2}(?:script|code|file|program|programme|module|"
+    r"function|thing))\s+)?"
+    r"(?:in|into|to|as|using)\s+")
+
+# A bare single-letter language at the very start of the tail, where the
+# preposition has already been consumed and there is nothing ambiguous left.
+_BARE_LANG_HEAD = re.compile(r"(?i)^\s*(c|go|r)\b(?![\w+#])")
+
+
+def parse_port_request(message: str) -> str:
+    """The language a "port it to X" message retargets the task to, or "".
+
+    Returns only the language: a port keeps the objective, the requirements and
+    the corrections, so nothing else about the state changes.
+    """
+    text = " ".join((message or "").split())
+    if not text or len(text) > 300:
+        return ""
+    match = _PORT_REQUEST.search(text)
+    if not match:
+        return ""
+    # The tail only, so "rewrite the python script in rust" retargets to rust
+    # rather than reading the language it is being ported AWAY from.
+    tail = text[match.end():match.end() + 60]
+    named = detect_language(tail, allow_bare=True)
+    if named:
+        return named
+    bare = _BARE_LANG_HEAD.match(tail)
+    return _BARE_LANG_CANON.get(bare.group(1).lower(), "") if bare else ""
 
 
 def is_reset_request(message: str) -> bool:
@@ -341,6 +495,17 @@ def parse_correction(message: str) -> dict | None:
 MAX_REQUIREMENTS = 12
 MAX_CORRECTIONS = 4
 
+# Complete versions kept for rollback. Small: this is persisted per conversation
+# and its only job is to survive the handful of turns in which a bad generation
+# is noticed.
+ARTIFACT_HISTORY = 3
+
+# A replacement this much smaller than what is already held is treated as a
+# possible loss rather than an edit, and is only accepted when it still parses.
+# Chosen from the real regression: 3642 chars became 1993, a 0.55 ratio, and the
+# 1993 did not parse.
+SHRINK_RATIO = 0.7
+
 
 @dataclass
 class TaskState:
@@ -359,6 +524,16 @@ class TaskState:
     artifact_type: str = ""
     artifact_version: int = 0
     artifact_complete: bool = True      # False when the last one was cut off
+    # The last few complete versions, newest last, so a turn that destroys the
+    # artifact can be undone. A truncated generation never lands here.
+    artifact_history: list[dict] = field(default_factory=list)
+    # A cut-off generation, kept BESIDE the last complete artifact rather than
+    # on top of it. Overwriting `artifact` with a partial is how a known-good
+    # 3642-character module became 1116 characters of truncated text that the
+    # next turn then "continued" into a spliced duplicate.
+    partial_artifact: str = ""
+    # Why the most recent replacement was refused, for the turn to report.
+    rejected_reason: str = ""
     # Continuation bookkeeping: which generation produced the partial artifact
     # and how far it got, so "continue" does not have to rediscover the task.
     generation_id: str = ""
@@ -389,6 +564,10 @@ class TaskState:
         for key in ("requirements", "constraints", "corrections"):
             value = clean.get(key)
             clean[key] = [str(v) for v in value] if isinstance(value, list) else []
+        history = clean.get("artifact_history")
+        clean["artifact_history"] = [
+            v for v in history if isinstance(v, dict) and v.get("artifact")
+        ][-ARTIFACT_HISTORY:] if isinstance(history, list) else []
         return cls(**clean)
 
     # -- updates --------------------------------------------------------- #
@@ -445,17 +624,136 @@ class TaskState:
             self.platform = update["platform"]
         self.add_correction(update.get("text") or "")
 
+    def _push_history(self) -> None:
+        """Keep the version being replaced, so a bad turn can be undone."""
+        if not self.artifact or not self.artifact_complete:
+            return
+        self.artifact_history.append({
+            "artifact": self.artifact,
+            "version": self.artifact_version,
+            "language": self.language,
+            "artifact_name": self.artifact_name,
+        })
+        del self.artifact_history[:-ARTIFACT_HISTORY]
+
+    def _is_loss(self, body: str) -> bool:
+        """True when accepting this replacement would destroy working code.
+
+        The test is structural damage, not size. An edit is allowed to make a
+        file much smaller -- the user asked to cut something -- and it is
+        allowed to be wrong in ways no parser can see. What is refused is a
+        replacement with unbalanced braces or a block spliced in twice, because
+        storing that makes it "the current artifact" and every later turn is
+        briefed to keep building on it.
+        """
+        if not self.artifact_complete:
+            return False                # nothing whole is at risk
+        if not looks_damaged(body, self.language):
+            return False
+        shrunk = (f", and {len(body)} chars against v{self.artifact_version}'s "
+                  f"{len(self.artifact)}"
+                  if len(body) < len(self.artifact) * SHRINK_RATIO else "")
+        self.rejected_reason = (
+            f"the new version has unclosed or duplicated blocks{shrunk}; keeping "
+            f"v{self.artifact_version}")
+        return True
+
+    def rollback(self) -> bool:
+        """Restore the previous complete version. True when one was restored."""
+        if not self.artifact_history:
+            return False
+        previous = self.artifact_history.pop()
+        self.artifact = str(previous.get("artifact") or "")
+        self.artifact_version = int(previous.get("version") or 0)
+        self.language = str(previous.get("language") or self.language)
+        self.artifact_name = str(previous.get("artifact_name") or self.artifact_name)
+        self.artifact_complete = True
+        self.partial_artifact = ""
+        self.partial_chars = 0
+        self.updated_at = time.time()
+        return True
+
+    def resumable(self) -> str:
+        """The text a "continue" should resume: the partial, else a cut-off artifact."""
+        if self.partial_artifact:
+            return self.partial_artifact
+        return self.artifact if not self.artifact_complete else ""
+
+    def retarget(self, language: str) -> bool:
+        """Switch the task to another language, keeping the job it is doing.
+
+        A port is neither a reset nor a modification. Resetting would throw away
+        the objective and every requirement the user has accumulated; treating
+        it as a modification is what recorded "port it to c" as a requirement ON
+        a PowerShell task and then flagged every C reply as drift for the rest
+        of the session. So: same objective, same requirements, new language, and
+        the old file retired to history because it is not the new file.
+        """
+        if not language or same_language(language, self.language):
+            return False
+        previous = self.language
+        self._push_history()
+        self.language = language
+        self.task_type = self.task_type or "code_generation"
+        self.output_kind = "code"
+        self.artifact_type = _LANG_ARTIFACT_TYPE.get(language, "")
+        self.artifact = ""
+        self.partial_artifact = ""
+        self.artifact_version = 0
+        self.artifact_complete = True
+        self.partial_chars = 0
+        self.artifact_name = ""
+        self.artifact_name = self.default_artifact_name()
+        if previous:
+            self.add_requirement(
+                f"this is a port of the {previous} version; keep the same "
+                f"behaviour, expressed idiomatically in {language}")
+        self.updated_at = time.time()
+        return True
+
     def record_artifact(self, code: str, language: str = "", complete: bool = True) -> None:
-        """Store a produced artifact as the current one, bumping the version."""
+        """Store a produced artifact as the current one, bumping the version.
+
+        Guarded, because this is where a bad turn used to destroy a good file.
+        A truncated generation is parked in partial_artifact beside the last
+        complete version instead of replacing it, and a complete replacement
+        that is both much smaller and structurally broken is refused outright.
+        Everything accepted pushes the version it replaces onto artifact_history
+        so the loss is recoverable either way.
+        """
         body = (code or "").strip()
         if not body:
             return
+        self.rejected_reason = ""
         if body == self.artifact and complete == self.artifact_complete:
             return                      # same artifact seen again; not a new version
+        if not complete:
+            # A cut-off generation. It is what a "continue" resumes, but it is
+            # not the artifact until it finishes -- unless there is nothing
+            # better, or it is already longer than what we hold, which makes it
+            # genuine progress rather than a loss. artifact_complete keeps
+            # describing `artifact`, never the partial: conflating the two is
+            # what let a truncated reply mark a whole file as truncated and then
+            # be overwritten by the next bad generation.
+            self.partial_artifact = body
+            self.partial_chars = len(body)
+            if self.artifact and self.artifact_complete \
+                    and len(body) < len(self.artifact):
+                # Normal operation, not a rejection: the answer already carries
+                # a truncation note saying it was cut off, and a second notice
+                # explaining that the whole version was kept is noise on top of
+                # it. rejected_reason stays for the case the user cannot see
+                # for themselves -- a COMPLETE reply that destroyed the file.
+                return
+        elif self.artifact and self._is_loss(body):
+            return
+        self._push_history()
         self.artifact = body
         self.artifact_version += 1
         self.artifact_complete = complete
         self.partial_chars = 0 if complete else len(body)
+        if complete:
+            self.partial_artifact = ""
         if language:
             self.language = language
             self.artifact_type = _LANG_ARTIFACT_TYPE.get(language, self.artifact_type)
@@ -497,6 +795,18 @@ class TaskState:
         if correction is not None:
             self.apply_correction(correction)
             return correction
+        # A port, checked before the modification path: "port it to c" reads as
+        # a modification (it points at the artifact and carries a code verb),
+        # and note_request deliberately refuses to change the language on a
+        # modification. Retargeting has to happen here or not at all.
+        if self.is_active():
+            target = parse_port_request(message)
+            if target and self.retarget(target):
+                self.add_requirement(message)
+                platform = detect_platform(message)
+                if platform:
+                    self.platform = platform
+                return None
         if not self.objective:
             self.set_objective(message)
             if self.objective:
@@ -531,6 +841,12 @@ class TaskState:
             return False
         if is_reset_request(message):
             return True
+        # A port changes the language without abandoning the job, and
+        # note_request handles it. Resetting here would drop the objective and
+        # every requirement the user has built up, which is the same loss the
+        # reset guard exists to prevent.
+        if parse_port_request(message):
+            return False
         if not starts_new_task(message):
             return False
         language = detect_language(message)
@@ -589,6 +905,17 @@ class TaskState:
         blocks = extract_code_blocks(strip_truncation_note(text))
         if not blocks:
             return None
+        # Patch reply first: on a long artifact the model is asked for only the
+        # sections it changes, so the reply is legitimately a fraction of the
+        # file and must be merged rather than allowed to replace it. apply_patch
+        # returns None unless every block names a function the artifact already
+        # has, so a genuine rewrite still falls through to the path below.
+        if complete and self.artifact:
+            bodies = [code for _, code in blocks]
+            if sum(len(b) for b in bodies) < len(self.artifact) * SHRINK_RATIO:
+                merged = self.apply_patch(bodies)
+                if merged is not None:
+                    return merged, self.language, True
         # Prefer a block in the task's language; otherwise the longest one. A
         # reply often shows a usage example alongside the artifact itself.
         best_code, best_lang, best_score = "", "", -1
@@ -608,6 +935,47 @@ class TaskState:
                                              or same_language(best_lang, self.language))) else ""
         return best_code, adopt, complete
 
+    def apply_patch(self, blocks: list[str]) -> str | None:
+        """Splice changed functions back into the artifact, or None if unsafe.
+
+        The patch lane's other half. Asking a 3B model to re-emit a 3600-char
+        module to add a try/catch costs 45 seconds and risks the whole file on
+        every turn; asking for just the changed functions costs a fraction of
+        that, but only pays off if the reply can be merged back deterministically
+        rather than replacing what it does not contain.
+
+        Confidence is the whole design. Every definition in every block must
+        already exist in the artifact, and the blocks together must not cover
+        the whole file (that is a rewrite, not a patch). Anything else returns
+        None and the caller falls back to treating the reply as a full file.
+        """
+        if not self.artifact or not self.language or not blocks:
+            return None
+        current = definitions(self.artifact, self.language)
+        if not current:
+            return None
+        index = {name: (start, end) for name, start, end in current}
+        edits: dict[str, str] = {}
+        for block in blocks:
+            body = (block or "").strip()
+            if not body:
+                continue
+            found = definitions(body, self.language)
+            if not found:
+                return None             # not a definition: cannot place it
+            for name, start, end in found:
+                if name not in index:
+                    return None         # new function: a rewrite, not a patch
+                edits[name] = body[start:end].rstrip()
+        if not edits or len(edits) >= len(index):
+            return None                 # touches everything: just take the file
+        merged = self.artifact
+        # Apply back-to-front so earlier offsets stay valid.
+        for name, (start, end) in sorted(index.items(), key=lambda kv: -kv[1][0]):
+            if name in edits:
+                merged = merged[:start] + edits[name] + merged[end:]
+        return merged
+
     def note_answer(self, answer: str) -> None:
         """Fold an assistant turn into the state: its artifact and completeness."""
         found = self._artifact_in(answer)
@@ -620,7 +988,8 @@ class TaskState:
 
     # -- the prompt block ------------------------------------------------ #
 
-    def brief(self, artifact_chars: int = 6000, verify_hint: bool = False) -> str:
+    def brief(self, artifact_chars: int = 6000, verify_hint: bool = False,
+              mode: str = "build") -> str:
         """The ACTIVE TASK block: what the model must be told on every turn.
 
         Rides on the current user turn rather than the system prompt, for two
@@ -642,6 +1011,9 @@ class TaskState:
         if self.artifact_name or self.artifact_type:
             state = ("complete" if self.artifact_complete else "TRUNCATED (was cut "
                      "off at the reply limit)")
+            if self.artifact_complete and self.partial_artifact:
+                state = ("complete, but a later attempt was cut off and is "
+                         "waiting to be finished")
             version = f"v{self.artifact_version}" if self.artifact_version else "not written yet"
             lines.append(f"Artifact: {self.artifact_name or '(unnamed)'} "
                          f"({self.artifact_type or 'file'}, {version}, {state})")
@@ -661,9 +1033,11 @@ class TaskState:
         if self.artifact:
             fence = self.language or ""
             body = self._artifact_for_prompt(artifact_chars)
-            lines.append(f"\nCURRENT ARTIFACT (v{self.artifact_version}) — this is the "
-                         f"thing to modify:\n```{fence}\n{body}\n```")
-        lines.append("\n" + self.rules(verify_hint=verify_hint))
+            purpose = ("this is what the user's question is about"
+                       if mode == "explain" else "this is the thing to modify")
+            lines.append(f"\nCURRENT ARTIFACT (v{self.artifact_version}) — {purpose}:"
+                         f"\n```{fence}\n{body}\n```")
+        lines.append("\n" + self.rules(verify_hint=verify_hint, mode=mode))
         return "\n".join(lines)
 
     def _artifact_for_prompt(self, artifact_chars: int) -> str:
@@ -686,10 +1060,33 @@ class TaskState:
                   "output only the sections you change, saying where they go ...\n\n")
         return body[:head].rstrip() + marker + body[-tail:].lstrip()
 
-    def rules(self, verify_hint: bool = False) -> str:
-        """The non-negotiables, derived from the state rather than hard-coded."""
+    def rules(self, verify_hint: bool = False, mode: str = "build") -> str:
+        """The non-negotiables, derived from the state rather than hard-coded.
+
+        `mode` is what the turn is actually for, and it has to be honest:
+
+            build     produce or update the whole artifact (the default)
+            explain   answer a question ABOUT the artifact, in prose
+            patch     emit only the sections that change
+
+        The failure this parameter exists for: the "reply with the complete
+        updated file" rule was unconditional on a code task, so a question
+        ("what is the logic behind this function?") was briefed to dump a
+        3642-character module -- into the 512-token chat budget the same turn
+        had been given, because the budget was conditional on the message and
+        the rule was not. It was cut off mid-function every time and the
+        question was never answered.
+        """
         language = self.language or "the same language"
         rules = ["RULES FOR THIS REPLY:"]
+        if mode == "explain":
+            rules.append("- The user asked a QUESTION about the work, not for a "
+                         "change to it. Answer the question directly, in prose.")
+            rules.append("- Do NOT re-emit the artifact. Quote at most the few "
+                         "lines you are actually talking about.")
+            rules.append("- If the honest answer is that the code above is wrong "
+                         "or does not do what its comments claim, say so plainly.")
+            return "\n".join(rules)
         if self.artifact:
             rules.append(f"- Continue working on the existing {language} artifact above. "
                          "Preserve its existing behaviour unless the user asked to "
@@ -698,7 +1095,13 @@ class TaskState:
             rules.append(f"- Produce the {language} artifact the objective asks for.")
         rules.append(f"- Stay in {language}. Do not switch language, and do not "
                      "introduce unrelated files, classes, frameworks or architectures.")
-        if self.is_code_task():
+        if self.is_code_task() and mode == "patch":
+            rules.append(f"- The file is long and most of it is not changing. Reply "
+                         f"with ONLY the functions or sections you actually change, "
+                         f"each complete, each in its own ```{self.language or ''} "
+                         f"block, and name where it goes. Do NOT reprint the "
+                         f"unchanged parts and do NOT rewrite them from memory.")
+        elif self.is_code_task():
             rules.append(f"- Reply with the complete updated file in ONE ```{self.language or ''} "
                          "block, plus at most two lines of explanation.")
             target = f" on {self.platform}" if self.platform else ""
@@ -746,6 +1149,32 @@ def load_task_state(persisted: dict | None, history: list[dict] | None) -> TaskS
     return TaskState.from_dict(persisted).absorb_history(history)
 
 
+def drifted_languages(task: TaskState, answer: str) -> list[str]:
+    """The languages an answer is in, when none of them is the task's.
+
+    Empty when the answer is fine, when it carries no identifiable code, or when
+    there is no task to contradict. Callers that only want a yes/no use
+    detect_drift; this exists so the turn can NAME the language it would switch
+    to without parsing its own error message back apart.
+    """
+    if not task.is_code_task() or not task.language or not answer:
+        return []
+    found: list[str] = []
+    for info, code in extract_code_blocks(answer):
+        language = canonical_language(info) or code_language(code)
+        if language:
+            found.append(language)
+    if not found:
+        # No fenced code: check the bare body, for a model that skipped fences.
+        language = code_language(strip_truncation_note(answer))
+        if not language:
+            return []
+        found = [language]
+    if any(same_language(language, task.language) for language in found):
+        return []
+    return sorted(set(found))
+
+
 def detect_drift(task: TaskState, answer: str) -> str:
     """Why an answer contradicts the active task, or "" when it does not.
 
@@ -756,24 +1185,10 @@ def detect_drift(task: TaskState, answer: str) -> str:
     left alone, because a validator that fires on ambiguity would block more
     good answers than bad ones.
     """
-    if not task.is_code_task() or not task.language or not answer:
-        return ""
-    blocks = extract_code_blocks(answer)
-    found: list[str] = []
-    for info, code in blocks:
-        language = canonical_language(info) or code_language(code)
-        if language:
-            found.append(language)
+    found = drifted_languages(task, answer)
     if not found:
-        # No fenced code: check the bare body, for a model that skipped fences.
-        language = code_language(strip_truncation_note(answer))
-        if not language:
-            return ""
-        found = [language]
-    if any(same_language(language, task.language) for language in found):
         return ""
-    seen = sorted(set(found))
-    return (f"the reply is {'/'.join(seen)} but the active task is "
+    return (f"the reply is {'/'.join(found)} but the active task is "
             f"{task.language}")
 
 
@@ -781,6 +1196,7 @@ __all__ = [
     "TaskState",
     "load_task_state",
     "detect_drift",
+    "drifted_languages",
     "detect_language",
     "detect_platform",
     "platform_from_code",
@@ -788,9 +1204,13 @@ __all__ = [
     "code_language",
     "same_language",
     "extract_code_blocks",
+    "SIGNATURE_MARGIN",
     "detect_filename",
     "parse_correction",
     "starts_new_task",
+    "parse_port_request",
+    "ARTIFACT_HISTORY",
+    "SHRINK_RATIO",
     "is_modification_request",
     "is_reset_request",
     "MAX_REQUIREMENTS",

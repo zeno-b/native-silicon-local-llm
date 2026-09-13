@@ -696,7 +696,15 @@ UI_JS_CHAT = r"""
              trace.reason = null;
            }
          } else if (event.type === "context") {
-           traceNotice(trace, "trimmed " + event.dropped + " old messages to fit the context window", true);
+           // "kept 1 of 16" is the number that matters: "trimmed 15" reads as
+           // routine housekeeping right up to the point where nothing of the
+           // conversation is left in front of the model.
+           var kept = (typeof event.kept === "number") ? event.kept : null;
+           var total = (typeof event.total === "number") ? event.total : null;
+           var line = (kept !== null && total !== null)
+             ? ("context window full: kept " + kept + " of " + total + " earlier messages")
+             : ("trimmed " + event.dropped + " old messages to fit the context window");
+           traceNotice(trace, line, kept !== 0);
            bumpActivity(trace);
          } else if (event.type === "step") {
            // Show which step is active and out of how many, always.

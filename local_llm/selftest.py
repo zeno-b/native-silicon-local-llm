@@ -87,7 +87,7 @@ def selftest() -> int:
     _expected = set() if not __package__ else {
         "core", "obslog", "database", "sysutil", "ui", "config", "model_server",
         "training", "websearch", "calculator", "tools", "llm", "model_client",
-        "textutil", "taskstate", "agent", "tasks", "auth", "cluster",
+        "textutil", "codecheck", "taskstate", "agent", "tasks", "auth", "cluster",
         "claude_import", "api",
         "diagnostics", "selftest", "cli",
     }

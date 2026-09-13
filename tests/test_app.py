@@ -48,13 +48,19 @@ from local_llm.mcp import MCP, parse_mcp_spec  # noqa: E402
 from local_llm.llm import skills_block, build_plain_system_prompt  # noqa: E402
 from local_llm.obslog import set_acting_user  # noqa: E402
 from local_llm.textutil import (  # noqa: E402
-    is_code_request, is_continue_request, truncation_note, was_truncated)
+    append_below_answer, is_code_request, is_continue_request,
+    classify_implicit_feedback, is_explanation_request,
+    refers_to_active_task, truncation_note, was_truncated)
 from local_llm.taskstate import (  # noqa: E402
     TaskState, canonical_language, code_language, detect_drift,
-    extract_code_blocks, parse_correction, starts_new_task)
+    drifted_languages, extract_code_blocks, is_reset_request, parse_correction,
+    parse_port_request, starts_new_task)
+from local_llm.codecheck import (  # noqa: E402
+    check_code, definitions, looks_damaged, structural_findings)
 from local_llm.core import estimate_tokens  # noqa: E402
 from local_llm.obslog import configure_logging  # noqa: E402
 from local_llm.api import create_app  # noqa: E402
+import local_llm.api  # noqa: E402
 from local_llm.core import ADAPTER_DIR  # noqa: E402
 from local_llm import model_server as model_server_mod  # noqa: E402
 from local_llm import sysutil as sysutil_mod  # noqa: E402
@@ -1193,7 +1199,14 @@ class _ScriptedClient:
 
     async def complete_with_stats(self, messages, *a, **kw):
         self.prompts.append(messages)
-        return self._next(), GenerationStats()
+        text = self._next()
+        # Real token counts, so a lane that forgets to call account() shows up
+        # as a hole in the turn's footer instead of passing silently.
+        stats = GenerationStats()
+        stats.prompt_tokens = sum(
+            estimate_tokens(str(m.get("content") or "")) for m in messages)
+        stats.completion_tokens = estimate_tokens(text)
+        return text, stats
 
     async def complete(self, messages, *a, **kw):
         text, _ = await self.complete_with_stats(messages, *a, **kw)
@@ -2808,9 +2821,14 @@ def test_a_second_drift_asks_the_user_rather_than_returning_junk():
     notices = [e.get("message", "") for e in events if e.get("type") == "notice"]
     assert any("could not stay on task" in n for n in notices), notices
     final = [e for e in events if e.get("type") == "final"][-1]
-    # It asks, and it does not pretend the Python was the answer.
-    assert "Do you want me to keep working on that, or switch?" in final["answer"]
-    assert "bash" in final["answer"]
+    # It asks, it names both options, and it does NOT dump the drifted Python
+    # underneath: appending that was the worst of both, because it neither
+    # blocked nor saved the cost, and the whole thing was then stored as the
+    # answer so a later "continue" replayed the question text with it.
+    assert "Before I go further" in final["answer"]
+    assert "stay on bash" in final["answer"]
+    assert "port it to python" in final["answer"]
+    assert "SkillValidator" not in final["answer"], final["answer"]
     db.close()
 
 
@@ -3059,3 +3077,582 @@ def _run_standalone():
 
 if __name__ == "__main__":
     raise SystemExit(_run_standalone())
+
+
+# --------------------------------------------------------------------------- #
+# The PowerShell/C session: ten distinct failures from one logged conversation. #
+# Each test below names the one it pins.                                        #
+# --------------------------------------------------------------------------- #
+
+PS_ASK = "write a powershell module for system config"
+PS_MODULE = ("function Get-SystemConfig {\n"
+             "    $h = Get-WmiObject Win32_ComputerSystem\n"
+             "    Write-Output $h\n"
+             "}\n\n"
+             "function Set-SystemConfig {\n"
+             "    param ([string]$Name)\n"
+             "    Write-Output $Name\n"
+             "}\n\n"
+             "function Test-SystemConfig {\n"
+             "    Write-Output \"t\"\n"
+             "}\n")
+C_PORT = ("#include <stdio.h>\n#include <stdlib.h>\n\n"
+          "char* getHardwareInfo(void) {\n"
+          "    char* o = malloc(1024);\n"
+          "    FILE* s = popen(\"wmic cpu get name /value\", \"r\");\n"
+          "    fgets(o, 1024, s);\n"
+          "    pclose(s);\n"
+          "    return o;\n"
+          "}\n")
+
+
+def _ps_task(artifact=PS_MODULE):
+    task = TaskState()
+    task.note_request(PS_ASK)
+    if artifact:
+        task.record_artifact(artifact, "powershell")
+    return task
+
+
+def test_a_port_retargets_the_task_instead_of_becoming_a_requirement():
+    """Defect: "port it to c" was recorded as a requirement ON the PowerShell
+    task, so the language never changed and every later C reply was drift."""
+    assert parse_port_request("port it to c") == "c"
+    assert parse_port_request("convert this to rust") == "rust"
+    assert parse_port_request("rewrite the python script in rust") == "rust"
+    assert parse_port_request("redo it as bash") == "bash"
+    # Not ports: a change to what the code PRODUCES, and an ordinary edit.
+    assert parse_port_request("convert the output to json") == ""
+    assert parse_port_request("add error handling") == ""
+    assert parse_port_request("rewrite it in a cleaner way") == ""
+
+    task = _ps_task()
+    assert task.language == "powershell"
+    before = list(task.requirements)
+    task.note_request("add error handeling")
+    task.note_request("port it to c")
+    # The language moved, the job did not.
+    assert task.language == "c", task.summary()
+    assert task.artifact_name.endswith(".c"), task.artifact_name
+    assert task.objective.startswith("write a powershell module")
+    assert "add error handeling" in task.requirements
+    assert any("port of the powershell version" in r for r in task.requirements)
+    assert before == [] and task.requirements
+    # The PowerShell file is not carried into the C task, but it is recoverable.
+    assert task.artifact == ""
+    assert task.artifact_history and task.artifact_history[-1]["language"] == "powershell"
+    # And a port is explicitly not a reset: that would drop the objective.
+    assert not _ps_task().should_reset("port it to c")
+
+
+def test_a_question_about_the_code_is_not_a_request_to_re_emit_it():
+    """Defect: the brief demanded the complete file unconditionally while the
+    budget was 512, so a question was cut off mid-function and never answered."""
+    assert is_explanation_request("whats the logic behind SetHardwareInfo?")
+    assert is_explanation_request("why is that not implemented")
+    assert not is_explanation_request("add more features")
+    assert not is_explanation_request("can you add retries?")
+
+    agent, cfg, db, reg, _ = _agent([])
+    task = _ps_task()
+    question = "whats the logic behind Set-SystemConfig and why is it a no-op?"
+    assert agent.explaining(question, task)
+    assert agent.turn_mode(question, task, 512) == "explain"
+    # The budget and the rules now agree: a chat budget AND a prose instruction.
+    assert agent.reply_reserve(question, 512, task) == 512
+    brief = agent.task_brief(task, 512, "explain")
+    assert "Do NOT re-emit the artifact" in brief, brief[-500:]
+    assert "complete updated file" not in brief
+    # A change request is unaffected: code budget, whole-file rules.
+    assert agent.turn_mode("add error handling", task, 512) != "explain"
+    assert agent.reply_reserve("add error handling", 512, task) == cfg.code_max_tokens
+    db.close()
+
+
+def test_a_file_that_cannot_fit_the_budget_is_never_asked_for_whole():
+    """The safety net behind the mode: asking for a complete file that does not
+    fit the reply budget is a guaranteed truncation."""
+    agent, cfg, db, reg, _ = _agent([], artifact_patch_chars=0)
+    task = _ps_task("function A {\n" + "    Write-Output 1\n" * 400 + "}\n")
+    # Patch lane off by config, but the file still cannot fit 256 tokens.
+    assert agent.turn_mode("add retries", task, 256) == "patch"
+    brief = agent.task_brief(task, 256, "patch")
+    assert "ONLY the functions or sections you actually change" in brief
+    db.close()
+
+
+def test_a_patch_reply_is_spliced_in_rather_than_replacing_the_file():
+    """Defect: every turn re-emitted the whole artifact, at 45s and full risk."""
+    task = _ps_task()
+    assert len(definitions(PS_MODULE, "powershell")) == 3
+    task.note_answer("Only the setter changes:\n\n```powershell\n"
+                     "function Set-SystemConfig {\n"
+                     "    param ([string]$Name)\n"
+                     "    try { Write-Output $Name } catch { Write-Error $_ }\n"
+                     "}\n```")
+    assert "catch { Write-Error $_ }" in task.artifact
+    assert 'Write-Output "t"' in task.artifact         # untouched function kept
+    assert "function Get-SystemConfig" in task.artifact
+    assert task.artifact_version == 2
+    # Replaying the same answer is idempotent, so absorb_history stays stable.
+    version = task.artifact_version
+    task.note_answer("```powershell\nfunction Set-SystemConfig {\n"
+                     "    param ([string]$Name)\n"
+                     "    try { Write-Output $Name } catch { Write-Error $_ }\n"
+                     "}\n```")
+    assert task.artifact_version == version
+    # A block naming a function the file does not have is a rewrite, not a
+    # patch, and must not be spliced.
+    assert task.apply_patch(["function New-Thing {\n    Write-Output 1\n}"]) is None
+
+
+def test_a_truncated_reply_never_overwrites_a_complete_artifact():
+    """Defect: a 512-token cut stored 1116 chars over a good 3642-char file."""
+    task = _ps_task()
+    whole = task.artifact
+    task.record_artifact("function Get-SystemConfig {\n    param", "powershell",
+                         complete=False)
+    assert task.artifact == whole                 # the good file is untouched
+    assert task.artifact_complete is True
+    assert task.partial_artifact.endswith("param")
+    assert task.resumable() == task.partial_artifact
+    # With nothing whole to protect, the old behaviour is unchanged.
+    fresh = TaskState()
+    fresh.note_request(PS_ASK)
+    fresh.record_artifact("function A {\n    param", "powershell", complete=False)
+    assert fresh.artifact.endswith("param") and not fresh.artifact_complete
+
+
+def test_a_spliced_or_unclosed_replacement_is_refused_and_recoverable():
+    """Defect: the "continue" that stitched Get-SystemConfig's body into
+    Set-SystemConfig was accepted, and the good version was gone."""
+    task = _ps_task()
+    whole, version = task.artifact, task.artifact_version
+    stitched = (PS_MODULE.split("function Test-")[0]
+                + "function Set-SystemConfig {            {\n"
+                + "    $h = Get-WmiObject Win32_ComputerSystem\n"
+                  "    Write-Output $h\n    param ([string]$Name)\n"
+                  "    Write-Output $Name\n    return\n}\n")
+    assert looks_damaged(stitched, "powershell")
+    task.record_artifact(stitched, "powershell", complete=True)
+    assert task.artifact == whole and task.artifact_version == version
+    assert "unclosed or duplicated blocks" in task.rejected_reason
+    # A smaller edit that still parses is a legitimate edit and goes through.
+    task.record_artifact("function Get-SystemConfig {\n    Write-Output 1\n}\n",
+                         "powershell", complete=True)
+    assert task.artifact_version == version + 1
+    assert task.rollback() and task.artifact == whole
+
+
+def test_generated_code_is_checked_before_the_user_sees_it():
+    """Defect: ten versions shipped with a function shadowing a builtin and
+    recursing into itself, and nothing in the pipeline ever looked."""
+    recursive = ("function Start-Service {\n"
+                 "    param ([string]$ServiceName)\n"
+                 "    if (Get-Service -Name $ServiceName) {\n"
+                 "        Start-Service -Name $ServiceName\n"
+                 "    }\n}\n")
+    messages = [f.message for f in check_code(recursive, "powershell")]
+    assert any("recurses forever" in m for m in messages), messages
+    assert any("Set-WmiObject is not a cmdlet" in f.message
+               for f in check_code("Set-WmiObject Win32_OperatingSystem -Filter \"x\"\n",
+                                   "powershell"))
+    assert any("-Name=value" in f.message
+               for f in check_code("function F {\n  Set-NetAdapter -Name=\"$($n)\"\n}\n",
+                                   "powershell"))
+    assert any("_popen" in f.message for f in check_code(C_PORT, "c"))
+    # Correct code is left alone, in every language the checker knows.
+    assert check_code("#!/bin/bash\nset -euo pipefail\nf() {\n  echo hi\n}\nf\n", "bash") == []
+    assert check_code(PS_MODULE, "powershell") == []
+    # And it never fires on a repeated line, which is ordinary code.
+    assert check_code("function X {\n" + "    Write-Output 1\n" * 12 + "}\n",
+                      "powershell") == []
+
+
+def test_the_check_is_appended_to_the_answer_without_breaking_continuation():
+    agent, cfg, db, reg, _ = _agent([])
+    task = _ps_task()
+    bad = ("```powershell\nfunction Start-Service {\n    param ([string]$n)\n"
+           "    Start-Service -Name $n\n}\n```")
+    checked = agent.checked_answer(bad, task)
+    assert "problem" in checked and "recurses forever" in checked
+    # The truncation marker has to stay LAST or "continue" stops working.
+    cut = bad + truncation_note(1536)
+    assert was_truncated(agent.checked_answer(cut, task))
+    assert was_truncated(append_below_answer(cut, "\n\n---\n*note*"))
+    # Off by config, nothing is appended.
+    quiet, qcfg, qdb, _, _ = _agent([], code_check_enabled=False)
+    assert quiet.checked_answer(bad, task) == bad
+    qdb.close()
+    db.close()
+
+
+def test_a_followup_about_the_work_is_never_turned_into_a_web_search():
+    """Defect: "how about the c port" became a search for "c port", which
+    returned a water-softener portal and the Wikipedia page on USB-C."""
+    assert refers_to_active_task("how about the c port")
+    assert refers_to_active_task("what about the c program")
+    assert refers_to_active_task("fix it")
+    # Still a lookup: the world, not the artifact.
+    assert not refers_to_active_task("the latest version of python")
+    assert not refers_to_active_task("who won the game last night")
+    assert not refers_to_active_task("summarise https://example.com/a")
+
+    agent, cfg, db, reg, client = _agent([])
+    task = _ps_task()
+    decision = asyncio.run(agent.route("how about the c port", [], task))
+    assert decision == {"action": "answer"}, decision
+    # Without a task there is nothing to refer to, so routing is untouched.
+    assert not client.prompts          # the shortcut answered before any call
+    db.close()
+
+
+def test_the_router_call_is_counted_in_the_turns_token_footer():
+    """Defect: route() discarded its stats, so a routed turn under-reported."""
+    agent, cfg, db, reg, client = _agent(['{"action":"answer"}'])
+    stats = GenerationStats()
+    asyncio.run(agent.route("what is the capital of france", [], None, stats))
+    assert stats.prompt_tokens > 0 or stats.completion_tokens > 0, stats.as_event()
+    db.close()
+
+
+def test_the_language_classifier_shrugs_instead_of_guessing():
+    """Defect: the same C program was called "c++" on one turn and "json" on
+    another, and each wrong verdict cost a regeneration and a question."""
+    assert code_language(C_PORT) == "c"
+    assert code_language("#include <iostream>\nstd::string f() {\n"
+                         "    std::cout << 1;\n    return \"\";\n}\n") == "c++"
+    assert code_language(PS_MODULE) == "powershell"
+    assert code_language('{\n  "action": "web_search",\n  "query": "c port"\n}\n') == "json"
+    # No honest verdict available: say nothing rather than guess.
+    assert code_language("x = 1\ny = 2\n") == ""
+    assert code_language("DISK  STATUS\ndisk0 ok\n") == ""
+    # A bare ```c fence is now readable, and c/c++ remain one family so telling
+    # them apart never turns into a drift verdict.
+    assert canonical_language("c") == "c"
+    ps = _ps_task()
+    assert drifted_languages(ps, "```c\n" + C_PORT + "```") == ["c"]
+    assert drifted_languages(ps, "```powershell\n" + PS_MODULE + "```") == []
+
+
+def test_the_turn_reports_what_it_kept_not_just_what_it_dropped():
+    """Defect: one turn printed "trimmed N old messages" three times with two
+    different values, and never said that nothing was left."""
+    agent, cfg, db, reg, client = _agent(["```bash\n#!/bin/bash\necho ok\n```"],
+                                         context_size=2048)
+    filler = []
+    for i in range(24):
+        filler.append({"role": "user", "content": f"unrelated aside number {i} " * 12})
+        filler.append({"role": "assistant", "content": f"noted, aside {i}. " * 12})
+    events = asyncio.run(_run(agent, "add SMART checks", _bash_history() + filler))
+    trims = [e for e in events if e.get("type") == "context"]
+    assert len(trims) == 1, trims                 # once per turn, not three times
+    assert trims[0]["total"] == len(_bash_history() + filler)
+    assert trims[0]["kept"] == trims[0]["total"] - trims[0]["dropped"]
+    db.close()
+
+
+def test_the_truncation_note_does_not_send_you_to_a_setting_it_overrode():
+    """Defect: "raise Max tokens in Settings" was printed on turns where the
+    harness had already widened 512 to 1536 on its own."""
+    widened = truncation_note(1536, requested=512, context_size=4096)
+    assert "already widened to 1536" in widened
+    assert "raise" not in widened
+    assert was_truncated("x" + widened)
+    honest = truncation_note(512, requested=512, context_size=4096)
+    assert 'raise "Max tokens"' in honest
+    assert was_truncated("x" + honest)
+
+
+def test_a_second_drift_asks_without_dumping_the_drifted_answer():
+    """Defect: the question was followed by the whole drifted reply, so it
+    neither blocked nor saved the cost, and "continue" replayed the preamble."""
+    agent, cfg, db, reg, client = _agent([DRIFTED_PYTHON, DRIFTED_PYTHON])
+    events = asyncio.run(_run(agent, "add more checks and error handling",
+                              _bash_history()))
+    final = [e for e in events if e.get("type") == "final"][-1]
+    assert "SkillValidator" not in final["answer"], final["answer"]
+    assert "port it to python" in final["answer"]
+    assert "stay on bash" in final["answer"]
+    assert len(final["answer"]) < 500, final["answer"]
+    db.close()
+
+
+def test_an_explanation_turn_is_not_regenerated_as_drift():
+    """The drift check must not fire on a prose answer that quotes a snippet."""
+    agent, cfg, db, reg, client = _agent([])
+    task = _ps_task()
+    prose = ("It is a stub. The comment claims hardware cannot be set on "
+             "Windows, which is not the real reason.\n\n```c\nreturn false;\n```")
+    answer, note = asyncio.run(agent.redirect_drift(
+        task, prose, "whats the logic behind that function?", [], 512, None))
+    assert note == "" and answer == prose
+    db.close()
+
+
+# --------------------------------------------------------------------------- #
+# Second audit pass: the same failure classes found elsewhere in the pipeline.  #
+# --------------------------------------------------------------------------- #
+
+def test_an_ordinary_edit_does_not_detonate_the_task():
+    """Defect: "use a hashtable instead of the array" matched the reset pattern,
+    so an ordinary edit discarded the objective, every requirement, every
+    correction and the artifact, and deleted the stored row."""
+    for phrase in ("use a hashtable instead of the array",
+                   "instead of the loop use a pipeline",
+                   "parse it with regex instead of that split",
+                   "add a retry instead of that sleep"):
+        assert not is_reset_request(phrase), phrase
+    # A real abandonment still resets.
+    for phrase in ("forget that, write a python script", "new task: write a parser",
+                   "start over", "scrap it", "instead of that, write a python script"):
+        assert is_reset_request(phrase), phrase
+
+    task = _ps_task()
+    task.note_request("add error handeling")
+    assert not task.should_reset("use a hashtable instead of the array")
+    task.note_request("use a hashtable instead of the array")
+    assert task.objective.startswith("write a powershell module"), task.summary()
+    assert task.artifact, "the artifact was destroyed by an edit"
+    assert "add error handeling" in task.requirements
+
+
+def test_a_feature_request_is_not_filed_as_a_correction():
+    """Defect: any sentence containing "stop" became a permanent entry under
+    "CORRECTIONS FROM THE USER (highest priority, do not repeat these
+    mistakes)", which never expires and is in front of the model every turn."""
+    for phrase in ("add a stop button to the script",
+                   "make it stop on the first error",
+                   "the script should stop when the disk is full",
+                   "add a --no-color flag"):
+        assert parse_correction(phrase) is None, phrase
+    for phrase in ("stop you were asked a bash script",
+                   "i asked for tabs not spaces",
+                   "no, that's not what I wanted",
+                   "you gave me python",
+                   "go back to the bash version"):
+        assert parse_correction(phrase) is not None, phrase
+
+    task = _ps_task()
+    task.note_request("add a stop button to the script")
+    assert task.corrections == [], task.corrections
+    assert "add a stop button to the script" in task.requirements
+    brief = task.brief()
+    assert "CORRECTIONS FROM THE USER" not in brief
+
+
+def test_continue_never_swallows_a_real_instruction():
+    """Defect: the continue pattern was a PREFIX match, so "more tests please"
+    and "finish the parser" resumed the previous answer and the instruction was
+    dropped without ever reaching the model."""
+    for phrase in ("continue", "go on", "keep going", "please continue", "continue.",
+                   "ok, carry on", "the rest of it", "rest of it", "finish it",
+                   "go ahead", "resume from where you stopped",
+                   "continue where you left off", "more", "just continue"):
+        assert is_continue_request(phrase), phrase
+    for phrase in ("more tests please", "finish the parser",
+                   "go ahead and add retries", "continue but in python",
+                   "more error handling on the network calls",
+                   "keep going with the tests"):
+        assert not is_continue_request(phrase), phrase
+
+    # End to end: with a truncated previous answer sitting there, a real request
+    # is answered rather than resumed.
+    agent, cfg, db, reg, client = _agent(["```bash\n#!/bin/bash\ntest_disks\n```"])
+    history = _bash_history() + [
+        {"role": "user", "content": "add SMART checks"},
+        {"role": "assistant", "content": "```bash\n#!/bin/bash\nsmartctl -a"
+                                         + truncation_note(1536)}]
+    events = asyncio.run(_run(agent, "more tests please", history))
+    assert not [e for e in events if e.get("type") == "final" and e.get("continued")]
+    prompt = _joined(client.prompts[-1])
+    assert "more tests please" in prompt, prompt[-400:]
+    db.close()
+
+
+def test_the_harness_own_retry_text_never_becomes_a_requirement():
+    """Defect: run_iterating re-enters run() with a machine-written fix request,
+    and 200 chars of compiler output were filed as a permanent requirement that
+    every later turn was then briefed to satisfy."""
+    fix = ("Your edits did not pass verification. Fix the code so it passes. "
+           "Problems found:\n\nSyntax errors:\n  File \"x.py\", line 3\n    def f(\n")
+
+    async def once(agent, internal):
+        async for _ in agent.run(fix, _bash_history(), conversation_id="t",
+                                 max_tokens=512, internal=internal):
+            pass
+
+    leaky, _, ldb, _, _ = _agent(["```bash\n#!/bin/bash\necho ok\n```"])
+    asyncio.run(once(leaky, internal=False))
+    assert ldb.load_task_state("t")["requirements"], "fixture no longer reproduces"
+    ldb.close()
+
+    agent, cfg, db, reg, _ = _agent(["```bash\n#!/bin/bash\necho ok\n```"])
+    asyncio.run(once(agent, internal=True))
+    stored = db.load_task_state("t")
+    assert stored["requirements"] == [], stored["requirements"]
+    assert "Your edits did not pass" not in stored["latest_request"]
+    assert stored["latest_request"].startswith("write a bash script")
+    db.close()
+
+
+def test_the_plain_lane_marks_a_cut_off_answer_so_continue_still_works():
+    """Defect: the non-agent lane had no truncation marker, so an answer cut off
+    there could not be continued -- "continue" was answered as a new question,
+    with the half-written file nowhere in the prompt."""
+    source = Path(local_llm.api.__file__).read_text()
+    # Both plain lanes (streaming and not) go through the marker helper, and
+    # neither calls clean_reply directly on a generated answer any more.
+    assert source.count("plain_lane_answer(") == 3, source.count("plain_lane_answer(")
+    assert 'answer += truncation_note(limit, limit, config.context_size)' in source
+    # The marker the helper appends is the one the continuation lane keys off.
+    marked = "#!/bin/bash\nsmartctl -a" + truncation_note(512, 512, 4096)
+    assert was_truncated(marked)
+
+
+def test_a_code_request_is_never_answered_on_the_plain_lane():
+    """Defect: with the agent toggle off and no project attached, a code request
+    went down a lane with no task state, no code budget and no truncation
+    marker -- the pipeline exactly as it was before any of that existed."""
+    source = Path(local_llm.api.__file__).read_text()
+    # The escalation no longer depends on a project being attached.
+    assert "elif not use_agent and is_code_request(request.message):" in source
+    assert "config.project_dir and is_code_request" not in source
+    # And an active task escalates too, because a follow-up on it carries no
+    # language and no code object of its own.
+    assert source.count("has_active_task(conversation_id, uid)") == 2, source.count(
+        "has_active_task(conversation_id, uid)")
+
+
+def test_implicit_feedback_does_not_mislabel_training_data():
+    """Defect: the highest-stakes classifier in the pipeline. A verdict here is
+    written to the feedback table and becomes a LoRA training example, and a
+    negative ALSO makes the chat handler re-ask the previous request and discard
+    what the user just said. It was labelling "thanks, but it still fails" as a
+    POSITIVE example of the answer the user had just said did not work."""
+    for phrase in ("thanks", "perfect", "thanks a lot", "that's exactly right",
+                   "nice, thanks", "good job", "that works", "yes exactly"):
+        assert classify_implicit_feedback(phrase) == 1, phrase
+    for phrase in ("that's wrong", "no, wrong", "nope", "wrong answer",
+                   "that's not it", "incorrect", "no that's incorrect",
+                   # Names what was wrong in the same breath. The retry path
+                   # carries the user's own words to the model as the complaint,
+                   # so a rejection is deliberately left looser than praise.
+                   "no c++ just an empty json?", "wrong file, use config.py"):
+        assert classify_implicit_feedback(phrase) == -1, phrase
+    # The lead word was doing grammatical work, not judging the answer. Praise
+    # is the strict side: a false positive teaches the model that a bad answer
+    # was good, and nothing downstream catches it.
+    for phrase in ("good, now add retries", "correct the typo in line 4",
+                   "yes please continue", "right, so how do I run it",
+                   "perfect, now port it to c"):
+        assert classify_implicit_feedback(phrase) is None, phrase
+    # "no" as a determiner is a statement about the design, not a rejection:
+    # treating it as one re-asks the previous request instead of acting on it.
+    assert classify_implicit_feedback("no timeout is needed here") is None
+    # Praise withdrawn in the same breath is not praise.
+    for phrase in ("thanks, but it still fails", "nice but it doesn't compile",
+                   "that works, but it crashes on an empty disk"):
+        assert classify_implicit_feedback(phrase) != 1, phrase
+
+
+# --------------------------------------------------------------------------- #
+# Third audit pass: machinery that claimed to have done something it had not.   #
+# --------------------------------------------------------------------------- #
+
+def test_compaction_carries_the_facts_not_just_the_headers():
+    """Defect: a tool result is a user turn whose FIRST LINE is the header
+    "TOOL RESULT [web_search]:", and the collapse carried exactly that line. On
+    any run long enough to compact, every fact the tools had gathered became a
+    list of identical headers -- while the dedup guard stopped the model
+    fetching any of it again."""
+    agent, cfg, db, reg, _ = _agent([], context_size=2048)
+    base = [{"role": "system", "content": "s" * 200},
+            {"role": "user", "content": "which mlx-lm version is current?"}]
+    scratch = []
+    for i in range(8):
+        scratch.append({"role": "assistant", "content": "I used web_search to get this."})
+        scratch.append({"role": "user", "content":
+                        f"TOOL RESULT [web_search]:\nmlx-lm {i}.9.2 released on 2026-0{i+1}-01. "
+                        + "Padding. " * 120
+                        + "\n\nAnswer my original question using this result."})
+    collapsed = agent.compact(base, scratch, 512)
+    assert collapsed > 0
+    summary = scratch[0]["content"]
+    assert summary.startswith(agent.SUMMARY_MARKER)
+    assert summary.count("released on") >= 3, summary[:400]
+    # The trailing directive is an instruction for a step that already happened,
+    # not a finding, and must not be carried into the digest.
+    assert "Answer my original question" not in summary
+    # And the digest is sized against the budget, so inserting it cannot
+    # immediately re-trigger a collapse (which would destroy prefix reuse).
+    budget = cfg.context_size - 512 - 256
+    assert estimate_tokens(summary) < budget * 0.5, estimate_tokens(summary)
+    db.close()
+
+
+def test_a_skill_is_not_autoloaded_on_filler_words():
+    """Defect: best_match counted every word over two letters, so a skill
+    matched on the words every request shares with every skill. "WRITE a
+    powershell module FOR system config" overlapped "Score a page for SEO health
+    and WRITE a report" on {write, for} and the turn was told "You have a
+    written procedure for this. Follow it." over an SEO scorer."""
+    library = SkillLibrary(Path(tempfile.mkdtemp(prefix="skill-match-")))
+    library.save(name="seo-health-scorer", tags=["seo", "report"],
+                 description="Score a page for SEO health and write a report",
+                 body="1. fetch the page")
+    library.save(name="invoice-parser", tags=["invoice", "pdf"],
+                 description="Parse an invoice PDF into structured fields",
+                 body="1. read the pdf")
+    overlap = Config().skill_autoload_overlap
+    for query in ("write a powershell module for system config",
+                  "write a bash script that checks which disks are failing",
+                  "add more checks and error handling",
+                  "create a program that builds a report"):
+        assert library.best_match(query, overlap) is None, query
+    # A genuine subject match still fires, or the feature is worthless.
+    assert library.best_match("score this page for seo health", overlap).name \
+        == "seo-health-scorer"
+    assert library.best_match("parse the invoice pdf into fields", overlap).name \
+        == "invoice-parser"
+
+
+def test_verification_checks_every_language_it_claims_to():
+    """Defect: syntax_check skipped everything that was not .py and returned
+    "", so the auto-iterate loop reported "changes verified (syntax)" for a turn
+    that had rewritten shell, Go or C with nothing examined at all."""
+    work = Path(tempfile.mkdtemp(prefix="syntax-check-"))
+    (work / "good.sh").write_text("#!/bin/bash\nf() {\n  echo hi\n}\nf\n")
+    (work / "bad.js").write_text("function f() {\n  console.log(1);\n")
+    (work / "bad.py").write_text("def f(\n")
+    (work / "notes.txt").write_text("not code")
+    reg = ToolRegistry(Config(project_dir=str(work), allow_shell=False))
+    files = ["good.sh", "bad.js", "bad.py", "notes.txt"]
+    report = reg.syntax_check(files)
+    assert "bad.py" in report, report
+    assert "bad.js" in report, report          # was skipped entirely before
+    assert "good.sh" not in report, report
+    assert "notes.txt" not in report
+    # "parsed" and "the braces balance" are different claims, and the notice
+    # says which one it is making.
+    parsed, shallow = reg.checked_languages(files)
+    assert "python" in parsed
+    assert "javascript" in shallow, (parsed, shallow)
+    assert reg.checked_languages(["notes.txt"]) == ([], [])
+
+
+def test_a_continuation_that_restarts_is_not_returned_twice():
+    """A small model told to resume sometimes starts over. Concatenating hands
+    back the whole answer twice, which the artifact checker then rejects as a
+    duplicated block -- so the turn produces nothing."""
+    partial = ("```c\n#include <stdio.h>\n\nint main(void) {\n"
+               "    printf(\"a long enough first line to match on\\n\");\n    int x = 1")
+    finished = partial + ";\n    return 0;\n}\n```"
+    # Restarted from the top: keep the complete one, drop the partial.
+    assert Agent.stitch_continuation(partial, finished) == finished
+    # Genuinely resumed: joined at the seam, nothing dropped.
+    resumed = Agent.stitch_continuation(partial, ";\n    return 0;\n}\n```")
+    assert resumed == finished
+    # Repeated tail: deduplicated rather than doubled.
+    tail = "\n    printf(\"a long enough first line to match on\\n\");\n    int x = 1"
+    assert Agent.stitch_continuation(partial, tail + ";\n}\n```").count("int x = 1") == 1

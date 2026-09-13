@@ -31,6 +31,7 @@ from .checkpoints import *  # noqa: F401,F403
 from .mcp import *  # noqa: F401,F403
 from .websearch import *  # noqa: F401,F403
 from .calculator import *  # noqa: F401,F403
+from .codecheck import check_code, parser_for
 
 
 def guarded_thread(fn, *args, **kwargs) -> threading.Thread:
@@ -744,30 +745,83 @@ class ToolRegistry:
         label = timezone if tz else "UTC"
         return now.strftime(f"%Y-%m-%d %H:%M:%S ({label}), %A")
 
-    def syntax_check(self, files: list[str]) -> str:
-        """Compile changed Python files in-process to catch syntax errors.
+    # Extension -> the language name codecheck understands. Only extensions
+    # where the mapping is unambiguous; anything else gets the structural checks
+    # under an empty language, which still catches an unclosed or spliced file.
+    CHECKABLE = {
+        ".py": "python", ".sh": "bash", ".bash": "bash", ".zsh": "bash",
+        ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+        ".ts": "typescript", ".c": "c", ".h": "c", ".cc": "c++", ".cpp": "c++",
+        ".hpp": "c++", ".go": "go", ".rs": "rust", ".rb": "ruby", ".php": "php",
+        ".ps1": "powershell", ".psm1": "powershell", ".json": "json",
+        ".java": "java", ".swift": "swift", ".kt": "kotlin",
+    }
 
-        Safe without --allow-shell: compile() parses but does not execute the
-        code, so this verification runs even when execution is disabled. Returns
-        an empty string when all files parse, or a description of the errors.
+    def checked_languages(self, files: list[str]) -> tuple[list[str], list[str]]:
+        """(really parsed, structure only) for these files.
+
+        Exists so the caller can report what it verified instead of claiming
+        more. The auto-iterate loop printed "changes verified (syntax)" after a
+        pass that skipped every file that was not Python, which is a claim about
+        code nothing had looked at -- and "parsed" and "checked the braces
+        balance" are not the same claim either.
+        """
+        parsed: list[str] = []
+        shallow: list[str] = []
+        for rel in files:
+            language = self.CHECKABLE.get(Path(rel).suffix.lower())
+            if not language:
+                continue
+            # Python is compiled in-process and needs no shell; everything else
+            # needs execution enabled AND the parser installed on this host.
+            real = language == "python" or (bool(self.config.allow_shell)
+                                            and bool(parser_for(language)))
+            bucket = parsed if real else shallow
+            if language not in bucket:
+                bucket.append(language)
+        return parsed, [l for l in shallow if l not in parsed]
+
+    def syntax_check(self, files: list[str]) -> str:
+        """Check changed source files. Empty string when they all pass.
+
+        Python is compiled in-process (compile() parses without executing), so
+        that layer has never needed --allow-shell. Everything else used to be
+        SKIPPED ENTIRELY -- the loop looked at `.py` and returned "" for a turn
+        that had rewritten shell, Go or C, and the caller reported the changes
+        verified. Now every known language gets the structural checks, and a
+        real parser on top when execution is allowed and the host has one.
         """
         problems = []
         root = self._root()
+        deep = bool(self.config.allow_shell)
         for rel in files:
-            if not rel.endswith(".py"):
+            language = self.CHECKABLE.get(Path(rel).suffix.lower())
+            if not language:
                 continue
             target = root / rel
             try:
                 src = target.read_text(encoding="utf-8", errors="replace")
-                compile(src, rel, "exec")
-            except SyntaxError as exc:
-                problems.append(f"{rel}:{exc.lineno}: {exc.msg}")
             except FileNotFoundError:
                 problems.append(f"{rel}: file disappeared before it could be checked")
+                continue
             except (PermissionError, OSError) as exc:
                 problems.append(f"{rel}: could not be read ({exc})")
+                continue
+            if language == "python":
+                try:
+                    compile(src, rel, "exec")
+                except SyntaxError as exc:
+                    problems.append(f"{rel}:{exc.lineno}: {exc.msg}")
+                except Exception as exc:
+                    problems.append(f"{rel}: could not be checked "
+                                    f"({type(exc).__name__}: {exc})")
+                continue
+            try:
+                for finding in check_code(src, language, deep=deep):
+                    problems.append(f"{rel}:{finding.line or '?'}: {finding.message}")
             except Exception as exc:
-                problems.append(f"{rel}: could not be checked ({type(exc).__name__}: {exc})")
+                problems.append(f"{rel}: could not be checked "
+                                f"({type(exc).__name__}: {exc})")
         return "\n".join(problems)
 
     def git_diff(self, files: list[str] | None = None, limit: int = 40000) -> str:

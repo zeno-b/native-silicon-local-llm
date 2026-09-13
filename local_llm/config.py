@@ -231,6 +231,21 @@ class Config:
     # gets a budget smaller than the script it must re-emit.
     artifact_reply_headroom: int = field(default_factory=lambda: int(
         os.environ.get("ARTIFACT_REPLY_HEADROOM", "640")))
+    # Above this many characters, a turn that changes the artifact is asked for
+    # the changed sections only and the reply is spliced back in, instead of the
+    # model re-emitting the whole file. Re-emitting a 3600-character module to
+    # add a try/catch cost 45 seconds a turn and put the whole file at risk on
+    # every one of them. 0 disables the patch lane.
+    artifact_patch_chars: int = field(default_factory=lambda: int(
+        os.environ.get("ARTIFACT_PATCH_CHARS", "2400")))
+    # Check generated code before showing it: unbalanced braces, blocks spliced
+    # in twice, a function shadowing a builtin and then recursing into itself,
+    # and a short list of literal mistakes per language. Pure text, no tools.
+    code_check_enabled: bool = field(default_factory=lambda: os.environ.get("CODE_CHECK_ENABLED", "1") == "1")
+    # Additionally parse the code with a real parser (bash -n, py_compile, pwsh,
+    # cc -fsyntax-only) when the host has one. Starts a subprocess, so it is
+    # gated on allow_shell as well and is off unless explicitly enabled.
+    code_check_deep: bool = field(default_factory=lambda: os.environ.get("CODE_CHECK_DEEP", "0") == "1")
     # Log the fully assembled prompt (redacted, and only when log_chat_content
     # is not "disabled") plus the task state, budget and lane for every model
     # call. Off by default: it is verbose and it writes conversation text.
@@ -734,7 +749,8 @@ class Config:
         "test_command", "auto_iterate_rounds", "agent_run_timeout", "code_max_tokens",
         # Multi-turn task continuity.
         "task_state_enabled", "task_artifact_chars", "drift_check_enabled",
-        "artifact_reply_headroom", "debug_prompts",
+        "artifact_reply_headroom", "artifact_patch_chars", "code_check_enabled",
+        "code_check_deep", "debug_prompts",
         # Logging: enabling DEBUG/TRACE and disabling content logs at runtime.
         "log_level", "log_format", "log_chat_content",
         # Routing factors, tunable live so a two-Mac cluster can be dialled in.
@@ -1014,6 +1030,7 @@ class Config:
         self.code_max_tokens = min(32768, max(256, self.code_max_tokens))
         self.task_artifact_chars = min(200_000, max(0, self.task_artifact_chars))
         self.artifact_reply_headroom = min(8192, max(0, self.artifact_reply_headroom))
+        self.artifact_patch_chars = min(200_000, max(0, self.artifact_patch_chars))
         self.route_sla_ms = min(3600000, max(0, self.route_sla_ms))
         self.route_cooldown_s = min(3600.0, max(0.0, self.route_cooldown_s))
         self.agent_run_timeout = min(3600.0, max(10.0, self.agent_run_timeout))

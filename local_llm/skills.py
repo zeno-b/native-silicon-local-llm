@@ -268,13 +268,23 @@ class SkillLibrary:
         positive much less likely than a missed one, and a miss only costs the
         model the chance to ask for the skill itself.
         """
-        words = {w for w in re.findall(r"[a-z0-9]+", (query or "").lower()) if len(w) > 2}
+        # SUBJECT words only, the same rule retrieval uses. Counting every word
+        # over two letters meant a skill matched on the words every request has
+        # in common with every skill: "WRITE a powershell module FOR system
+        # config" overlapped "Score a page for SEO health and WRITE a report" on
+        # {write, for} and cleared a threshold of two, and the turn was then told
+        # "You have a written procedure for this. Follow it." over an SEO
+        # scorer. rag_query_tokens exists precisely because "write" and
+        # "program" match nearly anything; this had its own weaker copy.
+        words = rag_query_tokens(query)
         if len(words) < min_overlap:
             return None
         best: tuple[int, Skill] | None = None
         for skill in self.list():
-            haystack = f"{skill.name} {skill.description} {' '.join(skill.tags)}".lower()
-            overlap = len(words & set(re.findall(r"[a-z0-9]+", haystack)))
+            haystack = f"{skill.name} {skill.description} {' '.join(skill.tags)}"
+            # The skill side is filtered the same way, so a description padded
+            # with filler cannot buy itself overlap either.
+            overlap = len(words & rag_query_tokens(haystack.replace("-", " ")))
             if overlap >= min_overlap and (best is None or overlap > best[0]):
                 best = (overlap, skill)
         return best[1] if best else None

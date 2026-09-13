@@ -22,6 +22,7 @@ from .tools import *  # noqa: F401,F403
 from .llm import *  # noqa: F401,F403
 from .model_client import *  # noqa: F401,F403
 from .textutil import *  # noqa: F401,F403
+from .codecheck import check_code, findings_note
 from .taskstate import *  # noqa: F401,F403
 
 
@@ -393,6 +394,12 @@ class Agent:
         writing code, a follow-up on it is a code turn, and a turn that has to
         reproduce an existing artifact gets at least what that artifact costs.
         """
+        # A question about the work is not a request to re-emit it. This has to
+        # match turn_mode() exactly: when they disagreed, a question mid-task
+        # got the 512-token chat budget AND a brief demanding the complete file,
+        # so it was cut off mid-function every time and never answered.
+        if self.explaining(message, task):
+            return requested
         code = is_code_request(message)
         if not code and task is not None and task.is_code_task():
             code = bool(is_modification_request(message)
@@ -408,6 +415,44 @@ class Agent:
                       self.config.context_size - CONTEXT_SAFETY_MARGIN - 768)
         return max(1, min(wanted, ceiling))
 
+    @staticmethod
+    def explaining(message: str, task: "TaskState | None") -> bool:
+        """True when this turn answers a question about the artifact.
+
+        Only meaningful mid-task: with no artifact there is nothing to explain,
+        and the ordinary lanes already handle a bare question.
+        """
+        if task is None or not task.is_code_task() or not task.artifact:
+            return False
+        if is_continue_request(message) or parse_correction(message):
+            return False
+        return is_explanation_request(message)
+
+    def turn_mode(self, message: str, task: "TaskState | None", reserve: int) -> str:
+        """What this turn is for: "explain", "patch" or "build".
+
+        The one place the decision is made, so the reply budget, the brief and
+        the rules cannot disagree about it.
+
+        "patch" is chosen either because the artifact is long enough that
+        re-emitting it is the dominant cost of the turn, or -- and this is the
+        safety net -- because the reply budget physically cannot hold the file.
+        Asking for a complete file that does not fit is a guaranteed truncation,
+        and doing it anyway is what corrupted the artifact twice in one session.
+        """
+        if task is None or not task.is_code_task():
+            return "build"
+        if self.explaining(message, task):
+            return "explain"
+        if not task.artifact:
+            return "build"
+        threshold = self.config.artifact_patch_chars
+        if threshold and len(task.artifact) > threshold:
+            return "patch"
+        if estimate_tokens(task.artifact) > max(0, reserve - 64):
+            return "patch"
+        return "build"
+
     def artifact_chars_for(self, reserve: int) -> int:
         """Characters of the artifact allowed into the prompt for this budget.
 
@@ -421,7 +466,8 @@ class Agent:
         room = max(0, self.config.context_size - reserve - CONTEXT_SAFETY_MARGIN)
         return int(min(self.config.task_artifact_chars, (room // 2) * CHARS_PER_TOKEN))
 
-    def task_brief(self, task: "TaskState | None", reserve: int) -> str:
+    def task_brief(self, task: "TaskState | None", reserve: int,
+                   mode: str = "build") -> str:
         """The ACTIVE TASK block for this turn, or "" when there is no task."""
         if not self.config.task_state_enabled or task is None or not task.is_active():
             return ""
@@ -432,7 +478,41 @@ class Agent:
                 f"{self.config.context_size}-token context; the middle is omitted "
                 "and the model is told to patch rather than rewrite.", logging.INFO)
         verify = bool(self.config.allow_shell and self.registry.get("run_shell"))
-        return task.brief(artifact_chars=allowed, verify_hint=verify)
+        return task.brief(artifact_chars=allowed, verify_hint=verify, mode=mode)
+
+    def checked_answer(self, answer: str, task: "TaskState | None") -> str:
+        """Append a short list of real problems found in the code in `answer`.
+
+        Advisory: it never rewrites and never blocks. The point is that a
+        problem the pipeline can see mechanically should not reach the user
+        unmentioned -- `Set-WmiObject` is not a cmdlet, a function that shadows
+        `Start-Service` and calls it recurses forever, and both went out ten
+        times in a row because nothing ever parsed the output.
+        """
+        if not self.config.code_check_enabled or not answer:
+            return answer
+        default_language = task.language if task is not None else ""
+        blocks = extract_code_blocks(strip_truncation_note(answer))
+        if not blocks:
+            return answer
+        deep = bool(self.config.code_check_deep and self.config.allow_shell)
+        findings: list = []
+        try:
+            for info, code in blocks:
+                language = canonical_language(info) or default_language
+                if not language or len(code.strip()) < 40:
+                    continue
+                findings.extend(check_code(code, language, deep=deep))
+                if len(findings) >= 4:
+                    break
+        except Exception as exc:
+            log(f"code check skipped: {exc}", logging.DEBUG)
+            return answer
+        if not findings:
+            return answer
+        log(f"code check found {len(findings)} problem(s) in the reply: "
+            + "; ".join(f.message[:80] for f in findings), logging.INFO)
+        return append_below_answer(answer, findings_note(findings[:4]))
 
     def trace_prompt(self, where: str, messages: list[dict], **fields: Any) -> None:
         """Log the prompt that is actually about to be sent, behind debug_prompts.
@@ -479,6 +559,11 @@ class Agent:
         """
         if not self.config.drift_check_enabled or task is None or not answer:
             return answer, ""
+        # A question about the work is answered in prose and may legitimately
+        # quote a snippet in another language. Running the drift check on it is
+        # how an explanation turn got regenerated as a code dump.
+        if self.explaining(user_message, task):
+            return answer, ""
         problem = detect_drift(task, answer)
         if not problem:
             return answer, ""
@@ -496,15 +581,26 @@ class Agent:
         if retry and not detect_drift(task, retry):
             return retry, (f"that reply drifted ({problem}); regenerated it as "
                            f"{task.language}")
-        # Still wrong, or nothing came back. Say so and ask, keeping the text so
-        # nothing is thrown away silently.
-        kept = retry or answer
+        # Still wrong after a corrective pass. Name the language it keeps
+        # producing, so accepting the switch is one short sentence rather than a
+        # re-explanation of the whole task.
+        elsewhere = drifted_languages(task, retry or answer)
+        # Still wrong after a corrective pass. Ask, and ask ONLY -- appending the
+        # drifted output under the question was the worst of both: it did not
+        # block, it doubled the cost of an already-wasted turn, and because the
+        # whole thing was stored as the answer, the next "continue" resumed the
+        # question text along with the code and replayed the preamble verbatim.
+        # The text is not lost: it is on the turn's own record via the events.
         question = (
             f"Before I go further: {problem}. The task I have recorded is "
             f"{task.language} — {task.artifact_name or 'the current artifact'}"
             + (f" on {task.platform}" if task.platform else "")
-            + ". Do you want me to keep working on that, or switch? "
-              "Here is what I produced, in case it is what you wanted:\n\n" + kept)
+            + (f". Say \"port it to {'/'.join(elsewhere)}\" and I will retarget the "
+               f"task, keeping the objective and every requirement; say \"stay on "
+               f"{task.language}\" and I will try again."
+               if elsewhere else
+               ". Do you want me to keep working on that, or switch?")
+        )
         return question, f"could not stay on task ({problem}); asking you instead"
 
     @staticmethod
@@ -552,10 +648,14 @@ class Agent:
                 request = f"{task.objective}\n\nMost recent request: {request}" \
                     if request else task.objective
             return request, partial
-        # Nothing in the visible history, but the state remembers an artifact
-        # that was cut off: resume that.
-        if task is not None and task.artifact and not task.artifact_complete:
-            return task.objective, task.artifact
+        # Nothing in the visible history, but the state remembers something cut
+        # off: resume that. resumable(), not `artifact`, because a partial is
+        # now parked BESIDE the last complete version rather than on top of it
+        # -- overwriting the whole file with a truncated one is what let a bad
+        # turn destroy work the user could no longer get back.
+        pending = task.resumable() if task is not None else ""
+        if pending:
+            return task.objective, pending
         return None
 
     # How much of a trailing incomplete line is worth discarding to give the
@@ -603,6 +703,15 @@ class Agent:
         # ends it mid-statement. The block can only legitimately close at the end.
         if partial.count("```") % 2 == 1:
             extra = re.sub(r"^\s*```[A-Za-z0-9+#.-]*[ \t]*\n?", "", extra, count=1)
+        # The model restarted from the top instead of resuming. Told not to, a
+        # small model still does it, and concatenating then hands back the whole
+        # answer twice -- which the artifact checker now rejects as a duplicated
+        # block, so the turn produces nothing at all. Detect it here, where the
+        # right answer is obvious: the restart IS the answer, complete on its
+        # own, so keep it and drop the partial.
+        head = partial.lstrip()[:200]
+        if len(head) >= 60 and extra.lstrip().startswith(head):
+            return extra.lstrip()
         # The longest suffix of the partial that the continuation repeats.
         window = partial[-400:]
         for size in range(len(window), 15, -1):
@@ -770,6 +879,7 @@ class Agent:
         if getattr(stats, "finish_reason", "") == "length":
             answer = answer.rstrip() + truncation_note(
                 self.client.reply_budget(messages, reserve, quiet=True))
+        answer = self.checked_answer(answer, task)
         self.partial_add(conversation_id, extra)
         if task is not None:
             # The stitched artifact is the new current one, and whether it is
@@ -792,7 +902,9 @@ class Agent:
             "continued": True,
         }
 
-    async def route(self, message: str, history: list[dict] | None = None) -> dict:
+    async def route(self, message: str, history: list[dict] | None = None,
+                    task: "TaskState | None" = None,
+                    stats: "GenerationStats | None" = None) -> dict:
         """Ask the model how to handle a message, as one structured decision.
 
         The router menu is generated from the registry: every tool that declares
@@ -804,10 +916,26 @@ class Agent:
         The model reads the message (with a little history so follow-ups resolve)
         and picks. On any parse failure it biases to a web search when one exists,
         so a genuine lookup is never silently answered from stale weights.
+
+        `task` is what stops a follow-up about the work from becoming a web
+        search. "how about the c port" was routed to web_search with the query
+        "c port", which returned a water-softener portal and a Wikipedia page on
+        USB-C: the router saw four words with the conversation stripped out, and
+        four words about an artifact look exactly like four words about the
+        world. `stats` folds the router's own call into the turn's totals, which
+        it was never doing.
         """
         routable = self.registry.routable()
         if not routable:
             # Nothing to route to; the model answers everything itself.
+            return {"action": "answer"}
+        # A message that points at the artifact is about the artifact. No search
+        # engine knows what "it", "that" or "the c port" refers to here, and the
+        # model does, because the brief is in front of it.
+        if (task is not None and task.is_active() and task.artifact
+                and refers_to_active_task(message)):
+            log("routing: the message refers to the active task, so it is "
+                "answered from the task rather than looked up.", logging.DEBUG)
             return {"action": "answer"}
 
         # The menu: an answer option plus one line per routable tool, taken
@@ -856,9 +984,15 @@ class Agent:
         fallback = {"action": "answer"}
 
         try:
-            text, _ = await self.client.complete_with_stats(
+            text, got = await self.client.complete_with_stats(
                 context, max_tokens=64, temperature=0.0
             )
+            # The router is a real model call. Not accounting for it is exactly
+            # the omission the turn footer exists to prevent.
+            if stats is not None and got is not None:
+                stats.prompt_tokens += got.prompt_tokens
+                stats.completion_tokens += got.completion_tokens
+                stats.total_ms += got.total_ms
         except Exception as exc:
             log(f"Router call failed ({exc}); falling back.", logging.WARNING)
             return fallback
@@ -1063,21 +1197,78 @@ class Agent:
         while scratch and fixed + messages_tokens(scratch) > target:
             oldest = scratch.pop(0)
             collapsed += 1
-            content = (oldest.get("content") or "").strip()
-            if not content:
+            line = self.condense_turn(oldest)
+            if not line:
                 continue
-            if content.startswith(self.SUMMARY_MARKER):
-                # Fold a previous summary in rather than nesting them.
-                carried = [line[2:] for line in content.splitlines()[1:]] + carried
-            elif oldest.get("role") == "user":
-                carried.append(content.split("\n")[0][:120])
+            if line is True:
+                # A previous summary: fold its lines in rather than nesting.
+                content = (oldest.get("content") or "").strip()
+                carried = [row[2:] for row in content.splitlines()[1:]] + carried
+            else:
+                carried.append(line)
 
         if carried:
             scratch.insert(0, {
                 "role": "user",
-                "content": self.SUMMARY_MARKER + "\n" + "\n".join(f"- {line}" for line in carried[-12:]),
+                "content": self.SUMMARY_MARKER + "\n"
+                + "\n".join(f"- {line}" for line in self.fit_summary(carried, budget)),
             })
         return collapsed
+
+    # Share of the step budget the condensed summary may occupy. The summary
+    # has to be big enough to carry facts and small enough that inserting it
+    # does not immediately re-trigger a collapse -- which would also destroy the
+    # prefix-extension property the whole compaction scheme exists to protect.
+    SUMMARY_BUDGET_SHARE = 0.15
+    SUMMARY_MAX_LINES = 12
+
+    def fit_summary(self, carried: list[str], budget: int) -> list[str]:
+        """The newest carried lines, each trimmed to an equal share of the cap.
+
+        Fixed per-line limits do not work across context sizes: 500 characters
+        a line is a reasonable digest in a 32k window and is most of a 4k one.
+        """
+        lines = carried[-self.SUMMARY_MAX_LINES:]
+        if not lines:
+            return []
+        allowed = int(max(240, budget * self.SUMMARY_BUDGET_SHARE) * CHARS_PER_TOKEN)
+        per_line = max(60, allowed // len(lines))
+        return [line[:per_line] for line in lines]
+
+    # How much of a collapsed tool result is kept. A tool result is the only
+    # thing in the trace that carries FACTS, so it gets real room; the model's
+    # own notes get a fraction of it.
+    CONDENSED_RESULT_CHARS = 1200
+    CONDENSED_NOTE_CHARS = 160
+
+    def condense_turn(self, turn: dict) -> "str | bool":
+        """One line standing in for a collapsed trace entry.
+
+        "" to drop it, True when it is a previous summary the caller should fold
+        in, otherwise the text to carry.
+
+        The bug this replaces: a tool result is stored as a user turn whose
+        FIRST LINE is the header "TOOL RESULT [web_search]:", and the collapse
+        carried exactly that first line. So on any run long enough to compact,
+        every fact the tools had gathered was replaced by a list of identical
+        headers, and the model was left to answer from a summary that said
+        nothing while the dedup guard stopped it fetching any of it again.
+        running_summary in this same class had always done it properly; the two
+        simply never agreed.
+        """
+        content = (turn.get("content") or "").strip()
+        if not content:
+            return ""
+        if content.startswith(self.SUMMARY_MARKER):
+            return True
+        if content.startswith(("TOOL RESULT", "PAGE TEXT")):
+            # Drop the trailing directive: it is an instruction to the model for
+            # a step that has already happened, not a finding.
+            body = content.split("\n\n")[0] if "\n\n" in content else content
+            return " ".join(body.split())[:self.CONDENSED_RESULT_CHARS]
+        if turn.get("role") == "assistant":
+            return "note: " + " ".join(content.split())[:self.CONDENSED_NOTE_CHARS]
+        return " ".join(content.split())[:self.CONDENSED_NOTE_CHARS]
 
     def assemble(self, base: list[dict], scratch: list[dict], reserve: int) -> tuple[list[dict], int]:
         """base + the trace. base is fixed and can never be evicted.
@@ -1314,7 +1505,8 @@ class Agent:
         turn_start_changed = set(self.registry.changed_files)
         for round_i in range(rounds + 1):
             last_final = None
-            async for ev in self.run(current, history, conversation_id, max_tokens, temperature):
+            async for ev in self.run(current, history, conversation_id, max_tokens,
+                                     temperature, internal=round_i > 0):
                 if ev.get("type") == "final":
                     last_final = ev
                     if not verify:
@@ -1352,10 +1544,29 @@ class Agent:
                                   "check only. Start with --allow-shell to auto-run tests."}
 
             if not problems:
-                yield {"type": "notice", "info": True,
-                       "message": "changes verified \u2713 (" +
-                                  ("syntax + tests" if (self.config.allow_shell and test_cmd) else "syntax")
-                                  + ")"}
+                # Say what was actually checked. "verified (syntax)" was printed
+                # after a pass that looked at .py files only, so a turn that
+                # rewrote shell or Go was reported as verified having had
+                # nothing examined at all.
+                parsed, shallow = self.registry.checked_languages(new_files)
+                if parsed or shallow:
+                    parts = []
+                    if parsed:
+                        parts.append("parsed: " + ", ".join(parsed))
+                    if shallow:
+                        # Not the same claim as "it parses". Say which one.
+                        parts.append("structure only: " + ", ".join(shallow))
+                    if self.config.allow_shell and test_cmd:
+                        parts.append("tests")
+                    message = "changes verified \u2713 (" + "; ".join(parts) + ")"
+                else:
+                    message = ("no syntax checker for "
+                               + ", ".join(sorted({Path(f).suffix or "?"
+                                                   for f in new_files})[:4])
+                               + "; the changes were NOT verified")
+                    if self.config.allow_shell and test_cmd:
+                        message = "tests passed \u2713 (no syntax checker for these files)"
+                yield {"type": "notice", "info": True, "message": message}
                 if last_final:
                     yield last_final
                 return
@@ -1452,8 +1663,15 @@ class Agent:
         max_tokens: int | None = None,
         temperature: float | None = None,
         cancel: asyncio.Event | None = None,
+        internal: bool = False,
     ) -> AsyncGenerator[dict, None]:
-        """Yield events: context, step, token, tool_call, tool_result, final, error, cancelled."""
+        """Yield events: context, step, token, tool_call, tool_result, final, error, cancelled.
+
+        `internal` marks a message this process wrote rather than the user (the
+        auto-iterate fix request). Such a message must not be folded into the
+        task state: it is not a requirement, not a correction, and not "the
+        latest user request".
+        """
         started = time.time()
         reserve = max_tokens or self.config.max_tokens
         known = set(self.registry.names())
@@ -1493,7 +1711,14 @@ class Agent:
             # without this an abandoned task ("forget that, what time is it")
             # would still be sitting in the database on the next turn.
             self.clear_task(conversation_id)
-        correction = task.note_request(user_message) if self.config.task_state_enabled else None
+        # note_request records requirements, corrections and the "latest user
+        # request" line in the brief, all of which are meant to be the USER's
+        # words. run_iterating re-enters run() with a machine-written fix
+        # request ("Your edits did not pass verification. Problems found: ...")
+        # and 200 chars of compiler output were being filed as a permanent
+        # requirement that every later turn was then briefed to satisfy.
+        correction = (task.note_request(user_message)
+                      if self.config.task_state_enabled and not internal else None)
         if correction:
             log(f"user correction applied to the task state: {task.summary()}",
                 logging.INFO)
@@ -1615,6 +1840,11 @@ class Agent:
         # looks like chat and is really a request to re-emit a whole script.
         requested_reserve = reserve
         reserve = self.reply_reserve(user_message, reserve, task)
+        # What the turn is for, decided once. The brief, the rules and the
+        # budget all read this, so they cannot contradict each other the way
+        # they did when a question got a chat budget and a "reply with the
+        # complete updated file" instruction in the same prompt.
+        mode = self.turn_mode(user_message, task, reserve)
 
         # The task brief goes LAST in the per-turn context, immediately before
         # the user's own words, and rides on the user turn rather than the
@@ -1624,14 +1854,24 @@ class Agent:
         # One id per generation attempt, so a later "continue" (and the logs)
         # can tell which generation the partial artifact came from.
         generation_id = task.begin_generation()
-        brief = self.task_brief(task, reserve)
+        brief = self.task_brief(task, reserve, mode)
         extra_context = "\n\n".join(
             part for part in (skill_context, reference_context, brief) if part)
         base, dropped = self.build_base(history, user_message, reserve,
                                         extra_context=extra_context,
                                         active_code_task=bool(brief and task.is_code_task()))
-        if dropped:
-            yield {"type": "context", "dropped": dropped, "tokens": messages_tokens(base)}
+        # Reported ONCE per turn, not once per prompt build. This used to fire
+        # here and again after the lane was picked, and the internals line
+        # restated both, so a single turn said "trimmed N old messages" three
+        # times with two different values. The number that matters is the one
+        # that applies to the prompt actually sent, so it is held until the lane
+        # has settled and emitted just before generation starts.
+        history_total = len([t for t in (history or [])
+                             if t.get("role") in ("user", "assistant") and t.get("content")])
+        pending_context = {"type": "context", "dropped": dropped,
+                           "kept": max(0, history_total - dropped),
+                           "total": history_total,
+                           "tokens": messages_tokens(base)} if dropped else None
         if brief:
             # Only once there is something to continue: on the turn that STARTS
             # the task there is no artifact and "continuing" would be a lie.
@@ -1647,8 +1887,12 @@ class Agent:
             if self.config.show_internals:
                 yield {"type": "detail", "message":
                        f"active task: {task.summary()}; brief "
-                       f"{estimate_tokens(brief)} tokens, reply budget {reserve} "
-                       f"(asked for {requested_reserve})"
+                       f"{estimate_tokens(brief)} tokens, {mode} turn, reply budget "
+                       f"{reserve}"
+                       + (f" (your Max tokens is {requested_reserve}; widened to "
+                          f"{reserve} because this turn has to produce code)"
+                          if reserve > requested_reserve else
+                          f" (asked for {requested_reserve})")
                        + (", user correction applied" if correction else "")}
 
         # Answer-lane state. Defined here, not inside the routing branch below:
@@ -1701,7 +1945,8 @@ class Agent:
             # fit the context, so a 2797-token prompt in a 4096-token window
             # leaves about 1100 whatever "Max tokens" says. Quoting the request
             # sent people to Settings to raise a number that was not the limit.
-            return answer.rstrip() + truncation_note(effective_reserve)
+            return answer.rstrip() + truncation_note(
+                effective_reserve, requested_reserve, self.config.context_size)
 
         def account(stats_obj) -> None:
             """Fold one model call's cost into the turn totals.
@@ -1729,6 +1974,22 @@ class Agent:
                 if truncated:
                     task.artifact_complete = False
                 self.save_task(conversation_id, task)
+                # record_artifact may have refused the reply: a cut-off or
+                # spliced version is not allowed to overwrite a whole one. That
+                # is a decision the user has to see, or the next turn silently
+                # builds on a file they think changed and did not.
+                if task.rejected_reason:
+                    log(f"artifact replacement refused: {task.rejected_reason}",
+                        logging.WARNING)
+                    answer = append_below_answer(
+                        answer, "\n\n---\n*Kept the previous version of "
+                        f"{task.artifact_name or 'the file'}: "
+                        f"{task.rejected_reason}.*")
+            # Last gate before the text leaves: does the code in it actually
+            # parse? Nothing in this pipeline used to look, so ten consecutive
+            # versions of a module went out with a function shadowing a builtin
+            # and recursing into itself, and each turn built on the last.
+            answer = self.checked_answer(answer, task)
             return {
                 "type": "final",
                 # Strip protocol scaffolding HERE, at the one point every lane
@@ -2101,7 +2362,9 @@ class Agent:
                     # But if the router reaches for a web lookup on a plain coding
                     # request that does not need one, write the code instead.
                     yield {"type": "phase", "label": "deciding how to handle this"}
-                    decision = await self.route(user_message, history)
+                    route_stats = GenerationStats()
+                    decision = await self.route(user_message, history, task, route_stats)
+                    account(route_stats)
                     if decision.get("action") in ("web_search", "fetch_url") and not needs_lookup:
                         decision = {"action": "answer"}
                 elif needs_lookup:
@@ -2112,7 +2375,9 @@ class Agent:
                     decision = {"action": "answer"}
             else:
                 yield {"type": "phase", "label": "deciding how to handle this"}
-                decision = await self.route(user_message, history)
+                route_stats = GenerationStats()
+                decision = await self.route(user_message, history, task, route_stats)
+                account(route_stats)
 
             action = decision.get("action")
             tool = None if action == "answer" else self.registry.get(action or "")
@@ -2154,6 +2419,9 @@ class Agent:
                     if not error:
                         trace.append({"name": action, "args": args,
                                       "result": result[:1000], "error": None})
+                        if pending_context is not None:
+                            yield pending_context
+                            pending_context = None
                         yield done(result.strip(), 0)
                         return
                     scratch.append({"role": "assistant", "content": f"I tried {action} and it failed."})
@@ -2196,16 +2464,29 @@ class Agent:
                     extra_context=extra_context,
                     active_code_task=bool(brief and task.is_code_task()))
                 prose_lane = True
-                # Only re-report a trim that is still a trim: the UI renders
-                # this as "trimmed N old messages", and N=0 is not a trim.
-                if dropped_prose and dropped_prose != dropped:
-                    yield {"type": "context", "dropped": dropped_prose,
-                           "tokens": messages_tokens(base)}
+                # The prose lane drops ~1500 tokens of tool protocol and can
+                # therefore keep more history. It replaces the held report
+                # rather than adding a second one: two different trim counts for
+                # one turn is noise, and the honest number is the one describing
+                # the prompt that is actually sent.
+                dropped = dropped_prose
+                pending_context = {"type": "context", "dropped": dropped_prose,
+                                   "kept": max(0, history_total - dropped_prose),
+                                   "total": history_total,
+                                   "tokens": messages_tokens(base)} if dropped_prose else None
                 ev = detail(f"answer lane: prose prompt, no tools ({before} -> "
-                            f"{messages_tokens(base)} prompt tokens, {dropped} -> "
-                            f"{dropped_prose} history messages dropped)")
+                            f"{messages_tokens(base)} prompt tokens, "
+                            f"{history_total - dropped_prose} of {history_total} "
+                            f"history messages kept)")
                 if ev:
                     yield ev
+
+            # The lane has settled, so the single trim report can go out now:
+            # every path from here either enters the step loop or returns, and
+            # both must still tell the user what was dropped.
+            if pending_context is not None:
+                yield pending_context
+                pending_context = None
 
             # Incremental reasoning: if the question is a hard analytical one and
             # nothing was seeded (a pure "answer" that isn't code), decompose it
@@ -2300,6 +2581,10 @@ class Agent:
                         answer = "Here is what I worked out:\n" + joined
                     yield done(answer, len(steps))
                     return
+
+        if pending_context is not None:
+            yield pending_context
+            pending_context = None
 
         for step in range(1, self.config.agent_max_steps + 1):
             if cancel is not None and cancel.is_set():

@@ -142,24 +142,75 @@ _NEG_PHRASE = re.compile(
 # Guards: leading tokens that look negative/positive but are not feedback.
 _NOT_FEEDBACK = re.compile(
     r"^\s*(?:no\s+(?:way|idea|one|problem|worries|clue)|not\s+sure|"
-    r"right\s+(?:now|away)|yes\s+(?:and|but|please)\b)", re.I)
+    r"right\s+(?:now|away)|yes\s+(?:and|but|please)\b|"
+    # "no" as a determiner, not a verdict: "no timeout is needed here" is a
+    # statement about the design, and treating it as a rejection re-asks the
+    # previous request instead of acting on it.
+    r"no\s+\w+\s+(?:is|are|was|were|will|would|should|needs?|needed|required)\b)",
+    re.I)
+
+# What may follow a lead word and still leave the message pure feedback. Anything
+# else means the word was doing grammatical work -- "GOOD, now add retries",
+# "CORRECT the typo on line 4", "NO timeout is needed here" -- rather than
+# judging the answer. A lead-word verdict therefore has to consume the WHOLE
+# message, the same reasoning as the continuation pattern: a verdict that is
+# only a prefix is a guess about a sentence that went on to say something else.
+_FEEDBACK_TAIL = re.compile(
+    r"(?i)^[\s,.!]*(?:that|this|it|thanks?|thank\s+you|ty|cheers|"
+    r"mate|man|perfect|great|now|indeed|much\s+better|"
+    r"very\s+much|a\s+lot|so\s+much|"
+    r"answer|one|work[s]?|"
+    # A second verdict word is still just a verdict: "yes exactly", "no, wrong".
+    r"exactly|right|correct|wrong|incorrect|nope|no+|yes+|"
+    r"is\s+(?:right|correct|wrong|incorrect)|"
+    r"was\s+(?:right|correct|wrong|incorrect))*[\s,.!?]*$")
+
+# Praise that is immediately withdrawn. "thanks, but it still fails" was being
+# stored as a POSITIVE training example of the very answer the user had just
+# said did not work -- and positive/negative labels here are not advisory, they
+# become the LoRA dataset.
+_WITHDRAWN = re.compile(
+    r"(?i)\b(?:but|however|though|except|although)\b|"
+    r"\b(?:still|again)\s+(?:\w+\s+){0,2}"
+    r"(?:fail|fails|failing|wrong|broken|error|errors|crash|crashes|off)\b|"
+    r"\b(?:does\s*n[o']?t|doesn'?t|did\s*n[o']?t|didn'?t|is\s*n[o']?t|isn'?t|"
+    r"won'?t|can'?t|cannot)\b")
 
 
 def classify_implicit_feedback(message: str) -> int | None:
-    """+1 if the message praises the prior answer, -1 if it rejects it, else None."""
+    """+1 if the message praises the prior answer, -1 if it rejects it, else None.
+
+    Conservative by design, because this is not advisory: a verdict here is
+    written to the feedback table and becomes a training example. A wrong label
+    teaches the model that a bad answer was good, and a wrong NEGATIVE also
+    makes the chat handler re-ask the previous request and throw away what the
+    user actually just said. None is always the safe answer.
+    """
     m = (message or "").strip()
     if not m:
         return None
     if _NOT_FEEDBACK.match(m):
         return None
-    short = len(m.split()) <= 6
+    withdrawn = bool(_WITHDRAWN.search(m))
     if _POS_PHRASE.search(m):
-        return 1
+        return None if withdrawn else 1
     if _NEG_PHRASE.search(m):
         return -1
-    if short and _POS_LEAD.match(m):
-        return 1
-    if short and _NEG_LEAD.match(m):
+    short = len(m.split()) <= 6
+    if not short:
+        return None
+    # Asymmetric on purpose. A false POSITIVE teaches the model that a bad
+    # answer was good and there is nothing downstream to catch it, so praise has
+    # to consume the whole message: "good, now add retries" is an instruction
+    # with a courtesy on the front, not an endorsement.
+    match = _POS_LEAD.match(m)
+    if match and _FEEDBACK_TAIL.match(m[match.end():]):
+        return None if withdrawn else 1
+    # A rejection is left looser. "no c++ just an empty json?" names what was
+    # wrong in the same breath, and the retry path carries the user's own words
+    # to the model as the complaint, so the instruction is not lost the way a
+    # mislabelled positive is.
+    if _NEG_LEAD.match(m):
         return -1
     return None
 
@@ -445,15 +496,46 @@ def unwrap_answer(text: str) -> str:
 TRUNCATION_NOTE = re.compile(r"\n*\[cut off at the \d+-token reply limit[^\]]*\]\s*$")
 
 
-def truncation_note(limit: int) -> str:
-    """The marker note_if_cut appends. Keep in sync with TRUNCATION_NOTE."""
-    return (f"\n\n[cut off at the {limit}-token reply limit \u2014 raise "
-            "\"Max tokens\" in Settings, or ask me to continue]")
+def truncation_note(limit: int, requested: int = 0, context_size: int = 0) -> str:
+    """The marker note_if_cut appends. Keep in sync with TRUNCATION_NOTE.
+
+    The advice has to be true. "Raise Max tokens in Settings" was printed on
+    turns where the harness had already widened the user's 512 to 1536 on its
+    own and the real ceiling was the context window, so following it changed
+    nothing. When the effective limit is not the user's setting, say which one
+    actually bit.
+    """
+    if requested and limit > requested:
+        reason = (f" \u2014 your Max tokens is {requested}, already widened to "
+                  f"{limit} for code; ask me to continue")
+    elif context_size and limit + 256 >= context_size:
+        reason = (f" \u2014 the {context_size}-token context window is the limit "
+                  "here, not Max tokens; ask me to continue")
+    else:
+        reason = " \u2014 raise \"Max tokens\" in Settings, or ask me to continue"
+    return f"\n\n[cut off at the {limit}-token reply limit{reason}]"
 
 
 def was_truncated(text: str) -> bool:
     """True if this stored assistant message ends in the truncation marker."""
     return bool(TRUNCATION_NOTE.search(text or ""))
+
+
+def append_below_answer(text: str, extra: str) -> str:
+    """Append a footnote while keeping the truncation note last.
+
+    was_truncated anchors to the END of the string, and it is the only evidence
+    the continuation lane has that an answer stopped at the budget rather than
+    at its natural end. Anything appended after it therefore does not merely
+    look untidy: it turns "continue" back into an ordinary question.
+    """
+    body = text or ""
+    if not (extra or "").strip():
+        return body
+    match = TRUNCATION_NOTE.search(body)
+    if not match:
+        return body.rstrip() + extra
+    return body[:match.start()].rstrip() + extra + "\n" + match.group(0).strip()
 
 
 def strip_truncation_note(text: str) -> str:
@@ -470,18 +552,109 @@ def strip_truncation_note(text: str) -> str:
 # caller requires that the previous answer was ACTUALLY truncated as well, so
 # both signals must agree before a turn is treated as a continuation and a long
 # instruction that merely opens with "continue" is never hijacked.
+# A continuation request carries NO new instruction, and the whole string has to
+# be consumed to prove it. As a prefix match this hijacked real work: "more
+# tests please", "finish the parser" and "go ahead and add retries" were all
+# read as "resume the previous answer", so whenever the previous reply had been
+# cut off -- which on a small local model is most of them -- the user's actual
+# instruction was dropped on the floor and never reached the model.
 CONTINUE_REQUEST = re.compile(
-    r"(?i)^\s*(?:please\s+|ok(?:ay)?[,\s]+|yes[,\s]+|and\s+)?"
+    r"(?i)^\s*(?:please\s+|ok(?:ay)?[,\s]+|yes[,\s]+|and\s+|just\s+)*"
     r"(?:continue|carry\s+on|keep\s+going|go\s+on|go\s+ahead|resume|"
-    r"finish\s+(?:it|that|this|up)?|the\s+rest|rest\s+of\s+it|more)\b")
+    r"finish\s+(?:it|that|this|up)?|(?:the\s+)?rest|more)"
+    # Only continuation-shaped tails, never a new object.
+    r"(?:\s+(?:of\s+(?:it|that|this)|from\s+where\s+(?:you|it)\s+\w+|"
+    r"where\s+you\s+left\s+off|with\s+(?:it|that|this)|for\s+me|now|"
+    r"pl(?:ease|z)|then))*"
+    r"[\s,.!]*$")
 
 
 def is_continue_request(message: str) -> bool:
-    """True for a short "continue" style follow-up. Pair with was_truncated."""
+    """True for a short "continue" style follow-up. Pair with was_truncated.
+
+    A full match, not a prefix one: anything trailing the continue word is a new
+    instruction, and resuming instead of reading it silently discards it.
+    """
     text = (message or "").strip()
     if not text or len(text) > 80:
         return False
     return bool(CONTINUE_REQUEST.match(text))
+
+
+# A question ABOUT code rather than a request to change it. The failure this
+# exists for: mid-task, "whats the logic behind SetHardwareInfo(...)" is a
+# request for an explanation, but every gate upstream saw an active code task
+# and briefed the model to re-emit the whole file -- into a 512-token chat
+# budget, so it was cut off mid-function and the question was never answered.
+_EXPLAIN_LEAD = re.compile(
+    r"(?i)^\s*(?:and\s+|so\s+|but\s+|ok(?:ay)?[,\s]+|please\s+|"
+    r"can\s+you\s+|could\s+you\s+)*"
+    r"(?:what(?:'?s| is| are| does| do| was| were)?|why|how\s+(?:does|do|did|is|are|"
+    r"come)|explain|describe|walk\s+me\s+through|tell\s+me\s+(?:about|why|how|what)|"
+    r"where\s+(?:does|do|is|are)|when\s+(?:does|do|is|are)|which\s+\w+\s+(?:does|do|is|are)|"
+    r"is\s+(?:that|this|it|there)|are\s+(?:those|these|they)|does\s+(?:that|this|it)|"
+    r"do\s+(?:those|these|they)|should\s+(?:i|we|that|this|it))\b")
+
+# Asking for a change, even when the sentence opens like a question. "can you
+# add error handling" is a modification; "what does this do" is not.
+_EXPLAIN_NOT = re.compile(
+    r"(?i)\b(add|append|extend|include|implement|rewrite|refactor|port|convert|"
+    r"translate|fix|correct|change|modify|update|remove|delete|drop|replace|"
+    r"rename|split|merge|optimi[sz]e|simplify|harden|improve|make\s+it|"
+    r"give\s+me|show\s+me\s+the\s+(?:code|file|script)|write)\b")
+
+
+def is_explanation_request(message: str) -> bool:
+    """True for a question ABOUT the work rather than a change to it.
+
+    Gates two things that have to agree: whether the reply budget is the chat
+    budget, and whether the task brief demands the whole file back. They
+    disagreed, and a question mid-task got a "reply with the complete updated
+    file" instruction on a 512-token budget.
+
+    Deliberately conservative: a message that also asks for a change ("why is
+    that slow, can you fix it") is a change, because answering it as prose only
+    would drop half the request.
+    """
+    text = " ".join((message or "").split())
+    if not text or len(text) > 400:
+        return False
+    if not _EXPLAIN_LEAD.match(text) and "?" not in text:
+        return False
+    if _EXPLAIN_NOT.search(text):
+        return False
+    # A quoted code fragment is normal in "what does this do: <code>", so a
+    # fenced block is not by itself evidence of a code request here.
+    return bool(_EXPLAIN_LEAD.match(text) or text.rstrip().endswith("?"))
+
+
+# Pointing at work already in progress: a pronoun, or a definite reference to
+# the thing being built. Used to keep the router's hands off a follow-up.
+_ACTIVE_TASK_REFERENCE = re.compile(
+    r"(?i)(?:^|\b)(?:it|its|it'?s|that|this|these|those|them|"
+    r"the\s+(?:\w+\s+){0,2}(?:script|code|file|program|programme|module|"
+    r"function|port|thing|one|artifact|above)|"
+    r"(?:the|your|my)\s+(?:last|previous|earlier|first|second)\b|"
+    r"what\s+(?:you|we)\s+(?:wrote|produced|made|had|did))\b")
+
+
+def refers_to_active_task(message: str) -> bool:
+    """True when a short message is about work already under way.
+
+    Length-bounded: a long message carries enough of its own subject that the
+    router can judge it, while "how about the c port" carries none at all and
+    becomes a literal two-word search query the moment it leaves this context.
+    """
+    text = " ".join((message or "").split())
+    if not text or len(text.split()) > 14:
+        return False
+    if _URL_IN_TEXT.search(text):
+        return False                    # a link is a lookup, whatever else it says
+    if is_time_sensitive(text):
+        # "the latest version of X" points at the world, not at the artifact,
+        # however definite the article is.
+        return False
+    return bool(_ACTIVE_TASK_REFERENCE.search(text))
 
 
 def is_code_request(message: str) -> bool:
@@ -576,9 +749,27 @@ def top_result_urls(search_text: str, limit: int) -> list[str]:
 # Result blocks look like "N. Title\n   URL\n   snippet" (see _web_search). This
 # splits a result block into (title, url, snippet) records in engine order.
 _RESULT_HEAD = re.compile(r"^\s*\d+\.\s+(.*)$")
-_STOPWORDS = frozenset(
-    "the a an of to for and or in on at is are be with how what why when who "
-    "which that this from into your you my our their his her its as by".split())
+# The user pointing at their own material: their project, a repo, a path, a
+# filename. A code request WITHOUT any of these ("write a basic c++ crud
+# program") wants code from the model's own knowledge, and pulling indexed
+# documents into it only spends context and derails the answer.
+_PROJECT_REFERENCE = re.compile(
+    r"(\bthis (?:project|repo|repository|codebase|file|function|class|module|"
+    r"script|code|bug|error|test|package)\b"
+    r"|\b(?:my|our) (?:project|repo|repository|codebase|code ?base|code|file|"
+    r"files|script|scripts|module|function|class|tests?)\b"
+    r"|\b(?:in|from|of|open|read|edit|patch|review) (?:the )?(?:file|files|repo|"
+    r"repository|codebase|project)\b"
+    r"|\b[\w-]+\.(?:py|js|ts|tsx|jsx|rs|go|c|h|cc|cpp|hpp|cs|java|rb|php|swift|"
+    r"kt|sh|zsh|sql|html|css|json|toml|yaml|yml|md|txt|ipynb)\b"
+    r"|[~.]?/[\w.-]+/[\w.-]+)",
+    re.I,
+)
+
+
+def refers_to_project(message: str) -> bool:
+    """True if the message points at the user's own files, repo or project."""
+    return bool(_PROJECT_REFERENCE.search(message or ""))
 
 
 def _parse_search_results(search_text: str) -> list[tuple[str, str, str]]:
@@ -605,56 +796,6 @@ def _parse_search_results(search_text: str) -> list[tuple[str, str, str]]:
             snippet_lines.append(raw.strip())
     flush()
     return records
-
-
-def _query_tokens(query: str) -> set[str]:
-    toks = re.findall(r"[a-z0-9]+", (query or "").lower())
-    return {t for t in toks if len(t) >= 3 and t not in _STOPWORDS}
-
-
-# Words that carry intent but no topic. They are fine for reranking search
-# results (every candidate there already matches the query), but as a
-# knowledge-base overlap signal they are noise: "write a basic c++ crud program"
-# shares "write" and "program" with almost any indexed document, which is how an
-# unrelated 4KB reference block got prepended to a request to write C++.
-# Retrieval must fire on subject words or not at all.
-_RAG_GENERIC = frozenset(
-    "write writing wrote create creating creation make making made build "
-    "building built generate generating generation implement implementing "
-    "code coding program programme script snippet function example examples "
-    "basic simple quick small full complete short long new please help show "
-    "give tell explain need want like about thing things stuff way ways "
-    "some any all more most best good nice fix fixing add adding use using "
-    "work works working try trying get getting got let lets".split())
-
-
-def rag_query_tokens(query: str) -> set[str]:
-    """Subject tokens of a query, for deciding whether retrieval has anything to
-    contribute. Intent verbs and filler are dropped; see _RAG_GENERIC."""
-    return {t for t in _query_tokens(query) if t not in _RAG_GENERIC}
-
-
-# The user pointing at their own material: their project, a repo, a path, a
-# filename. A code request WITHOUT any of these ("write a basic c++ crud
-# program") wants code from the model's own knowledge, and pulling indexed
-# documents into it only spends context and derails the answer.
-_PROJECT_REFERENCE = re.compile(
-    r"(\bthis (?:project|repo|repository|codebase|file|function|class|module|"
-    r"script|code|bug|error|test|package)\b"
-    r"|\b(?:my|our) (?:project|repo|repository|codebase|code ?base|code|file|"
-    r"files|script|scripts|module|function|class|tests?)\b"
-    r"|\b(?:in|from|of|open|read|edit|patch|review) (?:the )?(?:file|files|repo|"
-    r"repository|codebase|project)\b"
-    r"|\b[\w-]+\.(?:py|js|ts|tsx|jsx|rs|go|c|h|cc|cpp|hpp|cs|java|rb|php|swift|"
-    r"kt|sh|zsh|sql|html|css|json|toml|yaml|yml|md|txt|ipynb)\b"
-    r"|[~.]?/[\w.-]+/[\w.-]+)",
-    re.I,
-)
-
-
-def refers_to_project(message: str) -> bool:
-    """True if the message points at the user's own files, repo or project."""
-    return bool(_PROJECT_REFERENCE.search(message or ""))
 
 
 def rank_result_urls(search_text: str, query: str, limit: int) -> list[str]:
@@ -876,6 +1017,7 @@ __all__ = [
     'truncation_note',
     'was_truncated',
     'strip_truncation_note',
+    'append_below_answer',
     'CODE_NEEDS_LOOKUP',
     'CODE_OBJECT',
     'REASONING_SIGNAL',
@@ -895,6 +1037,8 @@ __all__ = [
     '_NEG_LEAD',
     '_NEG_PHRASE',
     '_NOT_FEEDBACK',
+    '_FEEDBACK_TAIL',
+    '_WITHDRAWN',
     '_POS_LEAD',
     '_POS_PHRASE',
     '_RESULT_URL',
@@ -908,6 +1052,11 @@ __all__ = [
     'extractable_text_len',
     'fast_path_call',
     'is_code_request',
+    'is_explanation_request',
+    'refers_to_active_task',
+    '_ACTIVE_TASK_REFERENCE',
+    '_EXPLAIN_LEAD',
+    '_EXPLAIN_NOT',
     'is_low_value_url',
     'is_reasoning_question',
     'is_substantive',
