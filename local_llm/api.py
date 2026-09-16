@@ -66,7 +66,7 @@ def _define_api_models() -> None:
     global SkillRequest
     if ChatRequest is not None:
         return
-    from pydantic import BaseModel, Field
+    from pydantic import BaseModel, Field, create_model
 
     class ChatRequest(BaseModel):  # noqa: F811
         message: str = Field(..., min_length=1, max_length=32000)
@@ -95,30 +95,51 @@ def _define_api_models() -> None:
     class ChatResponse(BaseModel):  # noqa: F811
         answer: str
 
-    class ConfigRequest(BaseModel):  # noqa: F811
-        system_prompt: str | None = Field(None, max_length=8000)
-        max_tokens: int | None = Field(None, ge=16, le=32768)
-        temperature: float | None = Field(None, ge=0.0, le=2.0)
-        context_size: int | None = Field(None, ge=512, le=1048576)
-        history_turns: int | None = Field(None, ge=0, le=200)
-        agent_enabled: bool | None = None
-        agent_max_steps: int | None = Field(None, ge=1, le=20)
-        # search_backend is intentionally absent: the provider is locked to
-        # DuckDuckGo Lite and cannot be set via the API.
-        search_results: int | None = Field(None, ge=1, le=10)
-        tool_result_chars: int | None = Field(None, ge=200, le=40000)
-        tool_raw_chars: int | None = Field(None, ge=200, le=200000)
-        tool_temperature: float | None = Field(None, ge=0.0, le=2.0)
-        disable_thinking: bool | None = None
-        fast_path: bool | None = None
-        stable_prefix: bool | None = None
-        summarise_tool_results: bool | None = None
-        summarise_over_chars: int | None = Field(None, ge=500, le=100000)
-        # The local codebase the file tools work on. Absent from this schema the
-        # Set button in the Codebase panel was inert: Pydantic dropped the key
-        # before config.apply() saw it, so the UI reported success and nothing
-        # changed. "" clears it (back to the sandbox workspace).
-        project_dir: str | None = Field(None, max_length=1000)
+    # The settings schema is GENERATED from Config.MUTABLE rather than written
+    # out by hand. Hand-writing it drifted badly: 105 of the 126 mutable fields
+    # had no entry here, so Pydantic dropped them from the body before
+    # config.apply() ever saw them and POST /api/config answered 200 having
+    # changed nothing. That is the failure the project_dir note below records,
+    # found once and then repeated across five sixths of the settings.
+    #
+    # This is safe because MUTABLE is already the allowlist of what may change
+    # at runtime, and it is deliberately narrow: allow_shell, allow_python, the
+    # model id, the adapter and search_backend are all absent from it, as is
+    # every secret. The asserts below hold that line if MUTABLE ever grows.
+    # Ranges are not repeated here either -- Config.apply() clamps every field
+    # and reports anything it moved as changed, so the clamp is the single
+    # authority on bounds and the UI shows the value actually adopted.
+    _STRING_CAPS = {"system_prompt": 8000, "identity": 4000, "project_dir": 1000,
+                    "rag_scope": 2000, "test_command": 1000,
+                    "large_model_markers": 500}
+    # The type comes from the default value rather than the annotation: this
+    # module runs under `from __future__ import annotations`, so a dataclass
+    # field's .type is the string "int", not the class. bool is checked first --
+    # it is a subclass of int, and an int-typed toggle would accept 7.
+    _defaults = Config()
+    _fields: dict = {}
+    for _name in Config.MUTABLE:
+        _value = getattr(_defaults, _name, None)
+        if isinstance(_value, bool):
+            _fields[_name] = (bool | None, Field(None))
+        elif isinstance(_value, int):
+            _fields[_name] = (int | None, Field(None))
+        elif isinstance(_value, float):
+            _fields[_name] = (float | None, Field(None))
+        elif isinstance(_value, str):
+            _fields[_name] = (str | None,
+                              Field(None, max_length=_STRING_CAPS.get(_name, 2000)))
+        # Anything else stays env-only: apply() would not know how to coerce it.
+
+    assert not (set(_fields) & set(Config.SECRET_FIELDS)), "a secret reached the settings schema"
+    for _blocked in ("allow_shell", "allow_python", "search_backend", "model", "adapter"):
+        assert _blocked not in _fields, f"{_blocked} must not be settable at runtime"
+    # project_dir is the one field that needs more than a clamp: an unchecked
+    # value would be stored and every file tool would fail later with a
+    # confusing error, so the endpoint resolves it and refuses a non-directory.
+    assert "project_dir" in _fields, "the Codebase panel's Set button needs this"
+
+    ConfigRequest = create_model("ConfigRequest", **_fields)  # noqa: F811
 
     class ToolRequest(BaseModel):  # noqa: F811
         name: str = Field(..., min_length=1, max_length=64)
@@ -934,6 +955,7 @@ def create_app(
             "model_healthy": model_healthy,
             "agent_enabled": config.agent_enabled,
             "agent_max_steps": config.agent_max_steps,
+            "agent_min_steps": config.agent_min_steps,
             "model": config.model,
             "context_size": config.context_size,
             "max_tokens": config.max_tokens,
@@ -1965,6 +1987,7 @@ def create_app(
             "search_backend": config.search_backend,
             "agent_enabled": config.agent_enabled,
             "agent_max_steps": config.agent_max_steps,
+            "agent_min_steps": config.agent_min_steps,
         }
 
     @app.post("/api/tools/call")

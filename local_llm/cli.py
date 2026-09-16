@@ -81,6 +81,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--agent", action="store_true", default=os.environ.get("AGENT_ENABLED") == "1",
                         help="Enable the tool-calling agent loop by default.")
     parser.add_argument("--agent-max-steps", type=int, default=int(os.environ.get("AGENT_MAX_STEPS", "6")))
+    parser.add_argument("--agent-min-steps", type=int,
+                        default=int(os.environ.get("AGENT_MIN_STEPS", "2")),
+                        help="steps the agent must take before it may settle on an "
+                             "answer; 1 means answer as soon as it can")
     parser.add_argument("--allow-python", action="store_true", default=os.environ.get("ALLOW_PYTHON") == "1",
                         help="Expose a run_python tool. The model gets code execution on this machine.")
     parser.add_argument("--allow-shell", action="store_true", default=os.environ.get("ALLOW_SHELL") == "1",
@@ -167,6 +171,7 @@ def build_config(args) -> Config:
         "history_turns": args.history_turns,
         "agent_enabled": args.agent,
         "agent_max_steps": args.agent_max_steps,
+        "agent_min_steps": args.agent_min_steps,
         "allow_python": args.allow_python,
         "allow_shell": args.allow_shell,
         "agent_tools": args.agent_tools,
@@ -419,7 +424,8 @@ def main() -> None:
     log(f"Model: {config.model}")
     log(f"System prompt: {config.system_prompt[:60]}...")
     log(f"Context: {config.context_size} tokens, max_tokens {config.max_tokens}, temperature {config.temperature}")
-    log(f"Agent: {'on' if config.agent_enabled else 'off'}, max steps {config.agent_max_steps}, "
+    log(f"Agent: {'on' if config.agent_enabled else 'off'}, steps "
+        f"{config.agent_min_steps}-{config.agent_max_steps}, "
         f"tools: {', '.join(registry.names())}")
     log(f"Adapter: {config.adapter} ({model_manager.adapter_path() or 'base model'})")
     scheduled = [t for t in db.list_tasks() if t["enabled"] and t["interval_seconds"]]

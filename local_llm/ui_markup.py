@@ -472,8 +472,28 @@ UI_BODY = r"""</style>
          <label class="agent-toggle" title="Toggle agent mode"><span class="switch"><input id="agentToggle" type="checkbox"><span class="slider"></span></span> tools + step reasoning</label>
        </div>
        <div>
-         <label>Max steps</label>
+         <label data-tip="Hard ceiling on steps in one turn. The agent stops here and salvages what it has.">Max steps</label>
          <input id="cfgAgentSteps" type="number" min="1" max="20" step="1">
+       </div>
+     </div>
+     <div class="row">
+       <div>
+         <label data-tip="Steps the agent must take before it may settle. At 1 it answers the moment it can, which is what most turns do. At 2 or more the first reply is treated as a draft and reviewed, costing one extra generation per step but catching the answers a small model fires off without thinking.">Min steps</label>
+         <input id="cfgAgentMinSteps" type="number" min="1" max="20" step="1">
+       </div>
+       <div>
+         <label data-tip="Break a hard question into a plan and work it one step at a time, then synthesise. The most expensive path here: one model call per step plus a synthesis.">Decompose hard questions</label>
+         <label class="agent-toggle" title="Toggle incremental reasoning"><span class="switch"><input id="cfgIncrementalReasoning" type="checkbox"><span class="slider"></span></span> plan, then step through</label>
+       </div>
+     </div>
+     <div class="row">
+       <div>
+         <label data-tip="How many analytical cues (compare, trade-offs, why does, evaluate) make a question worth decomposing. 2 is the default and leaves most questions on the one-pass path; 1 decomposes anything with a single cue in it, which is much slower and much more thorough. A question with no cue at all is never decomposed.">Reasoning cues needed</label>
+         <input id="cfgReasoningSignals" type="number" min="1" max="6" step="1">
+       </div>
+       <div>
+         <label data-tip="Length at which a single cue is enough on its own. Lower it to decompose shorter questions.">Single-cue length</label>
+         <input id="cfgReasoningMinChars" type="number" min="0" max="2000" step="10">
        </div>
      </div>
      <div class="row">

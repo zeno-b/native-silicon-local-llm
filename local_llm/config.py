@@ -193,6 +193,15 @@ class Config:
     auto_fetch_char_cap: int = field(default_factory=lambda: int(
         os.environ.get("AUTO_FETCH_CHAR_CAP") or _default_fetch_cap(TOTAL_RAM_GB)))
     agent_max_steps: int = field(default_factory=lambda: int(os.environ.get("AGENT_MAX_STEPS", "6")))
+    # How hard the agent thinks about an ordinary question. A small model answers
+    # the instant it can, not the instant it should: four out of five turns used
+    # to end at step 1 with whatever the first pass produced. Below
+    # agent_min_steps the loop refuses to settle on a plain-text reply -- it
+    # hands the draft back with a critique instruction and spends another step
+    # improving it. 1 restores the old one-shot behaviour; every step above it
+    # costs one more generation per turn, which on 8GB is seconds, not
+    # milliseconds. Never exceeds agent_max_steps.
+    agent_min_steps: int = field(default_factory=lambda: int(os.environ.get("AGENT_MIN_STEPS", "2")))
     # Resilience under memory pressure. When a generation errors (a model-server
     # OOM kill and watchdog restart look like a dropped connection from here), the
     # turn retries with a smaller token budget rather than surfacing an error.
@@ -299,6 +308,15 @@ class Config:
     chunk_trigger_ratio: float = field(default_factory=lambda: float(os.environ.get("CHUNK_TRIGGER_RATIO", "0.6")))
     chunk_size_ratio: float = field(default_factory=lambda: float(os.environ.get("CHUNK_SIZE_RATIO", "0.4")))
     reasoning_max_steps: int = field(default_factory=lambda: int(os.environ.get("REASONING_MAX_STEPS", "6")))
+    # When a question is worth decomposing rather than answering in one pass.
+    # reasoning_signals is how many analytical cues ("compare", "trade-offs",
+    # "why does") make it automatic; reasoning_min_chars is the length at which
+    # a single cue is enough on its own. Lower either one and more questions get
+    # the full treatment -- a plan, a model call per step, then a synthesis --
+    # which is the most expensive path here, so these are the latency-for-depth
+    # dial. reasoning_signals=1 decomposes anything with one cue in it.
+    reasoning_signals: int = field(default_factory=lambda: int(os.environ.get("REASONING_SIGNALS", "2")))
+    reasoning_min_chars: int = field(default_factory=lambda: int(os.environ.get("REASONING_MIN_CHARS", "80")))
     # Hard wall-clock cap per reasoning step. Distinct from stall_timeout (which
     # only fires on zero output): this bounds a step that streams slowly but
     # never finishes, so a single step can never wedge the whole chain.
@@ -732,7 +750,7 @@ class Config:
         "skill_retire_loss_rate",
         "max_tokens", "temperature", "repetition_penalty",
         "repetition_context_size", "repetition_penalty_enabled", "context_size",
-        "history_turns", "agent_enabled", "agent_max_steps",
+        "history_turns", "agent_enabled", "agent_max_steps", "agent_min_steps",
         # search_backend is intentionally NOT mutable: the provider is locked to
         # DuckDuckGo Lite and cannot be changed from the UI or the API.
         "search_results", "tool_result_chars", "tool_raw_chars", "auto_fetch_results",
@@ -741,6 +759,7 @@ class Config:
         # Safeguards, all tunable live so a machine can be dialled in without a
         # restart or an env edit.
         "incremental_reasoning", "reasoning_max_steps", "reasoning_step_timeout",
+        "reasoning_signals", "reasoning_min_chars",
         "reasoning_tokens", "chunk_large_prompts", "chunk_trigger_ratio",
         "chunk_size_ratio", "auto_fetch_char_cap", "stall_timeout", "ready_wait_timeout",
         "decode_floor_tps", "max_generation_timeout",
@@ -882,6 +901,7 @@ class Config:
 
         before = {name: getattr(self, name) for name in
                   ("context_size", "max_tokens", "temperature", "agent_max_steps",
+                   "agent_min_steps",
                    "history_turns", "search_results", "tool_result_chars",
                    "tool_temperature", "summarise_over_chars")}
         self.context_size = min(131072, max(512, self.context_size))
@@ -892,6 +912,9 @@ class Config:
         self.tool_temperature = min(2.0, max(0.0, self.tool_temperature))
         self.summarise_over_chars = max(500, self.summarise_over_chars)
         self.agent_max_steps = min(20, max(1, self.agent_max_steps))
+        # A minimum above the maximum would loop until the step budget ran out
+        # and then salvage, which is the opposite of thinking harder.
+        self.agent_min_steps = min(self.agent_max_steps, max(1, self.agent_min_steps))
         self.resilient_retries = min(6, max(0, self.resilient_retries))
         self.min_max_tokens = min(512, max(32, self.min_max_tokens))
         self.stall_timeout = min(600, max(10, self.stall_timeout))
@@ -903,6 +926,11 @@ class Config:
         # The cap can never be below the ordinary step budget.
         self.hard_step_cap = min(60, max(self.agent_max_steps, self.hard_step_cap))
         self.reasoning_max_steps = min(10, max(2, self.reasoning_max_steps))
+        # 1 is as low as it goes: a message with no analytical cue at all is
+        # never decomposed, so 0 would mean the same thing as 1 while reading
+        # like "always".
+        self.reasoning_signals = min(6, max(1, self.reasoning_signals))
+        self.reasoning_min_chars = min(2000, max(0, self.reasoning_min_chars))
         self.reasoning_step_timeout = min(300, max(10, self.reasoning_step_timeout))
         self.retrieval_deadline = min(600.0, max(15.0, self.retrieval_deadline))
         self.auto_iterate_rounds = min(5, max(0, self.auto_iterate_rounds))
@@ -998,8 +1026,23 @@ class Config:
         # constructor value), it is forced back to DuckDuckGo Lite here.
         self.search_backend = _normalize_search_backend(self.search_backend)
 
+        # Anything that is not "docker" means the local sandbox at the two call
+        # sites that read this, so junk was already safe -- but, as with
+        # log_level, it must not be stored and displayed as if it were in use.
+        self.exec_backend = (str(self.exec_backend or "local").strip().lower()
+                             if str(self.exec_backend or "").strip().lower()
+                             in ("local", "docker") else "local")
+
         # --- Logging -------------------------------------------------------- #
+        # Held to a level the logger will actually adopt. level_from_name()
+        # already falls back to INFO on junk, so an unrecognised name was
+        # harmless at the consumer -- but it was still stored and shown in
+        # Settings, which is the one thing this pass is not allowed to do:
+        # report a setting the process is not using.
         self.log_level = str(self.log_level or "INFO").strip().upper() or "INFO"
+        if self.log_level not in ("CRITICAL", "ERROR", "WARNING", "INFO",
+                                  "DEBUG", "TRACE", "NOTSET"):
+            self.log_level = "INFO"
         if str(self.log_format).strip().lower() not in ("json", "text"):
             self.log_format = "json"
         else:

@@ -707,10 +707,21 @@ UI_JS_CHAT = r"""
            traceNotice(trace, line, kept !== 0);
            bumpActivity(trace);
          } else if (event.type === "step") {
-           // Show which step is active and out of how many, always.
-           trace.stepLabel = "step " + event.step + (event.max_steps ? "/" + event.max_steps : "");
+           // Only label the step once the turn is genuinely multi-step. Four
+           // out of five turns end at step 1, so a permanent "step 1/6" prefix
+           // carries no information and reads like a counter that is stuck.
+           trace.stepLabel = event.step > 1
+             ? "step " + event.step + (event.max_steps ? "/" + event.max_steps : "")
+             : "";
            setActivity(trace, "thinking\u2026");
            if (trace.answer && trace.answer.node.classList.contains("pending")) {
+             // A new step supersedes whatever streamed during the last one: a
+             // draft about to be revised, or a tool call the model printed
+             // before deciding. Clearing only textContent left `raw` behind, so
+             // the next step's tokens appended to the dead text and the
+             // debounced markdown pass rendered both together.
+             trace.answer.raw = "";
+             trace.answer.rendered = false;
              trace.answer.text.textContent = "";
            }
          } else if (event.type === "think_token") {
@@ -1014,6 +1025,10 @@ UI_JS_CHAT = r"""
        document.getElementById("cfgContext").value = cfg.context_size;
        document.getElementById("cfgHistory").value = cfg.history_turns;
        document.getElementById("cfgAgentSteps").value = cfg.agent_max_steps;
+       document.getElementById("cfgAgentMinSteps").value = cfg.agent_min_steps;
+       document.getElementById("cfgIncrementalReasoning").checked = !!cfg.incremental_reasoning;
+       document.getElementById("cfgReasoningSignals").value = cfg.reasoning_signals;
+       document.getElementById("cfgReasoningMinChars").value = cfg.reasoning_min_chars;
        document.getElementById("cfgSearchBackend").value = cfg.search_backend;
        document.getElementById("cfgSearchResults").value = cfg.search_results;
        document.getElementById("cfgToolChars").value = cfg.tool_result_chars;
@@ -1041,6 +1056,10 @@ UI_JS_CHAT = r"""
        history_turns: Number(document.getElementById("cfgHistory").value),
        agent_enabled: agentToggle.checked,
        agent_max_steps: Number(document.getElementById("cfgAgentSteps").value),
+       agent_min_steps: Number(document.getElementById("cfgAgentMinSteps").value),
+       incremental_reasoning: document.getElementById("cfgIncrementalReasoning").checked,
+       reasoning_signals: Number(document.getElementById("cfgReasoningSignals").value),
+       reasoning_min_chars: Number(document.getElementById("cfgReasoningMinChars").value),
        search_results: Number(document.getElementById("cfgSearchResults").value),
        tool_result_chars: Number(document.getElementById("cfgToolChars2").value ||
                                  document.getElementById("cfgToolChars").value),

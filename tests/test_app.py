@@ -39,7 +39,7 @@ from local_llm.database import Database  # noqa: E402
 from local_llm.model_server import ModelServerManager  # noqa: E402
 from local_llm.training import RetrainManager  # noqa: E402
 from local_llm.tools import ToolRegistry  # noqa: E402
-from local_llm.agent import Agent  # noqa: E402
+from local_llm.agent import Agent, REVISE_DRAFT  # noqa: E402
 from local_llm.llm import GenerationStats, messages_tokens  # noqa: E402
 from local_llm.model_client import ModelClient  # noqa: E402
 from local_llm.skills import SkillLibrary  # noqa: E402
@@ -49,7 +49,7 @@ from local_llm.llm import skills_block, build_plain_system_prompt  # noqa: E402
 from local_llm.obslog import set_acting_user  # noqa: E402
 from local_llm.textutil import (  # noqa: E402
     append_below_answer, is_code_request, is_continue_request,
-    classify_implicit_feedback, is_explanation_request,
+    classify_implicit_feedback, is_explanation_request, is_reasoning_question,
     refers_to_active_task, truncation_note, was_truncated)
 from local_llm.taskstate import (  # noqa: E402
     TaskState, canonical_language, code_language, detect_drift,
@@ -1181,6 +1181,8 @@ class _ScriptedClient:
         self.ready = ready
         self.raises = raises
         self.prompts = []
+        # The routing hint the real client would send to the cluster, per call.
+        self.kinds = []
         self.ready_calls = 0
 
     def _next(self):
@@ -1188,6 +1190,7 @@ class _ScriptedClient:
 
     def stream(self, messages, *a, **kw):
         self.prompts.append(messages)
+        self.kinds.append(kw.get("kind"))
         raises, text = self.raises, self._next()
 
         async def gen():
@@ -1225,9 +1228,13 @@ class _ScriptedClient:
 
 
 def _agent(replies, **overrides):
+    # agent_min_steps=1: these scripts hand the agent one reply per model call,
+    # so the default self-review pass would eat the reply the assertion is about.
+    # The review itself is covered by its own tests below.
     base = dict(agent_enabled=True, knowledge_triage=False, fast_path=False,
                 incremental_reasoning=False, chunk_large_prompts=False,
-                agent_max_steps=3, resilient_retries=2, ready_wait_timeout=0.01,
+                agent_max_steps=3, agent_min_steps=1, resilient_retries=2,
+                ready_wait_timeout=0.01,
                 skills_dir=tempfile.mkdtemp(prefix="local-llm-test-skills-"))
     base.update(overrides)
     cfg = Config(**base)
@@ -3656,3 +3663,208 @@ def test_a_continuation_that_restarts_is_not_returned_twice():
     # Repeated tail: deduplicated rather than doubled.
     tail = "\n    printf(\"a long enough first line to match on\\n\");\n    int x = 1"
     assert Agent.stitch_continuation(partial, tail + ";\n}\n```").count("int x = 1") == 1
+
+
+def test_a_first_draft_is_reviewed_before_it_is_returned():
+    """agent_min_steps is the thinking-depth knob: below it, a plain-text reply
+    is a draft, not the answer. Four out of five turns used to end at step 1
+    with whatever the first pass produced, because a small model answers the
+    moment it can rather than the moment it should."""
+    agent, cfg, db, reg, client = _agent(
+        ["TCP uses a handshake.", "TCP opens a connection with SYN, SYN-ACK, ACK."],
+        agent_min_steps=2, drift_check_enabled=False)
+    events = asyncio.run(_drain(agent))
+    final = [e for e in events if e["type"] == "final"][-1]
+    assert final["answer"] == "TCP opens a connection with SYN, SYN-ACK, ACK."
+    assert final["steps"] == 2, final
+    # The draft went back to the model as its own turn, with the critique after it.
+    revise_prompt = client.prompts[-1]
+    assert revise_prompt[-1]["content"] == REVISE_DRAFT
+    assert revise_prompt[-2]["content"] == "TCP uses a handshake."
+    # Two step events, so the UI can say which pass is running.
+    assert [e["step"] for e in events if e["type"] == "step"] == [1, 2]
+
+
+def test_min_steps_of_one_answers_on_the_first_pass():
+    agent, cfg, db, reg, client = _agent(
+        ["TCP uses a handshake.", "never reached"],
+        agent_min_steps=1, drift_check_enabled=False)
+    final = [e for e in asyncio.run(_drain(agent)) if e["type"] == "final"][-1]
+    assert final["answer"] == "TCP uses a handshake."
+    assert final["steps"] == 1
+
+
+def test_a_revision_that_comes_back_empty_falls_back_to_the_draft():
+    """The draft was worth showing. Losing it to an empty revision would make
+    thinking harder strictly worse than not thinking at all."""
+    agent, cfg, db, reg, client = _agent(
+        ["TCP uses a handshake.", "", "", ""],
+        agent_min_steps=3, agent_max_steps=3, drift_check_enabled=False)
+    final = [e for e in asyncio.run(_drain(agent)) if e["type"] == "final"][-1]
+    assert final["answer"] == "TCP uses a handshake."
+
+
+def test_min_steps_cannot_exceed_max_steps():
+    cfg = Config(agent_max_steps=2, agent_min_steps=9)
+    assert cfg.agent_min_steps == 2
+    assert cfg.apply({"agent_min_steps": 0}) == ["agent_min_steps"]
+    assert cfg.agent_min_steps == 1
+
+
+def _final_answer_call(text):
+    return json.dumps({"tool": "final_answer", "args": {"answer": text}})
+
+
+def test_final_answer_is_reviewed_like_a_plain_text_reply():
+    """final_answer is always registered and is the loop's documented exit, so
+    an answer delivered through it must clear the same gates as one typed as
+    prose. It used to return straight out, which let the model skip the review
+    just by choosing the other syntax for the same reply."""
+    agent, cfg, db, reg, client = _agent(
+        [_final_answer_call("TCP uses a handshake."),
+         "TCP opens a connection with SYN, SYN-ACK, ACK."],
+        agent_min_steps=2, drift_check_enabled=False)
+    events = asyncio.run(_drain(agent))
+    final = [e for e in events if e["type"] == "final"][-1]
+    assert final["answer"] == "TCP opens a connection with SYN, SYN-ACK, ACK."
+    assert final["steps"] == 2, final
+    # The draft went back as prose, not as the JSON the model actually sent:
+    # replaying the tool call teaches it to answer in JSON again.
+    revise_prompt = client.prompts[-1]
+    assert revise_prompt[-1]["content"] == REVISE_DRAFT
+    assert revise_prompt[-2]["content"] == "TCP uses a handshake."
+    # final_answer is the loop's exit, not an action: still no trace node for it.
+    assert not [e for e in events if e.get("type") == "tool_call"]
+
+
+def test_final_answer_goes_through_the_drift_check():
+    """The drift gate hung off the plain-text exit only, so a drifted answer
+    wrapped in final_answer was returned unchecked."""
+    agent, cfg, db, reg, client = _agent(
+        [_final_answer_call(DRIFTED_PYTHON),
+         "```bash\n#!/bin/bash\nset -euo pipefail\ndiskutil list\n```"],
+        agent_min_steps=1)
+    events = asyncio.run(_run(agent, "add more checks and error handling",
+                              _bash_history()))
+    notices = [e.get("message", "") for e in events if e.get("type") == "notice"]
+    assert any("drifted" in n for n in notices), notices
+    final = [e for e in events if e["type"] == "final"][-1]
+    assert "diskutil" in final["answer"], final["answer"]
+
+
+def test_the_fast_path_answer_is_not_sent_back_for_review():
+    """A calculator result is not a draft: there is no model text to improve,
+    and a review pass would spend a generation second-guessing arithmetic."""
+    agent, cfg, db, reg, client = _agent([], agent_min_steps=3, fast_path=True)
+    events = asyncio.run(_drain(agent, "17 * 23"))
+    final = [e for e in events if e["type"] == "final"][-1]
+    assert "391" in final["answer"], final["answer"]
+    assert final["steps"] == 0
+    assert client.prompts == []
+
+
+def test_the_reasoning_bar_is_configurable_in_both_directions():
+    """Decomposition is the most expensive path here, so where the bar sits is
+    a machine-by-machine call rather than a constant."""
+    one_cue = "compare postgres and mysql for a write-heavy workload"
+    assert len(one_cue) < 80
+    # Default: one cue in a short question is answered in one pass.
+    assert is_reasoning_question(one_cue) is False
+    # Two cues, or one cue at length, clear the default bar.
+    assert is_reasoning_question("compare the trade-offs of postgres vs mysql")
+    assert is_reasoning_question(one_cue + " with lots of concurrent writers")
+    # Lower either lever and the same short question decomposes.
+    assert is_reasoning_question(one_cue, signals=1)
+    assert is_reasoning_question(one_cue, min_chars=0)
+    # No analytical cue at all is never decomposed, however low the bar goes.
+    assert is_reasoning_question("what time is it", signals=1, min_chars=0) is False
+
+
+def test_the_agent_applies_the_configured_reasoning_bar():
+    one_cue = "compare postgres and mysql for a write-heavy workload"
+    agent, *_ = _agent([], reasoning_signals=2)
+    assert agent.is_reasoning_question(one_cue) is False
+    eager, *_ = _agent([], reasoning_signals=1)
+    assert eager.is_reasoning_question(one_cue) is True
+    # Clamped, not trusted: 0 would read like "always" and mean nothing, since a
+    # message with no cue never decomposes.
+    assert Config(reasoning_signals=0).reasoning_signals == 1
+    assert Config(reasoning_signals=99).reasoning_signals == 6
+
+
+def test_the_reasoning_bar_also_steers_cluster_routing():
+    """The depth gate and the routing hint read the same classifier, so a box
+    tuned for depth does not keep sending its deep questions to the small node."""
+    one_cue = "compare postgres and mysql for a write-heavy workload"
+    agent, cfg, db, reg, client = _agent(["an answer."], reasoning_signals=1,
+                                         incremental_reasoning=False,
+                                         knowledge_triage=False)
+    asyncio.run(_drain(agent, one_cue))
+    assert client.kinds and client.kinds[0] == "reasoning", client.kinds
+
+
+def test_every_mutable_setting_is_reachable_through_the_api():
+    """ConfigRequest is generated from Config.MUTABLE, not written out by hand.
+
+    Hand-written, it drifted to covering 21 of 126 fields: the other 105 were
+    dropped by Pydantic before config.apply() saw them, so POST /api/config
+    answered 200 with changed: [] and Settings reported success while nothing
+    moved. That is the same failure test_project_dir_can_be_set_from_the_ui
+    documents, found once and repeated across five sixths of the settings.
+    """
+    import local_llm.api as api_mod
+    # The request models are built by create_app, not at import: read them off
+    # the module after the app exists, or you get the None placeholder.
+    app, _, _ = build_app()
+    assert set(api_mod.ConfigRequest.model_fields) == set(Config.MUTABLE)
+
+    with TestClient(app) as c:
+        login(c, "admin", "adminpw123")
+        # Three fields that used to be unreachable, one of each scalar type.
+        patch = {"reasoning_tokens": 384, "drift_check_enabled": False,
+                 "route_cpu_pct": 70.0, "log_level": "DEBUG"}
+        r = c.post("/api/config", json=patch)
+        assert r.status_code == 200, r.text
+        assert set(patch) <= set(r.json()["changed"]), r.json()
+        cfg = c.get("/api/config").json()["config"]
+        for key, value in patch.items():
+            assert cfg[key] == value, (key, cfg[key])
+
+
+def test_the_generated_schema_cannot_open_the_locked_settings():
+    """MUTABLE is the allowlist, and it is deliberately narrow. Generating the
+    schema from it must not widen what a running server will accept."""
+    import local_llm.api as api_mod
+    app, _, _ = build_app()
+    fields = set(api_mod.ConfigRequest.model_fields)
+    # Execution gates, model identity and the search provider are start-up only.
+    for locked in ("allow_shell", "allow_python", "model", "adapter",
+                   "search_backend", "studio_node_url"):
+        assert locked not in fields, locked
+    # No secret may ever be settable, or readable back, through the API.
+    assert not (fields & set(Config.SECRET_FIELDS))
+
+    with TestClient(app) as c:
+        login(c, "admin", "adminpw123")
+        before = c.get("/api/config").json()["config"]
+        r = c.post("/api/config", json={"allow_shell": True, "model": "evil/model"})
+        assert r.status_code == 200
+        assert r.json()["changed"] == [], r.json()
+        after = c.get("/api/config").json()["config"]
+        assert after["allow_shell"] == before["allow_shell"] is False
+        assert after["model"] == before["model"]
+
+
+def test_free_text_settings_are_held_to_values_the_process_uses():
+    """Generating the schema from MUTABLE made these reachable over HTTP. Junk
+    was already harmless at the consumers -- level_from_name falls back to INFO
+    and anything but "docker" means the local sandbox -- but it was stored and
+    shown in Settings, and reporting a setting the process is not using is the
+    one thing apply() promises not to do."""
+    cfg = Config()
+    assert cfg.apply({"log_level": "BANANA", "exec_backend": "rm -rf /"})
+    assert cfg.log_level == "INFO"
+    assert cfg.exec_backend == "local"
+    # Real values still land, case-insensitively.
+    cfg.apply({"log_level": "debug", "exec_backend": "Docker"})
+    assert (cfg.log_level, cfg.exec_backend) == ("DEBUG", "docker")

@@ -190,12 +190,28 @@ every variable with placeholders. Highlights:
 | Office 365 | `O365_TENANT_ID`, `O365_CLIENT_ID`, `O365_CLIENT_SECRET`, `O365_SCOPES` |
 | Cluster/routing | `NODE_ROLE`, `NODE_NAME`, `STUDIO_NODE_URL`, `NODE_TOKEN`, `ROUTE_MAX_ACTIVE`, `ROUTE_QUEUE_DEPTH`, `ROUTE_CPU_PCT`, `ROUTE_LOAD_RATIO`, `ROUTE_MEM_PCT`, `ROUTE_SLA_MS`, `ROUTE_COOLDOWN_S`, `LARGE_MODEL_MARKERS`, `HEARTBEAT_INTERVAL`, `HEARTBEAT_TIMEOUT`, `NODE_PROBE_TIMEOUT` |
 | Admission control | `MAX_CONCURRENT_GENERATIONS`, `GENERATION_QUEUE_DEPTH`, `MAX_CONCURRENT_TASKS`, `AGENT_RUN_TIMEOUT` |
-| Agent/tools | `AGENT_ENABLED`, `AGENT_MAX_STEPS`, `AGENT_TOOLS`, `CODE_MAX_TOKENS`, `PROJECT_DIR`, `ALLOW_SHELL`, `ALLOW_PYTHON` |
+| Agent/tools | `AGENT_ENABLED`, `AGENT_MIN_STEPS`, `AGENT_MAX_STEPS`, `AGENT_TOOLS`, `CODE_MAX_TOKENS`, `PROJECT_DIR`, `ALLOW_SHELL`, `ALLOW_PYTHON` |
 | Task continuity | `TASK_STATE_ENABLED`, `TASK_ARTIFACT_CHARS`, `DRIFT_CHECK_ENABLED`, `ARTIFACT_REPLY_HEADROOM`, `DEBUG_PROMPTS` (see [Multi-turn task continuity](#multi-turn-task-continuity)) |
 | Training | `TRAIN_MIN_EXAMPLES`, `TRAIN_EPOCHS`, `TRAIN_ITERS`, `TRAIN_LR`, `TRAIN_SEQ_LEN`, `TRAIN_BATCH_SIZE`, `TRAIN_NUM_LAYERS`, `TRAIN_FINE_TUNE_TYPE`, `TRAIN_LORA_RANK`, `TRAIN_TOOL_RATIO`, `TRAIN_TOOL_QUALITY`, `TRAIN_REPLAY_RATIO`, `TRAIN_VAL_SPLIT`, `TRAIN_VAL_CHECK`, `TRAIN_TIMEOUT`, `TRAIN_MAX_BACKUPS`, `AUTO_RETRAIN_THRESHOLD` (see [Feedback and LoRA retraining](#feedback-and-lora-retraining)) |
 | Import | `IMPORT_MAX_ZIP_BYTES`, `IMPORT_MAX_FILES`, `IMPORT_MAX_UNCOMPRESSED_BYTES`, `IMPORT_MAX_FILE_BYTES` |
 | Search | `SEARCH_RESULTS` (provider is locked to DuckDuckGo Lite) |
 | Networking | `ALLOWED_ORIGINS` (extra CORS origins behind a proxy; `*` is refused) |
+
+`AGENT_MIN_STEPS` (default 2) is the thinking-depth knob. Below it the agent will
+not settle on a plain-text reply: the first pass is treated as a draft, handed
+back with a critique instruction, and improved on the next step. Set it to 1 to
+get the old behaviour, where a turn ends as soon as the model produces anything.
+Each step above 1 costs one extra generation per turn.
+
+`REASONING_SIGNALS` (default 2) and `REASONING_MIN_CHARS` (default 80) set the
+bar for decomposing a question instead of answering it in one pass: how many
+analytical cues ("compare", "trade-offs", "why does") make it automatic, and the
+length at which a single cue is enough. Decomposition plans the question, spends
+a model call per step and then synthesises, so it is the most expensive path
+here — `REASONING_SIGNALS=1` makes it much more thorough and much slower. A
+message with no cue at all is never decomposed whatever these are set to. The
+same classifier is the cluster routing hint, so lowering the bar also sends more
+turns to the more capable node.
 
 Secrets (`AUTH_ADMIN_PASSWORD`, `OIDC_CLIENT_SECRET`, `O365_CLIENT_SECRET`,
 `NODE_TOKEN`, `AUTH_TEST_PASSWORD`) are never returned by the API or written to
@@ -206,9 +222,19 @@ Most defaults are derived from the machine's RAM rather than hard-coded, so an
 reasoning budget, fetch cap and generation concurrency without configuration.
 `python3 deploy.py --print-config` prints the resolved values.
 
-Admins can change most safe settings live from **Settings** (or `POST /api/config`)
-without a restart, including `LOG_LEVEL`, `LOG_CHAT_CONTENT` and the routing
-thresholds. Secrets and `AUTH_ENABLED` require a restart.
+Admins can change every runtime-safe setting live from **Settings** (or
+`POST /api/config`) without a restart, including `LOG_LEVEL`, `LOG_CHAT_CONTENT`
+and the routing thresholds. The request schema is generated from the same
+`Config.MUTABLE` allowlist that the server enforces, so the two cannot drift
+apart — a field is either settable in both places or neither. Values are clamped
+on the way in and anything the clamp moved comes back in `changed`, so Settings
+never shows a value the process did not adopt.
+
+Deliberately **not** runtime-settable: secrets, `AUTH_ENABLED`, the model id and
+adapter, the search provider, `STUDIO_NODE_URL` (a topology change), and the
+`ALLOW_SHELL` / `ALLOW_PYTHON` execution gates. Those need a restart. Note that
+`EXEC_BACKEND`, `DOCKER_IMAGE` and `TEST_COMMAND` *are* runtime-settable by an
+admin; they only do anything on a server already started with `--allow-shell`.
 
 ---
 

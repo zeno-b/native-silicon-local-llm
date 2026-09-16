@@ -395,22 +395,32 @@ REASONING_SIGNAL = re.compile(
 )
 
 
-def is_reasoning_question(message: str) -> bool:
-    """True if a question is worth decomposing into incremental reasoning steps."""
+def is_reasoning_question(message: str, signals: int = 2, min_chars: int = 80) -> bool:
+    """True if a question is worth decomposing into incremental reasoning steps.
+
+    `signals` is how many analytical cues make it automatic, and `min_chars` the
+    length at which a single cue is enough. Both are exposed as config so the
+    bar can be moved: decomposition is the most expensive thing this pipeline
+    does (one model call per step plus a synthesis), so the right threshold
+    depends on the machine and on how much latency the user will trade for
+    depth. A message with no cue at all never decomposes, whatever they are set
+    to -- the cue list is what distinguishes a question with work in it from
+    one that just needs an answer.
+    """
     text = (message or "").strip()
-    signals = REASONING_SIGNAL.findall(text)
-    if not signals:
+    found = REASONING_SIGNAL.findall(text)
+    if not found:
         return False
-    # Two or more analytical cues (e.g. "compare ... tradeoffs ... vs") means a
+    # Enough analytical cues (e.g. "compare ... tradeoffs ... vs") means a
     # genuinely multi-faceted question regardless of length.
-    if len(signals) >= 2:
+    if len(found) >= max(1, signals):
         return True
     # A single cue plus an explicit step-by-step request, length, or several
     # clauses. A lone short cue ("why is the sky blue") stays one-shot.
     if re.search(r"step by step|think through|walk me through", text, re.I):
         return True
     clauses = text.count(" and ") + text.count(", ") + text.count("?")
-    return len(text) >= 80 or clauses >= 2
+    return len(text) >= min_chars or clauses >= 2
 
 
 # Protocol scaffolding a model wraps its answer in, which must never reach the

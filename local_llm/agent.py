@@ -32,6 +32,18 @@ from .taskstate import *  # noqa: F401,F403
 RAG_HISTORY_FLOOR = 256
 
 
+# Handed back with a draft when a turn tries to finish before agent_min_steps.
+# Deliberately explicit about repeating a correct draft: told only to "improve"
+# it, a 3B model rewrites a right answer into a different one to show willing.
+REVISE_DRAFT = (
+    "That was a draft, not your answer. Read it again against what was actually "
+    "asked: is anything wrong, missing, or stated more confidently than you can "
+    "support? Fix those, then reply with the complete improved answer in plain "
+    "text. Do not describe your changes and do not mention this review. If the "
+    "draft was already correct and complete, repeat it unchanged."
+)
+
+
 class Agent:
     """A ReAct-style loop over the local model.
 
@@ -308,6 +320,9 @@ class Agent:
             agent_tools=",".join(allowed),
             agent_max_steps=min(self.config.agent_max_steps,
                                 self.config.subagent_max_steps),
+            # The parent reviews what comes back, so a self-review inside every
+            # child would multiply the cost of delegating for nothing.
+            agent_min_steps=1,
             # A child that hands work to yet another child, or writes skills of
             # its own from an unrated turn, is not what was asked for.
             delegation_enabled=False,
@@ -1607,6 +1622,18 @@ class Agent:
                 lines.append("note: " + " ".join(content[:300].split()))
         return "\n".join(lines[-12:])
 
+    def is_reasoning_question(self, message: str) -> bool:
+        """The configured version of the module-level gate.
+
+        Both callers go through here so the thresholds mean one thing: what the
+        depth gate decomposes is also what the cluster router sends to the more
+        capable node. Splitting them would let a machine tuned for depth keep
+        routing the deep questions to the small box.
+        """
+        return is_reasoning_question(message,
+                                     signals=self.config.reasoning_signals,
+                                     min_chars=self.config.reasoning_min_chars)
+
     async def plan_steps(self, question: str) -> list[str]:
         """Break a hard question into a short ordered list of sub-questions.
 
@@ -1827,7 +1854,7 @@ class Agent:
         # reasoning/code generation toward the more capable (Studio) node while
         # light chat stays on the primary (Mini). Purely a routing hint: it never
         # changes what the model is asked to do.
-        if is_reasoning_question(user_message) and not task.is_code_task():
+        if self.is_reasoning_question(user_message) and not task.is_code_task():
             gen_kind = "reasoning"
         elif is_code_request(user_message) or (task.is_code_task() and mid_task):
             gen_kind = "code"
@@ -1908,6 +1935,10 @@ class Agent:
         seen_calls: list[str] = []
         trace: list[dict] = []
         nudges = 0
+        # The last answer good enough to show, kept while it is being revised so
+        # a revision that comes back empty falls back to it instead of costing a
+        # forced regeneration of work already done.
+        draft = ""
         # Bounded: a model that keeps inventing tool names gets corrected
         # twice, then answered in prose rather than looping.
         bad_names = 0
@@ -2013,6 +2044,55 @@ class Agent:
                 "checkpoint": (self.registry.checkpoint_id
                                if new_files and self.registry.checkpoint_id else None),
             }
+
+        # Every quality gate an answer clears before the user sees it, in one
+        # place. Both exits from the step loop come through here: a plain-text
+        # reply, and a final_answer tool call. They used to differ, and the
+        # difference was invisible -- an answer delivered as final_answer
+        # skipped the drift check entirely, so the model could sidestep the gate
+        # by choosing the other syntax for the same reply. final_answer is
+        # always registered and is the loop's documented exit, so that was not a
+        # rare path.
+        #
+        # Yields UI events as it goes, then exactly one verdict: __revise__ to
+        # spend another step improving the draft, or __settled__ with the text
+        # to hand back.
+        async def settle(answer: str, cost, step: int):
+            nonlocal draft
+            if step < self.config.agent_min_steps and not internal:
+                # Thinking harder, on purpose. The model answers as soon as it
+                # can rather than as soon as it should, so below the minimum the
+                # first pass is a draft and goes back for another look.
+                # `internal` runs are the auto-iterate fix round, itself already
+                # a revision.
+                draft = answer
+                yield {"type": "phase", "label": "reviewing the draft"}
+                ev = detail(f"draft at step {step}: {len(answer)} chars; revising "
+                            f"to reach the {self.config.agent_min_steps}-step minimum")
+                if ev:
+                    yield ev
+                # The prose answer, not the raw buffer: appending the JSON of a
+                # final_answer call would teach the model to reply in JSON again.
+                scratch.append({"role": "assistant", "content": answer})
+                scratch.append({"role": "user", "content": REVISE_DRAFT})
+                yield {"__revise__": True}
+                return
+            # Does this answer still belong to the task? A strong contradiction
+            # (every code block in a language the task is not) gets one
+            # corrective regeneration rather than being returned.
+            drift_stats = GenerationStats()
+            fixed, drift_note = await self.redirect_drift(
+                task, answer, user_message, history, reserve, temperature, drift_stats)
+            if drift_note:
+                yield {"type": "notice", "info": True, "message": drift_note}
+                # The regeneration is a real model call: account for it, or the
+                # token footer under the answer understates the turn, and report
+                # the cut-off state of the text the user actually gets rather
+                # than of the discarded one.
+                account(drift_stats)
+                yield {"type": "usage", "step": step, **drift_stats.as_event()}
+                answer, cost = fixed, drift_stats
+            yield {"__settled__": note_if_cut(answer, cost)}
 
         # A tiny helper that runs a tool and seeds its result into the loop so
         # the model answers *from* the result instead of dumping it raw. Used by
@@ -2496,7 +2576,7 @@ class Agent:
             if (not scratch and action == "answer"
                     and self.config.incremental_reasoning
                     and not is_code_request(user_message)
-                    and is_reasoning_question(user_message)):
+                    and self.is_reasoning_question(user_message)):
                 yield {"type": "phase", "label": "planning the approach"}
                 steps = await self.plan_steps(user_message)
                 if len(steps) >= 2:
@@ -2847,25 +2927,15 @@ class Agent:
                                       "asking again for plain text"}
                     answer = ""
                 if answer:
-                    # Last gate before the user sees it: does this answer still
-                    # belong to the task? A strong contradiction (every code
-                    # block in a language the task is not) gets one corrective
-                    # regeneration rather than being returned.
-                    drift_stats = GenerationStats()
-                    fixed, drift_note = await self.redirect_drift(
-                        task, answer, user_message, history, reserve, temperature,
-                        drift_stats)
-                    cost = stats
-                    if drift_note:
-                        yield {"type": "notice", "info": True, "message": drift_note}
-                        # The regeneration is a real model call: account for it,
-                        # or the token footer under the answer understates the
-                        # turn, and report the cut-off state of the text the user
-                        # actually gets rather than of the discarded one.
-                        account(drift_stats)
-                        yield {"type": "usage", "step": step, **drift_stats.as_event()}
-                        answer, cost = fixed, drift_stats
-                    yield done(note_if_cut(answer, cost), step)
+                    verdict = None
+                    async for ev in settle(answer, stats, step):
+                        if "__revise__" in ev or "__settled__" in ev:
+                            verdict = ev
+                        else:
+                            yield ev
+                    if "__revise__" in verdict:
+                        continue
+                    yield done(verdict["__settled__"], step)
                     return
                 # An empty reply -- or an unfilled tool call -- is a hiccup, not
                 # an answer. Nudge once. The rejected text is NEVER appended to
@@ -2885,7 +2955,7 @@ class Agent:
                     continue
                 # Out of nudges: one forced tool-free pass beats handing back a
                 # blank turn, which is what yielding "" here did.
-                forced = await self.forced_prose_answer(
+                forced = draft or await self.forced_prose_answer(
                     history, user_message, reserve, temperature, task)
                 yield done(forced or "I could not produce an answer for that. Try "
                                      "rephrasing it, or ask me to continue.", step)
@@ -2899,7 +2969,15 @@ class Agent:
                     # No tool_call event: final_answer is how the loop exits, not
                     # an action worth a trace node. Emitting it rendered a stray
                     # "final_answer:" label above the reply.
-                    yield done(note_if_cut(answer, stats), step)
+                    verdict = None
+                    async for ev in settle(answer, stats, step):
+                        if "__revise__" in ev or "__settled__" in ev:
+                            verdict = ev
+                        else:
+                            yield ev
+                    if "__revise__" in verdict:
+                        continue
+                    yield done(verdict["__settled__"], step)
                     return
                 scratch.append({"role": "assistant", "content": strip_reasoning(buffer).strip()})
                 scratch.append({
