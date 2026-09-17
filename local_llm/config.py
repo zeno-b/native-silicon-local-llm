@@ -180,6 +180,15 @@ class Config:
     # emitting tool-call JSON. Biased toward SEARCH when unsure, since a needless
     # search is cheaper than a confident wrong answer or a refusal.
     knowledge_triage: bool = field(default_factory=lambda: os.environ.get("KNOWLEDGE_TRIAGE", "1") == "1")
+    # Let a tool-free turn switch into agent mode once it is clear it needed
+    # tools after all. The router decides answer-vs-tool before the model has
+    # seen how hard the question is, from one 64-token call on a small model,
+    # and when it guesses wrong the turn is locked out of every tool for the
+    # rest of its life: the reply that came back was "I don't have access to
+    # real-time data", with a working web_search sitting one step away. The
+    # switch fires on the model's OWN report that it lacked a capability, which
+    # is evidence the router never had, and at most once per turn.
+    agent_escalation: bool = field(default_factory=lambda: os.environ.get("AGENT_ESCALATION", "1") == "1")
     # After a lookup search, automatically fetch this many of the top result
     # pages and give the model their full text, not just the snippet. This is
     # what makes one generic search path answer domain-specific questions (a
@@ -754,7 +763,7 @@ class Config:
         # search_backend is intentionally NOT mutable: the provider is locked to
         # DuckDuckGo Lite and cannot be changed from the UI or the API.
         "search_results", "tool_result_chars", "tool_raw_chars", "auto_fetch_results",
-        "disable_thinking", "reasoning_visible", "tool_temperature", "fast_path", "stable_prefix", "knowledge_triage",
+        "disable_thinking", "reasoning_visible", "tool_temperature", "fast_path", "stable_prefix", "knowledge_triage", "agent_escalation",
         "summarise_tool_results", "summarise_over_chars",
         # Safeguards, all tunable live so a machine can be dialled in without a
         # restart or an env edit.
@@ -1104,9 +1113,10 @@ class Config:
 CAPABILITY_GROUPS = {
     "file_ops": {
         "label": "File operations",
-        "description": "Read, search, create and edit files in the project directory.",
+        "description": "Read, search, create and edit files in the project directory, "
+                       "and produce documents (PDF, Word, Excel, PowerPoint).",
         "tools": ["read_file", "write_file", "edit_file", "list_files",
-                  "search_files", "file_info"],
+                  "search_files", "file_info", "create_document"],
     },
     "code_exec": {
         "label": "Run code & shell",

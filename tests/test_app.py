@@ -1276,6 +1276,169 @@ def test_repair_tool_call_maps_a_url_onto_fetch_url():
     db.close()
 
 
+def _no_network(monkeypatch=None):
+    """Pretend the box is online without touching the network.
+
+    The switch into agent mode refuses a lookup it cannot perform, so a test of
+    the switch has to assert connectivity rather than inherit whatever the
+    machine running the suite happens to have.
+    """
+    import local_llm.agent as agent_mod
+
+    async def _online(*_a, **_kw):
+        return True
+
+    previous = agent_mod.has_internet
+    agent_mod.has_internet = _online
+    return previous
+
+
+def _restore_network(previous):
+    import local_llm.agent as agent_mod
+    agent_mod.has_internet = previous
+
+
+def _stub_tool(reg, name, result):
+    """Answer one tool with fixed text instead of going out to the world."""
+    real = reg.call
+
+    def call(tool, args, cid=None):
+        if tool == name:
+            return result, None
+        return real(tool, args, cid)
+
+    reg.call = call
+
+
+def test_a_tool_free_turn_switches_to_agent_mode_when_the_model_says_it_cannot():
+    """Defect: the router picks the lane from one 64-token call before the model
+    has seen the question, and on "answer" the prompt is rebuilt WITHOUT the tool
+    protocol -- so the turn is locked out of every tool for the rest of its life.
+    What came back was "I don't have access to real-time data" with a working
+    web_search one step away, and the user's only recourse was to ask again."""
+    agent, cfg, db, reg, client = _agent([
+        '{"action": "answer"}',                       # the router's guess
+        "I don't have access to real-time data, so I can't tell you today's price.",
+        '{"tool": "web_search", "args": {"query": "bitcoin price"}}',
+        "Bitcoin is trading at $X according to the sources.",
+    ], knowledge_triage=True, agent_max_steps=4, auto_fetch_results=0)
+    _stub_tool(reg, "web_search", "1. Price page\n   https://example.com/btc\n   $X")
+    previous = _no_network()
+    try:
+        events = asyncio.run(_run(agent, "what is the bitcoin price today", []))
+    finally:
+        _restore_network(previous)
+
+    notices = [e["message"] for e in events if e.get("type") == "notice"]
+    assert any("agent mode" in n for n in notices), notices
+    calls = [e["name"] for e in events if e.get("type") == "tool_call"]
+    assert calls == ["web_search"], calls
+    final = [e for e in events if e["type"] == "final"][-1]
+    # The refusal is not the answer, and it never reaches the transcript.
+    assert "don't have access" not in final["answer"], final["answer"]
+    assert "Bitcoin is trading" in final["answer"], final["answer"]
+    # The rebuilt prompt is the tool one: the step after the switch has the tool
+    # protocol in front of the model, which is the whole point of switching.
+    assert "web_search" in "\n".join(m["content"] for m in client.prompts[-2])
+    db.close()
+
+
+def test_a_real_answer_is_never_switched_into_agent_mode():
+    """The other half: a hedge in front of a real answer is not a refusal, and
+    escalating one spends a search and a step on a question already answered."""
+    answer = ("I don't have real-time access, but the TCP handshake is SYN, "
+              "SYN-ACK, ACK. " + "The client opens, the server replies, the client "
+              "confirms. " * 12)
+    agent, cfg, db, reg, client = _agent([
+        '{"action": "answer"}',
+        answer,
+    ], knowledge_triage=True)
+    previous = _no_network()
+    try:
+        events = asyncio.run(_run(agent, "explain how tcp handshakes work", []))
+    finally:
+        _restore_network(previous)
+    assert not [e for e in events if e.get("type") == "tool_call"], "escalated a real answer"
+    final = [e for e in events if e["type"] == "final"][-1]
+    assert "SYN-ACK" in final["answer"]
+    db.close()
+
+
+def test_an_explicit_no_search_override_is_not_overruled_by_the_switch():
+    """/no-search is the user making the same call this switch makes. Overruling
+    it would make the override meaningless."""
+    agent, cfg, db, reg, client = _agent([
+        "I can't access the internet to check that.",
+    ], knowledge_triage=True)
+    previous = _no_network()
+    try:
+        events = asyncio.run(
+            _run(agent, "/no-search what is the latest python release", []))
+    finally:
+        _restore_network(previous)
+    assert not [e for e in events if e.get("type") == "tool_call"], "ignored /no-search"
+    final = [e for e in events if e["type"] == "final"][-1]
+    assert "can't access" in final["answer"], final["answer"]
+    db.close()
+
+
+def test_the_switch_into_agent_mode_happens_at_most_once_per_turn():
+    """A model that refuses twice is not going to be talked into it a third
+    time, and each switch costs a prompt rebuild and a step."""
+    agent, cfg, db, reg, client = _agent([
+        '{"action": "answer"}',
+        "I don't have access to the internet.",
+        "I still cannot browse the web.",
+        "I am unable to access real-time data.",
+    ], knowledge_triage=True, agent_max_steps=4)
+    previous = _no_network()
+    try:
+        events = asyncio.run(_run(agent, "what is the bitcoin price today", []))
+    finally:
+        _restore_network(previous)
+    switches = [e for e in events if e.get("type") == "notice"
+                and "agent mode" in e.get("message", "")]
+    assert len(switches) == 1, [e["message"] for e in events if e.get("type") == "notice"]
+    # And the turn still ends with an answer rather than looping to the cap.
+    assert [e for e in events if e["type"] == "final"]
+    db.close()
+
+
+def test_the_switch_is_off_when_agent_escalation_is_off():
+    agent, cfg, db, reg, client = _agent([
+        '{"action": "answer"}',
+        "I don't have access to real-time data.",
+    ], knowledge_triage=True, agent_escalation=False)
+    previous = _no_network()
+    try:
+        events = asyncio.run(_run(agent, "what is the bitcoin price today", []))
+    finally:
+        _restore_network(previous)
+    assert not [e for e in events if e.get("type") == "tool_call"]
+    final = [e for e in events if e["type"] == "final"][-1]
+    assert "don't have access" in final["answer"]
+    db.close()
+
+
+def test_slash_agent_skips_the_router_and_keeps_the_tools():
+    """/agent is the user switching mode by hand. Asking the router anyway spends
+    a call to be overruled -- and a router that answers "answer" would build the
+    tool-free prompt and lock the turn out of the tools that were the point."""
+    agent, cfg, db, reg, client = _agent([
+        '{"tool": "read_file", "args": {"path": "README.md"}}',
+        "The file starts with a title.",
+    ], knowledge_triage=True, agent_max_steps=3)
+    _stub_tool(reg, "read_file", "# Title\nsome text")
+    events = asyncio.run(_run(agent, "/agent what is in README.md", []))
+    joined = "\n".join(m["content"] for p in client.prompts for m in p)
+    assert "You are a router" not in joined, "the router ran anyway"
+    # The command itself never reaches the model.
+    assert "/agent" not in joined, "the slash command leaked into the prompt"
+    calls = [e["name"] for e in events if e.get("type") == "tool_call"]
+    assert calls == ["read_file"], calls
+    db.close()
+
+
 def test_an_unregistered_tool_name_is_never_dispatched():
     """The observed bug: {"tool": "https://..."} reached the registry, which
 
@@ -3529,6 +3692,258 @@ def test_a_code_request_is_never_answered_on_the_plain_lane():
     # language and no code object of its own.
     assert source.count("has_active_task(conversation_id, uid)") == 2, source.count(
         "has_active_task(conversation_id, uid)")
+
+
+# --------------------------------------------------------------------------- #
+# Document generation
+# --------------------------------------------------------------------------- #
+def _doc_registry(**overrides):
+    base = dict(agent_enabled=True,
+                skills_dir=tempfile.mkdtemp(prefix="local-llm-test-skills-"))
+    base.update(overrides)
+    cfg = Config(**base)
+    db = Database(Path(tempfile.mkdtemp()) / "docs.db")
+    return ToolRegistry(cfg, db), cfg, db
+
+
+SAMPLE_DOC = """# Q3 Platform Review
+
+The cluster ran **without unplanned downtime** all quarter, and the *scheduler*
+rewrite landed in week 6.
+
+## Numbers
+
+| Metric | Q2 | Q3 |
+|---|---|---|
+| Requests | 1420331 | 1893004 |
+| p95 (ms) | 412 | 268 |
+
+## Next steps
+
+- Backfill the weeks lost in the migration
+- Revisit the routing factors
+
+1. Ship the batching change
+2. Re-run the benchmark
+
+```python
+def batch(requests):
+    return requests
+```
+"""
+
+
+def test_every_offered_document_format_produces_a_file_its_reader_accepts():
+    """Defect: the agent could only ever write text. Asked for a PDF or a Word
+    document it wrote Markdown into a .pdf-named file, which no reader opens --
+    or, more often, wrote the report into the chat and produced no file at all.
+
+    The checks here are the ones a reader actually performs: a PDF must carry the
+    header, an xref and its pages; an OOXML file must be a zip whose every part
+    is well-formed XML and whose content types name the parts present.
+    """
+    import zipfile
+    import xml.dom.minidom
+    from local_llm import documents
+
+    reg, cfg, db = _doc_registry()
+    for suffix in sorted(documents.FORMATS):
+        if suffix == ".json":
+            continue                       # JSON is passed through, not rendered
+        data = documents.render(SAMPLE_DOC, suffix, "Q3 Platform Review")
+        assert data, suffix
+        if suffix == ".pdf":
+            assert data.startswith(b"%PDF-1.4"), "no PDF header"
+            assert data.rstrip().endswith(b"%%EOF"), "no EOF marker"
+            assert b"xref" in data and b"/Type /Catalog" in data, "no xref/catalog"
+            assert b"/Type /Page" in data, "no page objects"
+            # Text is drawn, not merely embedded as metadata.
+            assert b"Platform Review" in data or b"Tj" in data
+        elif suffix in (".docx", ".xlsx", ".pptx"):
+            archive = zipfile.ZipFile(io.BytesIO(data))
+            assert archive.testzip() is None, f"{suffix}: corrupt zip"
+            names = set(archive.namelist())
+            assert "[Content_Types].xml" in names and "_rels/.rels" in names, names
+            for name in names:
+                if name.endswith((".xml", ".rels")):
+                    # Raises on malformed XML, which is exactly what Word reports
+                    # to the user as "unreadable content".
+                    xml.dom.minidom.parseString(archive.read(name))
+            # Every part the content types override must actually be in the zip,
+            # and vice versa for the parts that need one.
+            types = archive.read("[Content_Types].xml").decode()
+            for name in names:
+                # [Content_Types].xml is the manifest itself and the .rels parts
+                # are covered by a Default extension rule; everything else this
+                # writer emits declares an explicit Override.
+                if name.endswith(".xml") and "/_rels/" not in name \
+                        and name != "[Content_Types].xml":
+                    assert "/" + name in types, f"{suffix}: {name} has no content type"
+            body = b" ".join(archive.read(n) for n in names if n.endswith(".xml"))
+            assert b"Platform Review" in body, f"{suffix}: the content is missing"
+        else:
+            text = data.decode("utf-8")
+            assert "Platform Review" in text, suffix
+    db.close()
+
+
+def test_a_generated_docx_has_the_table_grid_word_requires():
+    """Defect: the table was written without <w:tblGrid>. Word reports the whole
+    document as containing unreadable content, and a strict reader refuses the
+    table outright -- from one missing required child element."""
+    import zipfile
+    from local_llm import documents
+    data = documents.render(SAMPLE_DOC, ".docx", "T")
+    body = zipfile.ZipFile(io.BytesIO(data)).read("word/document.xml").decode()
+    assert "<w:tbl>" in body, "the table was dropped"
+    assert "<w:tblGrid>" in body and "<w:gridCol" in body, "no tblGrid"
+    # One gridCol per column, or Word lays the table out on its own guess.
+    assert body.count("<w:gridCol") == 3, body.count("<w:gridCol")
+    # And the numbering part the bullets reference actually exists.
+    assert "word/numbering.xml" in zipfile.ZipFile(io.BytesIO(data)).namelist()
+
+
+def test_a_spreadsheet_keeps_numbers_numeric_and_identifiers_textual():
+    """A spreadsheet that stores 1420331 as text is not a spreadsheet, and one
+    that turns an order reference into a float has corrupted the data."""
+    import zipfile
+    from local_llm import documents
+    doc = "| Ref | Count | Rate |\n|---|---|---|\n| 00421 | 1420331 | 0.41 |\n"
+    sheet = zipfile.ZipFile(io.BytesIO(documents.render(doc, ".xlsx"))).read(
+        "xl/worksheets/sheet1.xml").decode()
+    assert "<v>1420331</v>" in sheet, "a plain integer was stored as text"
+    assert "<v>0.41</v>" in sheet, "a decimal was stored as text"
+    # A leading zero means an identifier, not a number.
+    assert "<v>00421</v>" not in sheet and "00421" in sheet, sheet[:400]
+
+
+def test_the_document_tool_refuses_a_format_it_cannot_write():
+    """Better an honest refusal naming the formats than a .key file containing
+    Markdown, which the user discovers only when Keynote will not open it."""
+    reg, cfg, db = _doc_registry()
+    out, err = reg.call("create_document", {"path": "deck.key", "content": "# Hi"}, None)
+    assert err, out
+    assert ".pdf" in out and ".docx" in out, out
+    # And a path that climbs out of the workspace is refused by the same resolver
+    # every other file tool uses.
+    out, err = reg.call("create_document",
+                        {"path": "../../escape.pdf", "content": "# Hi"}, None)
+    assert err and "escapes" in out, out
+    db.close()
+
+
+def test_a_request_for_a_file_never_goes_down_the_tool_free_lane():
+    """Defect: "write me a pdf report on the Q3 numbers" reaches the router as an
+    ordinary request, the router answers "answer", and the prompt is rebuilt with
+    no tools at all -- so the model wrote a perfectly good report into the chat
+    and the file the user asked for was never created."""
+    call = json.dumps({"tool": "create_document",
+                       "args": {"path": "q3.pdf", "content": SAMPLE_DOC}})
+    agent, cfg, db, reg, client = _agent(
+        [call, "I put the Q3 review together as a PDF."],
+        knowledge_triage=True, agent_max_steps=3)
+    events = asyncio.run(_run(agent, "write me a pdf report on the Q3 numbers", []))
+    joined = "\n".join(m["content"] for p in client.prompts for m in p)
+    assert "You are a router" not in joined, "spent a router call on a settled question"
+    assert "PRODUCE A FILE" in joined, "the model was never told to write a file"
+    calls = [e["name"] for e in events if e.get("type") == "tool_call"]
+    assert calls == ["create_document"], calls
+    final = [e for e in events if e["type"] == "final"][-1]
+    assert final["documents"] == ["q3.pdf"], final["documents"]
+    db.close()
+
+
+def test_a_document_turn_gets_a_budget_that_can_hold_the_document():
+    """Defect: the visible reply is one sentence ("I made the PDF"), so the turn
+    looked like chat and got the 512-token budget -- but the whole document is
+    generated before that, inside the create_document call's content argument.
+    The JSON was cut off mid-string, the call never parsed, and the turn produced
+    nothing at all."""
+    agent, cfg, db, reg, _ = _agent([], code_max_tokens=1536)
+    assert agent.reply_reserve("write me a pdf report on the Q3 numbers", 512, None) == 1536
+    assert agent.reply_reserve("export that as a word document", 512, None) == 1536
+    # An ordinary question is untouched: the widening is not a blanket raise.
+    assert agent.reply_reserve("how do tcp handshakes work", 512, None) == 512
+    db.close()
+
+
+def test_a_document_survives_an_auto_iterate_round():
+    """run() resets the per-turn document list on entry, and run_iterating
+    re-enters it. Without carrying them, a turn whose first round wrote the .pdf
+    and whose second round fixed a failing check handed back a final event
+    offering no download at all."""
+    source = Path(local_llm.agent.__file__).read_text()
+    assert "produced: list[str] = []" in source
+    assert 'ev["documents"] = list(produced)' in source
+
+
+def test_the_documents_list_is_per_turn():
+    """It drives the download links under the answer. Carried over from the
+    previous turn it would offer a file this answer had nothing to do with."""
+    call = json.dumps({"tool": "create_document",
+                       "args": {"path": "one.pdf", "content": "# One"}})
+    agent, cfg, db, reg, client = _agent(
+        [call, "Made one.pdf.", '{"action":"answer"}', "TCP is a protocol."],
+        knowledge_triage=True, agent_max_steps=3)
+    first = asyncio.run(_run(agent, "write me a pdf about one", []))
+    assert [e for e in first if e["type"] == "final"][-1]["documents"] == ["one.pdf"]
+    second = asyncio.run(_run(agent, "how do tcp handshakes work", []))
+    assert [e for e in second if e["type"] == "final"][-1]["documents"] == []
+    db.close()
+
+
+def test_the_download_endpoint_serves_documents_and_refuses_everything_else():
+    """A download endpoint that did its own path handling would be a second
+    place for "../../.ssh/id_rsa" to be got right, and the first one to be got
+    wrong. It goes through the same resolver the file tools use, and hands back
+    only the formats this app knows how to produce."""
+    cfg = Config(auth_enabled=True, admin_username="admin", admin_password="adminpw123",
+                 allow_test_user=False,
+                 skills_dir=tempfile.mkdtemp(prefix="local-llm-test-skills-"))
+    db = Database(Path(tempfile.mkdtemp()) / "download.db")
+    mm = ModelServerManager(cfg.model, 8090, ADAPTER_DIR)
+    registry = ToolRegistry(cfg, db)
+    app = create_app(cfg, db, mm, RetrainManager(db, mm, cfg), registry)
+    registry.call("create_document",
+                  {"path": "downloads/report.pdf", "content": SAMPLE_DOC}, None)
+    registry.call("write_file", {"path": "downloads/secret.env",
+                                 "content": "TOKEN=abc"}, None)
+    with TestClient(app) as c:
+        # Authentication is required: these are the user's own documents.
+        assert c.get("/api/files/download",
+                     params={"path": "downloads/report.pdf"}).status_code == 401
+        assert login(c, "admin", "adminpw123").status_code == 200
+
+        r = c.get("/api/files/download", params={"path": "downloads/report.pdf"})
+        assert r.status_code == 200, r.text
+        assert r.content.startswith(b"%PDF"), r.content[:20]
+        assert r.headers["content-type"] == "application/pdf"
+        assert 'attachment; filename="report.pdf"' in r.headers["content-disposition"]
+        assert r.headers["x-content-type-options"] == "nosniff"
+
+        # Not a document format: refused rather than handed over. This is the
+        # difference between a download link and an arbitrary file read.
+        r = c.get("/api/files/download", params={"path": "downloads/secret.env"})
+        assert r.status_code == 400, r.status_code
+        assert "TOKEN" not in r.text
+
+        # Path traversal, and a file that is not there.
+        r = c.get("/api/files/download", params={"path": "../../../etc/passwd"})
+        assert r.status_code == 400, r.status_code
+        assert c.get("/api/files/download",
+                     params={"path": "downloads/nope.pdf"}).status_code == 404
+    db.close()
+
+
+def test_slash_agent_reaches_the_agent_lane_from_both_chat_handlers():
+    """/agent is only understood inside the agent. A short one ("/agent go")
+    fails the substantive test, so without this it would be answered on the plain
+    lane with the slash command still sitting in the prompt."""
+    source = Path(local_llm.api.__file__).read_text()
+    assert source.count("elif not use_agent and forced_agent_lane(request.message):") == 2, (
+        source.count("elif not use_agent and forced_agent_lane(request.message):"))
+    from local_llm.textutil import routing_override
+    assert routing_override("/agent go")[0] == "agent"
 
 
 def test_implicit_feedback_does_not_mislabel_training_data():

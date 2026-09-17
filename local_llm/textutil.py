@@ -358,6 +358,179 @@ def is_time_sensitive(message: str) -> bool:
     return bool(TIME_SENSITIVE.search(message or ""))
 
 
+# The model saying it cannot do the job without something it was not given: the
+# web, the user's files, a shell. This is the model itself reporting that the
+# tool-free lane was the wrong lane, and it is far stronger evidence than the
+# router's one-shot guess -- the router decides before seeing the question's
+# difficulty, this arrives after the model has tried.
+#
+# Split in two because the two halves want different tools. NEEDS_LOOKUP is
+# answered by web_search/fetch_url; NEEDS_FILES by the file and shell tools.
+_NEEDS_LOOKUP = re.compile(
+    r"(?i)\b(?:"
+    r"(?:i\s+)?(?:do\s*n[o']?t|don'?t|cannot|can'?t|could\s+not|couldn'?t|"
+    r"am\s+(?:un|not\s+)able|'?m\s+(?:un|not\s+)able|unable)\s+"
+    r"(?:to\s+)?(?:\w+\s+){0,3}?"
+    r"(?:access|browse|reach|retrieve|look\s+(?:it|that|this)?\s*up|search|"
+    r"fetch|download|open\s+(?:the\s+)?(?:link|url|page|website)|"
+    r"real[- ]?time|live|current|up[- ]?to[- ]?date|internet|web)"
+    r"|"
+    r"(?:my|the)\s+(?:knowledge|training)\s+(?:cut[- ]?off|cutoff|data)\b"
+    r"|"
+    r"as\s+of\s+my\s+(?:last\s+)?(?:knowledge|training|update)"
+    r"|"
+    r"i\s+(?:do\s*n[o']?t|don'?t)\s+have\s+(?:access\s+to\s+)?"
+    r"(?:real[- ]?time|live|current|up[- ]?to[- ]?date|internet|the\s+web)"
+    r"|"
+    r"(?:you|you'?ll|please)\s+(?:should\s+|will\s+|need\s+to\s+|can\s+)?"
+    r"(?:check|visit|consult|see)\s+(?:the\s+)?(?:official|vendor|their)\s+"
+    r"(?:website|site|docs|documentation|page)"
+    r")\b"
+)
+_NEEDS_FILES = re.compile(
+    r"(?i)\b(?:"
+    r"(?:i\s+)?(?:do\s*n[o']?t|don'?t|cannot|can'?t|could\s+not|couldn'?t|"
+    r"am\s+(?:un|not\s+)able|'?m\s+(?:un|not\s+)able|unable)\s+"
+    r"(?:to\s+)?(?:\w+\s+){0,3}?"
+    r"(?:read|open|see|view|inspect|list|run|execute)\s+"
+    r"(?:your|the|any|this|that|these|those)?\s*"
+    r"(?:file|files|code|codebase|repo|repository|project|directory|folder|"
+    r"script|source|command|tests?)"
+    r"|"
+    r"without\s+(?:seeing|reading|access\s+to)\s+(?:your|the)\s+"
+    r"(?:file|files|code|codebase|repo|repository|project|source)"
+    r"|"
+    r"(?:please\s+)?(?:paste|share|show|send)\s+(?:me\s+)?(?:the\s+)?"
+    r"(?:file|files|code|contents|source|error|output)\b"
+    r")"
+)
+
+# How much text may surround a refusal before it stops being a refusal. A real
+# answer that opens "I don't have real-time access, but as of 2024 ..." and then
+# answers is NOT a refusal, and escalating it would spend a search on a question
+# already answered. A refusal is short because there was nothing to say.
+REFUSAL_MAX_CHARS = 700
+
+
+def missing_capability(answer: str) -> str | None:
+    """Which capability an answer says it lacked: "lookup", "files", or None.
+
+    Used to switch a tool-free turn into agent mode after the fact. Returns None
+    for any answer long enough to be a real answer, so a hedged-but-complete
+    reply is never mistaken for a refusal.
+    """
+    text = (answer or "").strip()
+    if not text or len(text) > REFUSAL_MAX_CHARS:
+        return None
+    # A reply carrying a code block or a table did work; the caveat in it is a
+    # caveat, not a refusal.
+    if "```" in text:
+        return None
+    if _NEEDS_FILES.search(text):
+        return "files"
+    if _NEEDS_LOOKUP.search(text):
+        return "lookup"
+    return None
+
+
+# A request for a document FILE, and which format it asks for. Detected
+# deterministically, for the same reason is_code_request is: "write me a PDF
+# report on the Q3 numbers" reaches the router as an ordinary request, the router
+# quite reasonably answers "answer", and the turn is then rebuilt with no tools
+# at all -- so the model writes a lovely report into the chat and no file is ever
+# produced. The user asked for a file and got a message.
+#
+# Order matters: the first pattern that matches wins, so the more specific
+# formats are listed before the ones whose words appear inside them.
+_DOC_FORMAT_WORDS = (
+    (".docx", r"word\s+(?:document|doc|file|version)|docx|ms\s*word|"
+              r"microsoft\s+word"),
+    (".xlsx", r"excel|spread\s?sheet|xlsx|workbook"),
+    (".pptx", r"power\s?point|pptx|slide\s*deck|slides|presentation|deck"),
+    (".pdf", r"pdf"),
+    (".csv", r"csv"),
+    (".html", r"html|web\s*page"),
+    (".md", r"markdown|\.md\b"),
+    (".txt", r"(?:plain\s*)?text\s+file|\.txt\b"),
+)
+# Verbs that mean "produce one", as opposed to reading one the user already has.
+_DOC_MAKE = (r"(?:creat\w*|generat\w*|mak\w*|writ\w*|produc\w*|export\w*|sav\w*|"
+             r"build\w*|draft\w*|prepar\w*|render\w*|render|put|compile|"
+             r"give\s+me|send\s+me|i\s+(?:need|want)|turn\s+(?:it|this|that|them)\s+into|"
+             r"convert\s+(?:it|this|that|them)\s+(?:in)?to)")
+# A filename the user spelled out wins over any phrasing: "save it as notes.docx"
+# names both the format and the file.
+# Format words that are safe ONLY inside a target phrase. "to word" means Word;
+# a bare "word" anywhere else is an English word.
+_DOC_TARGET_EXTRA = {".docx": r"word", ".xlsx": r"sheets?", ".pptx": r"slides?"}
+_DOC_FILENAME = re.compile(
+    r"(?i)\b[\w][\w \-.]{0,60}?(\.(?:pdf|docx|xlsx|pptx|csv|html?|md|txt))\b")
+
+
+# Verbs that mean the user already HAS the file and wants it read. A format word
+# under one of these is not a request to produce anything: "summarise this pdf",
+# "read the excel file I uploaded". Only an explicit output phrase ("... into a
+# word document") overrides it.
+_DOC_READ = re.compile(
+    r"(?i)\b(?:read|open|parse|extract|summari[sz]e|analy[sz]e|review|index|"
+    r"import|uploaded?|attached?|look\s+at|check|what(?:'s|\s+is)\s+in)\b")
+
+
+def _doc_patterns() -> tuple[list, list]:
+    """Two matchers per format, built once.
+
+    `target` is the unambiguous one: "as/into/to a <fmt>" states the OUTPUT and
+    therefore beats a filename mentioned elsewhere in the same sentence, which is
+    what makes "convert report.pdf to word" a Word request rather than a PDF one.
+    `other` covers "<fmt> file/report/..." and "<make verb> ... a <fmt>", both of
+    which are requests to produce one but neither of which can outrank a
+    filename the user spelled out.
+    """
+    target, other = [], []
+    for suffix, words in _DOC_FORMAT_WORDS:
+        extra = _DOC_TARGET_EXTRA.get(suffix)
+        target.append((suffix, re.compile(
+            r"(?i)\b(?:as|in-?to|to)\s+(?:an?\s+)?(?:\w+\s+){0,2}?"
+            rf"(?:{words}{'|' + extra if extra else ''})\b")))
+        other.append((suffix, re.compile(
+            r"(?i)(?:"
+            rf"\b(?:in)\s+(?:an?\s+)?(?:new\s+)?(?:{words})\b"
+            rf"|\b(?:{words})\s+(?:file|document|doc|report|version|copy|export|"
+            r"deck|presentation|summary|output)\b"
+            rf"|\b{_DOC_MAKE}\s+(?:me\s+)?(?:\w+\s+){{0,3}}?(?:an?|the)?\s*(?:{words})\b"
+            r")")))
+    return target, other
+
+
+_DOC_TARGET, _DOC_OTHER = _doc_patterns()
+
+
+def document_request(message: str) -> str | None:
+    """The file extension a message asks to be produced, or None.
+
+    Returns ".pdf", ".docx", ... so the caller can name the format back to the
+    user and steer the tool. None for a message that merely mentions a format
+    ("summarise this pdf"), which is a request to READ one -- acting on that
+    would have the agent overwrite the very file it was asked to look at.
+    """
+    text = (message or "").strip()
+    if not text:
+        return None
+    for suffix, pattern in _DOC_TARGET:
+        if pattern.search(text):
+            return suffix
+    if _DOC_READ.search(text):
+        return None
+    named = _DOC_FILENAME.search(text)
+    if named:
+        suffix = named.group(1).lower()
+        return ".html" if suffix == ".htm" else suffix
+    for suffix, pattern in _DOC_OTHER:
+        if pattern.search(text):
+            return suffix
+    return None
+
+
 # Framing words to strip so the search topic is the subject, not "write a python
 # script to ...". Applied only when building a query for a code lookup.
 _CODE_FRAMING = re.compile(
@@ -941,14 +1114,17 @@ def url_read_request(message: str) -> str | None:
 # bypasses the model router entirely. Deterministic and explicit, so the user is
 # never surprised by the router's judgement when they have already made the call.
 # Lanes: "web_search" (force a search), "answer" (never search; own knowledge +
-# knowledge base), "kb" (answer, but say the knowledge base is the source).
+# knowledge base), "kb" (answer, but say the knowledge base is the source),
+# "agent" (skip the router and go straight to the tool loop).
 _OVERRIDE = re.compile(
-    r"^\s*/(search|web|websearch|nosearch|no-search|answer|local|kb|docs)\b[ \t]*",
+    r"^\s*/(search|web|websearch|nosearch|no-search|answer|local|kb|docs|"
+    r"agent|tools|act)\b[ \t]*",
     re.I)
 _OVERRIDE_LANE = {
     "search": "web_search", "web": "web_search", "websearch": "web_search",
     "nosearch": "answer", "no-search": "answer", "answer": "answer", "local": "answer",
     "kb": "kb", "docs": "kb",
+    "agent": "agent", "tools": "agent", "act": "agent",
 }
 
 
@@ -1072,6 +1248,18 @@ __all__ = [
     'is_substantive',
     'is_thin_page',
     'is_time_sensitive',
+    'document_request',
+    '_DOC_FORMAT_WORDS',
+    '_DOC_TARGET',
+    '_DOC_OTHER',
+    '_DOC_READ',
+    '_DOC_FILENAME',
+    '_DOC_TARGET_EXTRA',
+    '_DOC_MAKE',
+    'missing_capability',
+    'REFUSAL_MAX_CHARS',
+    '_NEEDS_LOOKUP',
+    '_NEEDS_FILES',
     'is_followup_remark',
     '_FOLLOWUP_LEAD',
     'quick_tool',

@@ -804,15 +804,39 @@ UI_JS_CHAT = r"""
            meta.textContent = bits.join(" \u00b7 ");
            stopActivity(trace);
            trace.turn.appendChild(meta);
-           if (event.changed_files && event.changed_files.length) {
+           if (event.documents && event.documents.length) {
+             // A generated document is the deliverable, not a diff to review, so
+             // it gets its own row of download links above the changed-files
+             // node -- which would otherwise present a .docx as an edit to
+             // inspect with git before pushing.
+             var docs = document.createElement("div");
+             docs.className = "docrow";
+             event.documents.forEach(function(rel) {
+               var a = document.createElement("a");
+               a.className = "docdl";
+               a.href = "/api/files/download?path=" + encodeURIComponent(rel);
+               a.setAttribute("download", rel.split("/").pop());
+               a.textContent = "\u2b07\ufe0e  " + rel.split("/").pop();
+               a.title = "Download " + rel;
+               docs.appendChild(a);
+             });
+             trace.turn.appendChild(docs);
+           }
+           // The document files are already offered above as downloads; listing
+           // them again as "changed files (review before push)" reads as a
+           // warning about the very thing the user asked for.
+           var changed = (event.changed_files || []).filter(function(f) {
+             return (event.documents || []).indexOf(f) === -1;
+           });
+           if (changed.length) {
              var wrap = document.createElement("div");
              wrap.className = "gnode diff open";
              var head = document.createElement("div");
              head.className = "ghead";
              var tag = document.createElement("span");
              tag.className = "gtool";
-             tag.textContent = "changed " + event.changed_files.length + " file"
-               + (event.changed_files.length === 1 ? "" : "s") + " (review before push)";
+             tag.textContent = "changed " + changed.length + " file"
+               + (changed.length === 1 ? "" : "s") + " (review before push)";
              var caret = document.createElement("span");
              caret.className = "gcaret";
              caret.textContent = "\u25b8";
@@ -821,7 +845,7 @@ UI_JS_CHAT = r"""
              body.className = "gbody gdiff";
              body.textContent = event.diff && event.diff.trim()
                ? event.diff
-               : (event.changed_files.join("\n") + "\n\n(new files — not yet tracked by git)");
+               : (changed.join("\n") + "\n\n(new files — not yet tracked by git)");
              head.onclick = function() { wrap.classList.toggle("open"); };
              wrap.appendChild(head); wrap.appendChild(body);
              trace.turn.appendChild(wrap);

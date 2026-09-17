@@ -1432,6 +1432,67 @@ def create_app(
         registry.changed_files.clear()
         return {"restored": restored, "removed": removed, "failed": failed}
 
+    # Content types for the formats create_document produces. Served explicitly
+    # rather than guessed with mimetypes: the guess depends on the OS mime
+    # database, and getting it wrong means the browser renders a .docx as text
+    # instead of downloading it.
+    _DOWNLOAD_TYPES = {
+        ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".csv": "text/csv; charset=utf-8",
+        ".html": "text/html; charset=utf-8",
+        ".htm": "text/html; charset=utf-8",
+        ".md": "text/markdown; charset=utf-8",
+        ".txt": "text/plain; charset=utf-8",
+        ".json": "application/json",
+    }
+    # How big a file this endpoint will hand back in one response. A document the
+    # app generated is kilobytes; anything approaching this is a project file
+    # that has no business being downloaded through the chat UI.
+    _DOWNLOAD_MAX_BYTES = 64 * 1024 * 1024
+
+    @app.get("/api/files/download")
+    def download_file(path: str = Query(..., max_length=512), _u: dict = USER):
+        """Serve a file the agent produced, as an attachment.
+
+        Confined to the same root the file tools write into, through the same
+        resolver: a download endpoint that did its own path handling would be a
+        second place for "../../.ssh/id_rsa" to be got right, and the first one
+        to be got wrong. Any authenticated user may fetch it, which matches the
+        tools: the workspace and the project directory are per-installation, not
+        per-user, so there is nothing here one user has and another does not.
+        """
+        try:
+            target = registry._resolve(path)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        if not target.is_file():
+            return JSONResponse({"error": f"no such file: {path}"}, status_code=404)
+        suffix = target.suffix.lower()
+        if suffix not in _DOWNLOAD_TYPES:
+            return JSONResponse(
+                {"error": f"{suffix or 'that file'} is not a downloadable document"},
+                status_code=400)
+        size = target.stat().st_size
+        if size > _DOWNLOAD_MAX_BYTES:
+            return JSONResponse(
+                {"error": f"{path} is {size} bytes, too large to download here"},
+                status_code=413)
+        # The filename goes in a quoted field, so a quote or a newline in it
+        # would let the model's chosen name forge extra response headers.
+        safe_name = re.sub(r'[^A-Za-z0-9._ -]', "_", target.name)[:120] or "document"
+        return Response(
+            content=target.read_bytes(),
+            media_type=_DOWNLOAD_TYPES[suffix],
+            headers={
+                "Content-Disposition": f'attachment; filename="{safe_name}"',
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-store",
+            },
+        )
+
     @app.get("/api/dataset/export")
     def dataset_export(
         format: str = Query("chat", pattern="^(chat|bare|preference|raw)$"),
@@ -1599,6 +1660,15 @@ def create_app(
                       "that answer was rejected; retrying the original request"),
         }
 
+    def forced_agent_lane(message: str) -> bool:
+        """True for a message the user prefixed with /agent (or /tools, /act).
+
+        Both chat handlers ask, so the two lanes cannot drift apart on what the
+        command means.
+        """
+        override = routing_override(message)
+        return bool(override and override[0] == "agent")
+
     def retry_message(feedback: dict | None, message: str) -> str:
         """The message to send the model, given any implicit feedback on the
         previous turn. Unchanged unless the previous answer was rejected."""
@@ -1645,6 +1715,12 @@ def create_app(
             # substantive by the test above, so without this it went down the
             # plain lane and was answered as a new question -- the truncated
             # artifact it was meant to resume never came into it.
+            use_agent = True
+        elif not use_agent and forced_agent_lane(request.message):
+            # "/agent do the thing" is the user switching mode by hand. The
+            # command is only understood inside the agent, so a short one ("/agent
+            # go") that fails the substantive test would otherwise be answered on
+            # the plain lane with the slash command still in the prompt.
             use_agent = True
 
         # Recorded before generating, so a failed or empty run still leaves the
@@ -1788,6 +1864,12 @@ def create_app(
             # substantive by the test above, so without this it went down the
             # plain lane and was answered as a new question -- the truncated
             # artifact it was meant to resume never came into it.
+            use_agent = True
+        elif not use_agent and forced_agent_lane(request.message):
+            # "/agent do the thing" is the user switching mode by hand. The
+            # command is only understood inside the agent, so a short one ("/agent
+            # go") that fails the substantive test would otherwise be answered on
+            # the plain lane with the slash command still in the prompt.
             use_agent = True
 
         # A short "no, wrong" is feedback on the PREVIOUS answer: record it, and

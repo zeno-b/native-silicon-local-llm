@@ -32,6 +32,13 @@ from .mcp import *  # noqa: F401,F403
 from .websearch import *  # noqa: F401,F403
 from .calculator import *  # noqa: F401,F403
 from .codecheck import check_code, parser_for
+from . import documents
+from .documents import describe_document  # noqa: F401
+
+# The document formats create_document offers, in the order they are
+# listed to the model. Read from the renderer so the tool description and
+# what can actually be written cannot drift apart.
+_DOC_FORMATS = documents.FORMATS
 
 
 def guarded_thread(fn, *args, **kwargs) -> threading.Thread:
@@ -164,6 +171,12 @@ class ToolRegistry:
         # Files the tools have created or modified this session, so you can see at
         # a glance what changed before reviewing with git.
         self.changed_files: set[str] = set()
+        # Documents create_document produced during the CURRENT turn, in order.
+        # Separate from changed_files because these are deliverables, not edits:
+        # the turn ends with a download link per entry, and a .pdf the user is
+        # meant to open has nothing to do with "review the diff before pushing".
+        # Reset per turn by the agent.
+        self.documents_written: list[str] = []
         # Set per request so memory writes can record where they came from.
         self.conversation_id: str | None = None
         self._register_defaults()
@@ -330,6 +343,25 @@ class ToolRegistry:
             parameters={"path": "file path relative to the workspace", "content": "full file contents"},
             required=["path", "content"],
             handler=self._write_file,
+        ))
+        self._add(Tool(
+            name="create_document",
+            description=(
+                "Produce a real document file the user can open or send: "
+                + ", ".join(f"{ext} ({name})" for ext, name in _DOC_FORMATS.items())
+                + ". Write the body as Markdown (# headings, **bold**, - bullets, "
+                "1. numbered, | tables |, ``` code fences) and it is typeset into "
+                "the format the path's extension asks for. Use this, not "
+                "write_file, whenever the user asks for a PDF, a Word document, a "
+                "spreadsheet or a slide deck."
+            ),
+            parameters={
+                "path": "file name with the extension you want, e.g. report.pdf",
+                "content": "the document body as Markdown",
+                "title": "optional document title; the first heading is used if omitted",
+            },
+            required=["path", "content"],
+            handler=self._create_document,
         ))
         self._add(Tool(
             name="edit_file",
@@ -1076,6 +1108,19 @@ class ToolRegistry:
         target.write_text(content, encoding="utf-8")
         self._note_change(target)
 
+    def _save_bytes(self, target: Path, data: bytes) -> None:
+        """_save_text for a binary file. Same checkpoint-then-write contract.
+
+        A generated document is a file in the project like any other: if a turn
+        overwrites last week's report.pdf, the undo has to be able to bring it
+        back.
+        """
+        if self.config.checkpoints_enabled and self.checkpoint_id:
+            self.checkpoints.capture(self.checkpoint_id, self._root(), target,
+                                     self.conversation_id)
+        target.write_bytes(data)
+        self._note_change(target)
+
     # Directory names never worth walking for listing/search.
     _IGNORE_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__",
                     ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist", "build",
@@ -1412,6 +1457,46 @@ class ToolRegistry:
         verb = "Updated" if existed else "Created"
         note = self._validate_written(target, str(content))
         return f"{verb} {self._rel(target)} ({len(str(content))} characters){note}"
+
+    def _create_document(self, path: str, content: str, title: Any = None) -> str:
+        """Render Markdown into a real .pdf/.docx/.xlsx/.pptx/... in the workspace.
+
+        Separate from write_file rather than folded into it: write_file's contract
+        is "these exact bytes land on disk", which is what an edit to source code
+        needs, and a document is the opposite -- the model writes prose and the
+        app decides the bytes. Merging them would mean write_file silently
+        rewriting content whenever the path happened to end in .pdf.
+        """
+        target = self._resolve(path)
+        if target.is_dir():
+            raise ValueError(f"{path} is a directory; give a file name to write to.")
+        suffix = target.suffix.lower()
+        if suffix not in _DOC_FORMATS:
+            raise ValueError(
+                f"I cannot write {suffix or 'a file with no extension'}. Ask for one of: "
+                + ", ".join(sorted(_DOC_FORMATS)) + ".")
+        try:
+            data = documents.render(str(content), suffix, str(title or "").strip())
+        except documents.DocumentError as exc:
+            raise ValueError(str(exc)) from None
+        except Exception as exc:
+            raise ValueError(
+                f"could not build the {_DOC_FORMATS[suffix]}: "
+                f"{type(exc).__name__}: {exc}") from None
+        existed = target.is_file()
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            self._save_bytes(target, data)
+        except PermissionError:
+            raise ValueError(f"no permission to write {path}") from None
+        except OSError as exc:
+            raise ValueError(f"could not write {path}: {exc}") from None
+        rel = self._rel(target)
+        self.documents_written.append(rel)
+        verb = "Updated" if existed else "Created"
+        return (f"{verb} {rel} — a {_DOC_FORMATS[suffix]}, {len(data):,} bytes. "
+                "The user can download it from the link under your answer; do not "
+                "paste the file contents into your reply.")
 
     def _validate_written(self, target: Path, content: str) -> str:
         """After writing a structured file, check it parses and report the result
@@ -1917,6 +2002,9 @@ class ToolRegistry:
 # Re-exported explicitly: the original file was one flat namespace, so private
 # helpers (leading underscore) must cross module boundaries too.
 __all__ = [
+    'documents',
+    'describe_document',
+    '_DOC_FORMATS',
     'Tool',
     'ToolRegistry',
     'guarded_thread',

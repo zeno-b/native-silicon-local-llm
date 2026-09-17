@@ -21,6 +21,7 @@ without scrolling a single enormous file:
     websearch       search backends and URL guards
     calculator      the sandboxed arithmetic evaluator
     tools           tool definitions and the registry
+    documents       Markdown -> PDF / Word / Excel / PowerPoint rendering
     llm             prompt assembly and tool-call parsing
     model_client    HTTP client for the model server
     textutil        classifiers, chunking, routing heuristics

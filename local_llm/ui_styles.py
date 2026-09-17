@@ -666,6 +666,19 @@ UI_CSS = r"""
    .sbody { padding: 0 2px 12px; }
    .sbody > label:first-child { margin-top: 0; }
 
+   /* --- Generated-document download links under an answer --- */
+   .docrow { display:flex; flex-wrap:wrap; gap:8px; margin:10px 0 2px; }
+   .docdl {
+     display:inline-flex; align-items:center; gap:7px;
+     padding:7px 13px; border-radius:8px; text-decoration:none;
+     font-size:13px; font-weight:600; letter-spacing:.01em;
+     color:var(--accent); background:var(--btn-bg);
+     border:1px solid var(--btn-border);
+     transition:background .12s ease, border-color .12s ease, transform .12s ease;
+   }
+   .docdl:hover { background:var(--btn-hover); border-color:var(--accent); }
+   .docdl:active { transform:translateY(1px); }
+
    /* --- Reusable toggle switch (agent mode, agent enable) --- */
    .switch { position: relative; display: inline-block; width: 34px; height: 20px; flex: 0 0 auto; }
    .switch input { opacity: 0; width: 0; height: 0; position: absolute; margin: 0; }

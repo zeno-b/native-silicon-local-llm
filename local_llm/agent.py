@@ -44,6 +44,29 @@ REVISE_DRAFT = (
 )
 
 
+# Handed to the model when a tool-free turn switches into agent mode. It has just
+# said it could not do the job; this tells it that the thing it said it lacked is
+# now in front of it, and that the shape of the reply has changed (a tool call,
+# not prose). Explicit about not apologising: told only "you have tools now", a
+# 3B model spends the step writing "I'm sorry for the confusion" and nothing else.
+ESCALATION_DIRECTIVE = (
+    "You do have that capability. The tools listed in your instructions are "
+    "available to you right now. Use them: reply with exactly one tool call as a "
+    "JSON object, answer the original question from what it returns, and do not "
+    "apologise or mention this message."
+)
+
+# Which tools make each missing capability available. Keyed by what
+# missing_capability() reports, so the two stay in step: a turn is only switched
+# into agent mode when at least one of these is actually registered, since
+# telling the model to use a tool it does not have just wastes the step.
+ESCALATION_TOOLS = {
+    "lookup": ("web_search", "fetch_url", "search_docs"),
+    "files": ("read_file", "list_files", "search_files", "run_shell", "run_tests",
+              "run_python", "execute_code"),
+}
+
+
 class Agent:
     """A ReAct-style loop over the local model.
 
@@ -420,7 +443,13 @@ class Agent:
             code = bool(is_modification_request(message)
                         or is_continue_request(message)
                         or parse_correction(message))
-        if not code:
+        # A document turn's visible REPLY is one sentence ("I made the PDF"),
+        # but the whole document is generated before that, inside the
+        # create_document call's content argument. On the 512-token chat budget
+        # that JSON is cut off mid-string, the call never parses, and the turn
+        # produces nothing at all -- so it needs the same room a program does.
+        document = bool(document_request(message))
+        if not code and not document:
             return requested
         wanted = max(requested, self.config.code_max_tokens)
         if task is not None and task.artifact:
@@ -467,6 +496,17 @@ class Agent:
         if estimate_tokens(task.artifact) > max(0, reserve - 64):
             return "patch"
         return "build"
+
+    def escalation_tools(self, need: str) -> list[str]:
+        """Registered tools that would give the model the capability it says it lacks.
+
+        Empty when nothing can help, which is the signal not to switch lanes: a
+        build with no search tool telling the model "you can search after all"
+        would spend a step to get the same refusal back, and then have taught it
+        to claim a capability it does not have.
+        """
+        return [name for name in ESCALATION_TOOLS.get(need, ())
+                if self.registry.get(name) is not None]
 
     def artifact_chars_for(self, reserve: int) -> int:
         """Characters of the artifact allowed into the prompt for this budget.
@@ -1518,11 +1558,20 @@ class Agent:
         # turn (across rounds) is what we verify. Capturing per-round would miss a
         # file the fix re-edits, since it is already in changed_files by then.
         turn_start_changed = set(self.registry.changed_files)
+        # Documents produced in ANY round of this turn. run() resets the
+        # registry's per-turn list on entry, so without this a turn whose first
+        # round wrote a .pdf and whose second round fixed a test would hand back
+        # a final event offering no download at all.
+        produced: list[str] = []
         for round_i in range(rounds + 1):
             last_final = None
             async for ev in self.run(current, history, conversation_id, max_tokens,
                                      temperature, internal=round_i > 0):
                 if ev.get("type") == "final":
+                    for name in ev.get("documents") or []:
+                        if name not in produced:
+                            produced.append(name)
+                    ev["documents"] = list(produced)
                     last_final = ev
                     if not verify:
                         yield ev
@@ -1703,7 +1752,7 @@ class Agent:
         reserve = max_tokens or self.config.max_tokens
         known = set(self.registry.names())
 
-        # A leading /command (/search, /no-search, /kb) is an explicit routing
+        # A leading /command (/search, /no-search, /kb, /agent) is an explicit routing
         # override. Honour it, and strip it from the message so neither the base
         # prompt nor the search query keeps the command text. A bare command with
         # no request behind it is ignored.
@@ -1806,6 +1855,11 @@ class Agent:
         # counters live) wiped the autoload's own entry, so the final event
         # reported no skills for a turn that had just used one.
         self.registry.skills_used = []
+        # Documents produced this turn. Reset here for the same reason as
+        # skills_used: the final event reports them as download links, and a
+        # list carried over from the previous turn would offer the user a file
+        # this answer had nothing to do with.
+        self.registry.documents_written = []
 
         # Load the procedure for this task WITHOUT waiting for the model to ask.
         # Measured on this hardware: given "format a candidate CV to our house
@@ -1850,6 +1904,30 @@ class Agent:
                     if ev0:
                         yield ev0
 
+        # Is the user asking for a FILE rather than an answer? Decided
+        # deterministically and before routing, for the same reason the code and
+        # read-URL shortcuts are: "write me a PDF of the Q3 numbers" looks to the
+        # router like an ordinary request, the router answers "answer", the
+        # prompt is rebuilt with no tools at all -- and the model then writes a
+        # perfectly good report into the chat while the file the user actually
+        # asked for is never created.
+        doc_format = (document_request(user_message)
+                      if self.registry.get("create_document") else None)
+        document_directive = ""
+        if doc_format:
+            name = describe_document(doc_format)
+            document_directive = (
+                f"The user is asking you to PRODUCE A FILE: a {name}. Call the "
+                f"create_document tool with a path ending in {doc_format} and the "
+                "whole document in its content argument, written as Markdown "
+                "(# headings, **bold**, - bullets, | tables |). Do not write the "
+                "document into your reply and do not use write_file. After the "
+                "tool succeeds, answer with one or two sentences saying what you "
+                "made; the user gets a download link automatically."
+            )
+            yield {"type": "notice", "info": True,
+                   "message": f"writing a {name} for you"}
+
         # Classify the kind of work once, so the cluster router can steer heavy
         # reasoning/code generation toward the more capable (Studio) node while
         # light chat stays on the primary (Mini). Purely a routing hint: it never
@@ -1883,7 +1961,8 @@ class Agent:
         generation_id = task.begin_generation()
         brief = self.task_brief(task, reserve, mode)
         extra_context = "\n\n".join(
-            part for part in (skill_context, reference_context, brief) if part)
+            part for part in (skill_context, reference_context, brief,
+                              document_directive) if part)
         base, dropped = self.build_base(history, user_message, reserve,
                                         extra_context=extra_context,
                                         active_code_task=bool(brief and task.is_code_task()))
@@ -1931,6 +2010,10 @@ class Agent:
         answered_retry = False
         lookup_used = False
         prose_lane = False
+        # Whether this turn has already switched into agent mode. Once only: the
+        # switch costs a prompt rebuild and a step, and a model that refuses
+        # twice is not going to be talked into it a third time.
+        escalated = False
         scratch: list[dict] = []
         seen_calls: list[str] = []
         trace: list[dict] = []
@@ -1991,6 +2074,89 @@ class Agent:
             prompt_tokens_total += stats_obj.prompt_tokens
             completion_tokens_total += stats_obj.completion_tokens
 
+        async def switch_to_agent(answer: str, step: int):
+            """Turn a tool-free turn into an agent turn, mid-flight.
+
+            The router picks the lane from one 64-token call before the model has
+            seen how hard the question is, and its decision used to be final for
+            the whole turn: on "answer" the prompt is rebuilt WITHOUT the tool
+            protocol and without the tool list, so there is no way back. What
+            came out the other end was "I don't have access to real-time data"
+            with a working web_search one step away, and the user's only recourse
+            was to ask again.
+
+            The trigger is the model's own report that it lacked a capability,
+            which is evidence the router never had -- it arrives after the
+            attempt, not before it. Refusing to fire is the default: it needs a
+            lane that actually withholds something, a registered tool that
+            supplies it, a step left to spend, and no explicit /answer or /kb
+            from the user, who has already made this call themselves.
+
+            Yields UI events, then exactly one {"__switched__": bool}.
+            """
+            nonlocal base, dropped, prose_lane, answer_routed, escalated
+            if escalated or not self.config.agent_escalation:
+                yield {"__switched__": False}
+                return
+            # Nothing is being withheld in the tool lane, so there is nothing to
+            # give back: a refusal there is the model declining work it could
+            # already do, and another step would only get the same reply.
+            if not (prose_lane or answer_routed):
+                yield {"__switched__": False}
+                return
+            # The user typed /answer or /kb. That is the same decision this
+            # function makes, made by the person whose turn it is; overriding it
+            # would make the override meaningless.
+            if forced_lane in ("answer", "kb"):
+                yield {"__switched__": False}
+                return
+            if step >= self.config.agent_max_steps:
+                yield {"__switched__": False}
+                return
+            need = missing_capability(answer)
+            if not need:
+                yield {"__switched__": False}
+                return
+            available = self.escalation_tools(need)
+            if not available:
+                yield {"__switched__": False}
+                return
+            if need == "lookup" and not await has_internet():
+                # The refusal was accurate. Say so rather than promising a
+                # lookup that cannot happen.
+                yield {"__switched__": False}
+                return
+
+            escalated = True
+            answer_routed = False
+            log(f"step {step}: the reply reported a missing capability ({need}); "
+                f"switching the turn into agent mode with {', '.join(available)}.",
+                logging.INFO)
+            if prose_lane:
+                before = messages_tokens(base)
+                base, dropped = self.build_base(
+                    history, user_message, reserve, tools=True,
+                    extra_context=extra_context,
+                    active_code_task=bool(brief and task.is_code_task()))
+                prose_lane = False
+                ev = detail(f"switched to agent mode: tool prompt restored "
+                            f"({before} -> {messages_tokens(base)} prompt tokens, "
+                            f"{history_total - dropped} of {history_total} history "
+                            "messages kept)")
+                if ev:
+                    yield ev
+            yield {"type": "notice", "info": True,
+                   "message": ("switching to agent mode: that needs "
+                               + ("a lookup" if need == "lookup" else "your files")
+                               + f", so I'm using {available[0]}")}
+            # The refusal itself is NEVER put in the trace. Feeding a model its
+            # own rejected output is what teaches it to produce the same thing
+            # again -- the same reasoning as the empty-reply nudge below. A
+            # placeholder keeps the turn structure without the example.
+            scratch.append({"role": "assistant", "content": "(no answer yet)"})
+            scratch.append({"role": "user", "content": ESCALATION_DIRECTIVE})
+            yield {"__switched__": True}
+
         def done(answer: str, step: int, truncated: bool = False) -> dict:
             new_files = sorted(self.registry.changed_files - changed_before)
             diff = self.registry.git_diff(new_files) if new_files else ""
@@ -2039,6 +2205,8 @@ class Agent:
                 "changed_files": new_files,
                 "diff": diff,
                 "skills_used": list(getattr(self.registry, "skills_used", [])),
+                # Deliverables, not edits: the UI renders one download link each.
+                "documents": list(getattr(self.registry, "documents_written", [])),
                 # Only when something was actually recorded: offering an undo
                 # for a turn that wrote nothing is noise.
                 "checkpoint": (self.registry.checkpoint_id
@@ -2382,6 +2550,19 @@ class Agent:
         # not handle, ask the model how to handle it. This one structured call
         # replaces all the intent regexes: it decides answer vs search vs
         # weather, and extracts the query or the place and day from free text.
+        #
+        # "/agent" skips routing entirely. The router's job is to decide whether
+        # a turn needs tools, and the user has just said it does; asking anyway
+        # spends a call to be overruled, and a router that answers "answer"
+        # would build the tool-free prompt and lock the turn out of the tools
+        # that were the whole point of typing the command.
+        elif forced_lane == "agent":
+            yield {"type": "notice", "info": True,
+                   "message": "agent mode: tools are available for this turn"}
+        elif doc_format:
+            # Nothing to route: the turn has to end in a create_document call,
+            # and the router's only useful answer would be the one already made.
+            pass
         elif self.config.knowledge_triage and is_substantive(user_message):
             # Decide how to handle a substantive message, then execute the
             # decision generically. The decision is either {"action":"answer"}
@@ -2907,6 +3088,18 @@ class Agent:
                 # that never mentions tools in the first place.
                 direct = await self.forced_prose_answer(
                     history, user_message, reserve, temperature, task)
+                # If THAT comes back as "I can't, I have no access", the model
+                # has now said three times over that this turn needs a tool, and
+                # the router's one-shot guess is the only thing still claiming
+                # otherwise. Give it the tools rather than returning the refusal.
+                switched = False
+                async for ev in switch_to_agent(direct, step):
+                    if "__switched__" in ev:
+                        switched = bool(ev["__switched__"])
+                    else:
+                        yield ev
+                if switched:
+                    continue
                 yield done(direct or "I don't have enough to answer that confidently.", step)
                 return
 
@@ -2926,7 +3119,20 @@ class Agent:
                            "message": "that reply was an empty tool call, not an answer; "
                                       "asking again for plain text"}
                     answer = ""
+                # Before the answer clears the quality gates: is it an answer at
+                # all, or the model saying it needed a tool it was not given?
+                # Checked HERE rather than after settle(), because settle spends
+                # a revision step polishing the wording of a refusal and the
+                # drift check has no opinion about one.
                 if answer:
+                    switched = False
+                    async for ev in switch_to_agent(answer, step):
+                        if "__switched__" in ev:
+                            switched = bool(ev["__switched__"])
+                        else:
+                            yield ev
+                    if switched:
+                        continue
                     verdict = None
                     async for ev in settle(answer, stats, step):
                         if "__revise__" in ev or "__settled__" in ev:
@@ -2965,7 +3171,19 @@ class Agent:
 
             if name == "final_answer":
                 answer = str(args.get("answer") or "").strip()
+                # Same gate as the plain-text exit. final_answer is the loop's
+                # other way out, and a refusal delivered through it used to skip
+                # every check the prose exit runs -- the model could sidestep the
+                # switch simply by choosing the JSON syntax for the same reply.
                 if answer:
+                    switched = False
+                    async for ev in switch_to_agent(answer, step):
+                        if "__switched__" in ev:
+                            switched = bool(ev["__switched__"])
+                        else:
+                            yield ev
+                    if switched:
+                        continue
                     # No tool_call event: final_answer is how the loop exits, not
                     # an action worth a trace node. Emitting it rendered a stray
                     # "final_answer:" label above the reply.

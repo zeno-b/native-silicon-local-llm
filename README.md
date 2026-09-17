@@ -115,7 +115,8 @@ the multi-user, multi-node and auth features are additive and off by default.
 - **Native arm64 Python 3.10+**. `--selftest`, `--doctor` and `--list-models`
   also run on non-Apple hardware (without the model server).
 - **Dependencies** (installed automatically into `./.venv` on first run):
-  `mlx-lm`, `fastapi`, `uvicorn`, `httpx`, `pydantic`. Optional:
+  `mlx-lm`, `fastapi`, `uvicorn`, `httpx`, `pydantic`. Document generation
+  (PDF, Word, Excel, PowerPoint) is built in and needs nothing extra. Optional:
   `python-multipart` (browser file uploads to the knowledge base),
   `PyJWT`+`cryptography` (extra OIDC signature verification), `psutil` (memory-%
   routing signal), `pytest` (test suite).
@@ -190,12 +191,53 @@ every variable with placeholders. Highlights:
 | Office 365 | `O365_TENANT_ID`, `O365_CLIENT_ID`, `O365_CLIENT_SECRET`, `O365_SCOPES` |
 | Cluster/routing | `NODE_ROLE`, `NODE_NAME`, `STUDIO_NODE_URL`, `NODE_TOKEN`, `ROUTE_MAX_ACTIVE`, `ROUTE_QUEUE_DEPTH`, `ROUTE_CPU_PCT`, `ROUTE_LOAD_RATIO`, `ROUTE_MEM_PCT`, `ROUTE_SLA_MS`, `ROUTE_COOLDOWN_S`, `LARGE_MODEL_MARKERS`, `HEARTBEAT_INTERVAL`, `HEARTBEAT_TIMEOUT`, `NODE_PROBE_TIMEOUT` |
 | Admission control | `MAX_CONCURRENT_GENERATIONS`, `GENERATION_QUEUE_DEPTH`, `MAX_CONCURRENT_TASKS`, `AGENT_RUN_TIMEOUT` |
-| Agent/tools | `AGENT_ENABLED`, `AGENT_MIN_STEPS`, `AGENT_MAX_STEPS`, `AGENT_TOOLS`, `CODE_MAX_TOKENS`, `PROJECT_DIR`, `ALLOW_SHELL`, `ALLOW_PYTHON` |
+| Agent/tools | `AGENT_ENABLED`, `AGENT_ESCALATION`, `AGENT_MIN_STEPS`, `AGENT_MAX_STEPS`, `AGENT_TOOLS`, `CODE_MAX_TOKENS`, `PROJECT_DIR`, `ALLOW_SHELL`, `ALLOW_PYTHON` |
 | Task continuity | `TASK_STATE_ENABLED`, `TASK_ARTIFACT_CHARS`, `DRIFT_CHECK_ENABLED`, `ARTIFACT_REPLY_HEADROOM`, `DEBUG_PROMPTS` (see [Multi-turn task continuity](#multi-turn-task-continuity)) |
 | Training | `TRAIN_MIN_EXAMPLES`, `TRAIN_EPOCHS`, `TRAIN_ITERS`, `TRAIN_LR`, `TRAIN_SEQ_LEN`, `TRAIN_BATCH_SIZE`, `TRAIN_NUM_LAYERS`, `TRAIN_FINE_TUNE_TYPE`, `TRAIN_LORA_RANK`, `TRAIN_TOOL_RATIO`, `TRAIN_TOOL_QUALITY`, `TRAIN_REPLAY_RATIO`, `TRAIN_VAL_SPLIT`, `TRAIN_VAL_CHECK`, `TRAIN_TIMEOUT`, `TRAIN_MAX_BACKUPS`, `AUTO_RETRAIN_THRESHOLD` (see [Feedback and LoRA retraining](#feedback-and-lora-retraining)) |
 | Import | `IMPORT_MAX_ZIP_BYTES`, `IMPORT_MAX_FILES`, `IMPORT_MAX_UNCOMPRESSED_BYTES`, `IMPORT_MAX_FILE_BYTES` |
 | Search | `SEARCH_RESULTS` (provider is locked to DuckDuckGo Lite) |
 | Networking | `ALLOWED_ORIGINS` (extra CORS origins behind a proxy; `*` is refused) |
+
+### Producing files
+
+Ask for a document and you get one: **PDF, Word (.docx), Excel (.xlsx),
+PowerPoint (.pptx), HTML, CSV, Markdown or plain text**. The agent writes the
+body as Markdown and the `create_document` tool typesets it into the format the
+extension asks for — headings, bold and italic, bullet and numbered lists,
+tables, code blocks and page breaks, with page numbers on multi-page PDFs. The
+file lands in the workspace (or the attached project directory) and appears as a
+download link under the answer.
+
+This is written against the file formats directly and needs **no extra
+dependencies**: PDF is emitted as PDF 1.4 with the base-14 fonts, and .docx,
+.xlsx and .pptx are written as OOXML packages. A capability that only works when
+a wheel happens to be installed is exactly the "I can't do that" answer this app
+is built to avoid, so it is always available and works offline.
+
+"Write me a PDF of the Q3 numbers" is detected *before* routing, for the same
+reason a code request is: the router would quite reasonably answer "answer", the
+prompt would be rebuilt with no tools at all, and the model would write a
+perfectly good report into the chat while the file you asked for was never
+created. Merely mentioning a format ("summarise this pdf") is a request to read
+one and is left alone, so the agent never overwrites the file you handed it.
+
+Downloads are served by `GET /api/files/download?path=…`, which requires
+authentication, resolves the path through the same confinement the file tools
+use, and serves only the formats above — it is a download link, not an arbitrary
+file read.
+
+`AGENT_ESCALATION` (default 1) lets a turn switch into agent mode partway
+through. The router decides answer-vs-tool from one short call *before* the
+model has seen how hard the question is, and on "answer" the prompt is rebuilt
+without the tool protocol — so the turn used to be locked out of every tool for
+the rest of its life, and came back with "I don't have access to real-time data"
+while a working `web_search` sat one step away. With this on, a reply that
+reports a missing capability (no web, no access to your files) hands the turn
+its tools and spends another step instead of returning the refusal. It fires at
+most once per turn, never when the tool that would help is not registered, never
+when a lookup is impossible because the box is offline, and never against an
+explicit `/no-search` or `/kb`. Type `/agent` (or `/tools`) in front of a message
+to skip the router and start the turn in agent mode yourself.
 
 `AGENT_MIN_STEPS` (default 2) is the thinking-depth knob. Below it the agent will
 not settle on a plain-text reply: the first pass is treated as a draft, handed

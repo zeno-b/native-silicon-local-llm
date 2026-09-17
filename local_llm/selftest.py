@@ -88,7 +88,7 @@ def selftest() -> int:
         "core", "obslog", "database", "sysutil", "ui", "config", "model_server",
         "training", "websearch", "calculator", "tools", "llm", "model_client",
         "textutil", "codecheck", "taskstate", "agent", "tasks", "auth", "cluster",
-        "claude_import", "api",
+        "claude_import", "api", "documents",
         "diagnostics", "selftest", "cli",
     }
     _found = {p.stem for p in _pkg_dir.glob("*.py")} - {"__init__", "__main__"}
@@ -1070,11 +1070,90 @@ def selftest() -> int:
         ("/search who won the 2025 tour de france", ("web_search", "who won the 2025 tour de france")),
         ("/no-search explain tail latency", ("answer", "explain tail latency")),
         ("/kb what does our runbook say about failover", ("kb", "what does our runbook say about failover")),
+        ("/agent find the bug in main.py", ("agent", "find the bug in main.py")),
+        ("/tools what changed since friday", ("agent", "what changed since friday")),
         ("no leading slash here", None),
         ("/search", ("web_search", "")),     # bare command: caller ignores empty rest
     ]:
         if routing_override(text) != expected:
             failures.append(f"routing_override({text!r}) returned {routing_override(text)!r}")
+
+    # A request for a FILE is detected before routing: the router would answer
+    # "answer", the prompt would be rebuilt with no tools, and the model would
+    # write the report into the chat instead of producing the file.
+    for text, expected in [
+        ("write me a pdf report on the Q3 numbers", ".pdf"),
+        ("export this as a word document", ".docx"),
+        ("turn it into a spreadsheet", ".xlsx"),
+        ("build me a slide deck about the migration", ".pptx"),
+        ("save it as report.pdf", ".pdf"),
+        ("convert report.pdf to word", ".docx"),
+        ("now make that a pdf", ".pdf"),
+        # Mentioning a format is not asking for one to be produced. Acting on
+        # these would have the agent overwrite the file it was asked to read.
+        ("summarise this pdf for me", None),
+        ("read the excel file I uploaded", None),
+        ("open report.pdf and tell me what it says", None),
+        ("what is a pdf?", None),
+        ("write a python script that parses a pdf", None),
+    ]:
+        if document_request(text) != expected:
+            failures.append(f"document_request({text!r}) returned "
+                            f"{document_request(text)!r}, expected {expected!r}")
+
+    # Every offered format actually renders, and renders something a reader will
+    # open: a PDF with a header and an xref, an OOXML package whose parts are all
+    # well-formed XML. A format in the menu that produces a broken file is worse
+    # than one that is not offered.
+    import io as _io
+    import zipfile as _zipfile
+    import xml.dom.minidom as _minidom
+    _doc = ("# Title\n\nSome **bold** prose.\n\n| A | B |\n|---|---|\n| 1 | two |\n\n"
+            "- bullet\n\n```\ncode\n```\n")
+    for _suffix in sorted(documents.FORMATS):
+        if _suffix == ".json":
+            continue
+        try:
+            _data = documents.render(_doc, _suffix, "Title")
+        except Exception as _exc:
+            failures.append(f"documents.render({_suffix}) raised: "
+                            f"{type(_exc).__name__}: {_exc}")
+            continue
+        if not _data:
+            failures.append(f"documents.render({_suffix}) produced nothing")
+        elif _suffix == ".pdf":
+            if not (_data.startswith(b"%PDF-1.4") and b"xref" in _data
+                    and b"/Type /Catalog" in _data and _data.rstrip().endswith(b"%%EOF")):
+                failures.append("the generated PDF is not a well-formed PDF file")
+        elif _suffix in (".docx", ".xlsx", ".pptx"):
+            try:
+                _zip = _zipfile.ZipFile(_io.BytesIO(_data))
+                for _part in _zip.namelist():
+                    if _part.endswith((".xml", ".rels")):
+                        _minidom.parseString(_zip.read(_part))
+            except Exception as _exc:
+                failures.append(f"the generated {_suffix} is not a readable OOXML "
+                                f"package: {type(_exc).__name__}: {_exc}")
+
+    # A tool-free turn switches into agent mode on the model's own report that it
+    # lacked a capability. The detector has to tell that report apart from a
+    # hedge in front of a real answer, because escalating a finished answer
+    # spends a search (and a step) on a question already answered.
+    for text, expected in [
+        ("I don't have access to real-time data, so I can't give today's price.", "lookup"),
+        ("I'm unable to browse the web.", "lookup"),
+        ("As of my last knowledge update, the newest release was 3.11.", "lookup"),
+        ("I can't read your files. Please paste the code.", "files"),
+        ("Without seeing your code I cannot say why it fails.", "files"),
+        ("The capital of France is Paris.", None),
+        # A hedge with the answer behind it is not a refusal.
+        ("I don't have real-time access, but as of 2024 " + "the answer is 42. " * 40, None),
+        # Work was done; the caveat in it is a caveat.
+        ("I can't access the internet, but here it is:\n```python\nprint(1)\n```", None),
+    ]:
+        if missing_capability(text) != expected:
+            failures.append(f"missing_capability({text[:40]!r}) returned "
+                            f"{missing_capability(text)!r}, expected {expected!r}")
 
     # Web-search rerank: the on-topic result is fetched before the off-topic one
     # that the engine happened to rank first, and aggregator hosts are demoted.
