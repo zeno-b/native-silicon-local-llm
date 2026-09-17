@@ -635,6 +635,11 @@ class TaskState:
         self.output_kind = "document"
         if not self.objective:
             self.objective = " ".join((message or "").split())[:800]
+        if suffix and not self.document_format:
+            self.document_format = suffix
+        if not self.document_path:
+            self.document_path = self.default_document_name()
+            self.artifact_name = self.document_path
         if suffix and suffix != self.document_format:
             # A format change on the same document ("now make it a word
             # document") keeps the source and moves the file, so the brief, the
@@ -837,6 +842,34 @@ class TaskState:
             self.artifact_name = detect_filename(body) or self.default_artifact_name()
         self.output_kind = "code"
         self.updated_at = time.time()
+
+    # Words that say what KIND of file it is, not what it is about. A document
+    # named "word-document-for.docx" tells the user nothing.
+    _DOC_NAME_FILLER = {
+        "create", "make", "write", "draft", "generate", "produce", "build",
+        "prepare", "give", "need", "want", "please", "document", "documents",
+        "file", "report", "word", "excel", "powerpoint", "spreadsheet",
+        "workbook", "deck", "presentation", "markdown", "text", "about",
+        "with", "from", "into", "that", "this", "them", "they", "look",
+        "much", "find", "then", "your", "yours", "some", "very", "also",
+        "for", "you", "can", "the", "and", "are", "its", "our", "all",
+        "one", "new", "out", "use", "www", "http", "https", "com", "please",
+    }
+
+    def default_document_name(self) -> str:
+        """A short descriptive file name derived from the objective.
+
+        The model should not have to invent one: told to pick a name, a 3B model
+        picks whatever the rules happen to call it, which is how a turn produced
+        `"path": "the document.docx"`.
+        """
+        suffix = self.document_format or ".pdf"
+        seen: list[str] = []
+        for word in re.findall(r"[a-z0-9]{3,}", (self.objective or "").lower()):
+            if word not in self._DOC_NAME_FILLER and word not in seen:
+                seen.append(word)
+        stem = "-".join(seen[:4]) if seen else "document"
+        return f"{stem[:60].strip('-') or 'document'}{suffix}"
 
     def default_artifact_name(self) -> str:
         extension = _LANG_EXT.get(self.language, "txt")
@@ -1168,17 +1201,33 @@ class TaskState:
                          "or does not do what its comments claim, say so plainly.")
             return "\n".join(rules)
         if self.is_document_task():
-            name = self.document_path or f"the document{self.document_format}"
-            rules.append(f"- You are updating an existing document: {name}. Its "
-                         "current Markdown source is above.")
-            rules.append("- Apply the user's latest request to that source, then call "
-                         f"create_document with path \"{name}\" and the COMPLETE "
-                         "revised Markdown in content. Keep everything the user did "
-                         "not ask you to change, including the existing headings, "
-                         "tables and placeholder fields.")
+            # There is only a document to UPDATE once one has been written. On
+            # the first turn these rules used to fire anyway, with the path
+            # falling back to the literal words "the document" -- so the model
+            # was told to update a file that did not exist, at a made-up name,
+            # and obediently wrote `"path": "the document.docx"`.
+            name = self.document_path
+            if self.artifact and name:
+                rules.append(f"- You are updating an existing document: {name}. Its "
+                             "current Markdown source is above.")
+                rules.append("- Apply the user's latest request to that source, then "
+                             f"call create_document with path \"{name}\" and the "
+                             "COMPLETE revised Markdown in content. Keep everything "
+                             "the user did not ask you to change, including the "
+                             "existing headings, tables and placeholder fields.")
+            else:
+                rules.append(f"- Write the document the objective asks for and call "
+                             f"create_document once, with path \"{name}\"."
+                             if name else
+                             "- Write the document the objective asks for and call "
+                             "create_document once, with a short descriptive file "
+                             f"name ending in {self.document_format or '.pdf'}.")
+                rules.append("- Put the WHOLE document in the content argument as "
+                             "Markdown: # headings, **bold**, - bullets, | tables |. "
+                             "Start with a # title.")
             rules.append("- Do NOT write the document into your reply and do NOT use "
                          "write_file. Once the tool succeeds, say in one or two "
-                         "sentences what you changed.")
+                         "sentences what you made or changed.")
             return "\n".join(rules)
         if self.artifact:
             rules.append(f"- Continue working on the existing {language} artifact above. "

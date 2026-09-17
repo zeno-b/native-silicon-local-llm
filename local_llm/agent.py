@@ -1163,6 +1163,19 @@ class Agent:
                 + "\n\nUsing those passages only where they apply (cite the [path] "
                   "when you do), answer:\n" + user_message)
 
+    # What a document turn is allowed to call. Everything else in the registry
+    # is ~1600 tokens of a 4096-token window describing tools it will not touch,
+    # and that is budget the document itself has to fit in.
+    DOCUMENT_TOOLS = ("create_document", "final_answer")
+    DOCUMENT_LOOKUP_TOOLS = ("web_search", "fetch_url", "read_file", "search_docs")
+
+    def document_tool_subset(self, research: bool) -> list[str]:
+        """The tools a document turn may use, narrowed to what is registered."""
+        names = list(self.DOCUMENT_TOOLS)
+        if research:
+            names += list(self.DOCUMENT_LOOKUP_TOOLS)
+        return [n for n in names if self.registry.get(n) is not None]
+
     def build_base(
         self,
         history: list[dict],
@@ -1171,6 +1184,7 @@ class Agent:
         tools: bool = True,
         extra_context: str = "",
         active_code_task: bool = False,
+        tool_subset: "list[str] | None" = None,
     ) -> tuple[list[dict], int]:
         """Assemble [system, trimmed history, user]. This prefix is never cut later.
 
@@ -1183,7 +1197,8 @@ class Agent:
             "role": "system",
             "content": (build_agent_system_prompt(
                             self.config.system_prompt_with_identity, self.registry,
-                            reasoning=self.config.reasoning_visible)
+                            reasoning=self.config.reasoning_visible,
+                            only=tool_subset)
                         if tools else
                         build_plain_system_prompt(
                             self.config.system_prompt_with_identity,
@@ -1548,6 +1563,111 @@ class Agent:
                     "memory (also saved to disk):\n\n" + saved)
         return note
 
+    async def auto_continue(self, final: dict, request: str, history: list[dict],
+                            conversation_id: str | None, max_tokens: int | None,
+                            temperature: float | None,
+                            cancel: "asyncio.Event | None" = None):
+        """Carry an answer that stopped at the reply limit through to its end.
+
+        The reply budget is a property of the context window, not of the
+        request: a program that needs 2000 tokens on a 4096-token context is
+        going to be cut off however it is phrased. Leaving it there and printing
+        "ask me to continue" made finishing the work the user's job, one "go on"
+        at a time -- and every one of those round trips re-prefills the whole
+        prompt, so the manual route is also the expensive one.
+
+        This reuses the continuation lane exactly as a typed "continue" does; it
+        only stops waiting to be asked. Bounded by auto_continue_max, and a pass
+        that adds nothing ends the loop, so a model with nothing left to say
+        cannot spin through the budget discovering that repeatedly.
+
+        Yields UI events, then exactly one {"__final__": <the completed final>}.
+        """
+        answer = str(final.get("answer") or "")
+        passes_allowed = self.config.auto_continue_max if self.config.auto_continue else 0
+        if passes_allowed <= 0 or not was_truncated(answer):
+            yield {"__final__": final}
+            return
+
+        task = self.load_task(conversation_id, history)
+        # A turn that was ITSELF a "continue" hands "continue" down as the
+        # request, which says nothing about the work. The recorded objective is
+        # the anchor, exactly as continuation_target uses it for the manual case.
+        if is_continue_request(request) and task.objective:
+            request = task.objective
+        prompt_tokens = int(final.get("prompt_tokens") or 0)
+        completion_tokens = int(final.get("completion_tokens") or 0)
+        elapsed_ms = float(final.get("elapsed_ms") or 0.0)
+        passes = 0
+        last_addition = ""
+
+        while passes < passes_allowed and was_truncated(answer):
+            if cancel is not None and cancel.is_set():
+                break
+            partial = strip_truncation_note(answer)
+            if not partial.strip():
+                break
+            passes += 1
+            yield {"type": "notice", "info": True,
+                   "message": (f"the reply hit the token limit; continuing "
+                               f"automatically ({passes}/{passes_allowed})")}
+            log(f"auto-continue pass {passes}: resuming a "
+                f"{estimate_tokens(partial)}-token partial answer.", logging.INFO)
+            resumed = None
+            async for event in self.continue_answer(
+                    (request, partial), history, max_tokens, temperature, cancel,
+                    conversation_id, task):
+                if event.get("type") == "final":
+                    resumed = event
+                elif event.get("type") == "cancelled":
+                    yield event
+                    return
+                else:
+                    yield event
+            if resumed is None:
+                break
+            prompt_tokens += int(resumed.get("prompt_tokens") or 0)
+            completion_tokens += int(resumed.get("completion_tokens") or 0)
+            elapsed_ms += float(resumed.get("elapsed_ms") or 0.0)
+            grown = str(resumed.get("answer") or "")
+            body = strip_truncation_note(grown)
+            addition = body[len(partial):].strip()
+            if len(body) <= len(partial) or not addition:
+                # The pass produced nothing new. continue_answer already says so
+                # when the model returns empty; this also catches a pass that
+                # only re-emitted the boundary.
+                answer = grown or answer
+                break
+            if addition == last_addition:
+                # Two passes in a row added the same text: the model is looping,
+                # not writing. stitch_continuation catches a restart and a
+                # duplicated seam, but not a short phrase repeated forever, and
+                # spending the remaining passes on it only makes the answer
+                # longer and worse.
+                log("auto-continue: the continuation repeated itself; stopping.",
+                    logging.WARNING)
+                answer = grown
+                break
+            last_addition = addition
+            answer = grown
+
+        completed = dict(final)
+        completed["answer"] = answer
+        completed["prompt_tokens"] = prompt_tokens
+        completed["completion_tokens"] = completion_tokens
+        completed["elapsed_ms"] = round(elapsed_ms)
+        completed["truncated"] = was_truncated(answer)
+        completed["continued"] = passes
+        if passes and was_truncated(answer):
+            # Honest about where it stopped: the note under the answer still
+            # says "ask me to continue", and now that is the actual next step.
+            yield {"type": "notice", "info": True,
+                   "message": (f"still unfinished after {passes} automatic "
+                               "continuation"
+                               + ("s" if passes != 1 else "")
+                               + "; say \"continue\" for more, or raise Max tokens")}
+        yield {"__final__": completed}
+
     async def run_iterating(self, message, history, conversation_id, max_tokens, temperature):
         """Run the agent, then verify any code it changed and, if the checks fail,
         let it see the errors and try again — up to auto_iterate_rounds times.
@@ -1575,6 +1695,17 @@ class Agent:
             async for ev in self.run(current, history, conversation_id, max_tokens,
                                      temperature, internal=round_i > 0):
                 if ev.get("type") == "final":
+                    # Finish it before anything treats it as the round's answer:
+                    # the verification below reads changed files, and the task
+                    # state records the artifact, and both should see the whole
+                    # thing rather than the half that fitted in one reply.
+                    async for sub in self.auto_continue(
+                            ev, message, history, conversation_id, max_tokens,
+                            temperature):
+                        if "__final__" in sub:
+                            ev = sub["__final__"]
+                        else:
+                            yield sub
                     for name in ev.get("documents") or []:
                         if name not in produced:
                             produced.append(name)
@@ -1981,6 +2112,18 @@ class Agent:
                 doc_format = task.document_format
                 editing_document = True
         document_directive = ""
+        document_research = False
+        if doc_format:
+            # "look up as much as you can find about them, then draft the
+            # document" is half the request. Sending the model straight to
+            # create_document produces a confident page of invented facts, which
+            # is worse than no document -- so the lookup tools come back and the
+            # directive spells out the order.
+            document_research = (document_needs_research(user_message)
+                                 and bool(self.registry.get("web_search")
+                                          or self.registry.get("fetch_url"))
+                                 and forced_lane not in ("answer", "kb")
+                                 and await has_internet())
         if doc_format:
             # Register the task NOW, not after the tool call: a turn whose tool
             # call fails still leaves the next turn knowing what was being made.
@@ -2003,17 +2146,33 @@ class Agent:
                 yield {"type": "notice", "info": True,
                        "message": f"updating {target}"}
             else:
+                target = task.document_path or f"document{doc_format}"
                 document_directive = (
                     f"The user is asking you to PRODUCE A FILE: a {name}. Call the "
-                    f"create_document tool with a path ending in {doc_format} and the "
-                    "whole document in its content argument, written as Markdown "
+                    f"create_document tool with path \"{target}\" and the whole "
+                    "document in its content argument, written as Markdown "
                     "(# headings, **bold**, - bullets, | tables |). Do not write the "
                     "document into your reply and do not use write_file. After the "
                     "tool succeeds, answer with one or two sentences saying what you "
                     "made; the user gets a download link automatically."
                 )
+                if document_research:
+                    document_directive = (
+                        "Work in two steps and do NOT skip the first.\n"
+                        "STEP 1 — RESEARCH: the user asked you to look this up. Call "
+                        "web_search now (or fetch_url for a page they named) and read "
+                        "what comes back. Do not call create_document yet.\n"
+                        f"STEP 2 — WRITE: once you have the findings, call "
+                        f"create_document with path \"{target}\" and the whole "
+                        f"{name} in its content argument as Markdown (# headings, "
+                        "**bold**, - bullets, | tables |). Base it on what you found "
+                        "and say plainly where the sources were thin rather than "
+                        "filling the gaps in. Then answer in one or two sentences."
+                    )
                 yield {"type": "notice", "info": True,
-                       "message": f"writing a {name} for you"}
+                       "message": (f"looking things up first, then writing a {name}"
+                                   if document_research else
+                                   f"writing a {name} for you")}
 
         # Classify the kind of work once, so the cluster router can steer heavy
         # reasoning/code generation toward the more capable (Studio) node while
@@ -2050,9 +2209,16 @@ class Agent:
         extra_context = "\n\n".join(
             part for part in (skill_context, reference_context, brief,
                               document_directive) if part)
+        # A document turn can only ever call create_document (plus a lookup tool
+        # when it is researching), so the other twenty-one specs are ~1600
+        # tokens of a 4096-token window describing tools it will not touch --
+        # budget the document itself has to fit into.
+        tool_subset = (self.document_tool_subset(document_research)
+                       if doc_format else None)
         base, dropped = self.build_base(history, user_message, reserve,
                                         extra_context=extra_context,
-                                        active_code_task=bool(brief and task.is_code_task()))
+                                        active_code_task=bool(brief and task.is_code_task()),
+                                        tool_subset=tool_subset)
         # Reported ONCE per turn, not once per prompt build. This used to fire
         # here and again after the lane was picked, and the internals line
         # restated both, so a single turn said "trimmed N old messages" three
@@ -2114,6 +2280,8 @@ class Agent:
         # Bounded: a model that keeps inventing tool names gets corrected
         # twice, then answered in prose rather than looping.
         bad_names = 0
+        # Tool calls that ran out of reply budget mid-JSON this turn.
+        cut_calls = 0
         # Subagents spawned this turn. Capped so a parent cannot delegate in a
         # loop, which on a 3B model is a real failure mode rather than a
         # theoretical one.
@@ -3105,6 +3273,43 @@ class Agent:
                 return
 
             call = parse_tool_call(buffer, known)
+
+            # A tool call that ran out of reply budget partway through its JSON.
+            # parse_tool_call correctly refuses it -- and the branch below then
+            # handed two thousand characters of half-written document to the
+            # user as though it were the answer, which is what a "create a Word
+            # document" turn returned instead of a file. Say what happened and
+            # ask for one that fits.
+            if call is None and is_truncated_tool_call(buffer, known):
+                cut_calls += 1
+                log(f"step {step}: the tool call was cut off at the "
+                    f"{effective_reserve}-token reply limit after "
+                    f"{len(buffer)} characters.", logging.WARNING)
+                if cut_calls > 2 or step >= self.config.agent_max_steps:
+                    yield done(
+                        "I could not fit that document into this model's context "
+                        f"window ({self.config.context_size} tokens): the tool call "
+                        "carrying it was cut off each time I tried. Ask for a "
+                        "shorter document — fewer sections, or one section at a "
+                        "time — or raise CONTEXT_SIZE and ask again.",
+                        step, truncated=True)
+                    return
+                yield {"type": "notice", "info": True,
+                       "message": ("that tool call was cut off at the reply limit; "
+                                   "asking for a shorter document")}
+                # The cut-off text is never appended to the trace: putting a
+                # half-written call in front of the model is how it learns to
+                # write another one.
+                scratch.append({"role": "assistant",
+                                "content": "(the tool call was cut off)"})
+                scratch.append({"role": "user", "content":
+                                f"Your tool call was cut off after "
+                                f"{effective_reserve} tokens: the content argument "
+                                "was too long to finish. Call the SAME tool again "
+                                "with the same path and a SHORTER document — keep "
+                                "the structure, cut the prose to about half, and "
+                                "make sure the JSON closes."})
+                continue
 
             # Canonicalise the tool name BEFORE any policy check runs on it.
             # parse_tool_call honours an explicit {"tool": ...} key whatever the

@@ -189,6 +189,19 @@ class Config:
     # switch fires on the model's OWN report that it lacked a capability, which
     # is evidence the router never had, and at most once per turn.
     agent_escalation: bool = field(default_factory=lambda: os.environ.get("AGENT_ESCALATION", "1") == "1")
+    # Finish an answer that stopped at the reply limit without being asked. The
+    # reply budget is a property of the context window, not of the request: a
+    # program that needs 2000 tokens on a 4096-token context gets cut off
+    # however it is phrased. Leaving it there and printing "ask me to continue"
+    # made finishing the work the user's job, one "go on" at a time, and every
+    # one of those round trips re-prefills the whole prompt. The continuation
+    # lane already existed for the manual case; this stops it waiting to be
+    # asked. 0 restores the old behaviour.
+    auto_continue: bool = field(default_factory=lambda: os.environ.get("AUTO_CONTINUE", "1") == "1")
+    # How many continuation passes one turn may spend. Each is a full
+    # generation, so this is a wall-clock budget as much as a quality one.
+    auto_continue_max: int = field(default_factory=lambda: int(
+        os.environ.get("AUTO_CONTINUE_MAX", "3")))
     # After a lookup search, automatically fetch this many of the top result
     # pages and give the model their full text, not just the snippet. This is
     # what makes one generic search path answer domain-specific questions (a
@@ -764,6 +777,7 @@ class Config:
         # DuckDuckGo Lite and cannot be changed from the UI or the API.
         "search_results", "tool_result_chars", "tool_raw_chars", "auto_fetch_results",
         "disable_thinking", "reasoning_visible", "tool_temperature", "fast_path", "stable_prefix", "knowledge_triage", "agent_escalation",
+        "auto_continue", "auto_continue_max",
         "summarise_tool_results", "summarise_over_chars",
         # Safeguards, all tunable live so a machine can be dialled in without a
         # restart or an env edit.
@@ -943,6 +957,10 @@ class Config:
         self.reasoning_step_timeout = min(300, max(10, self.reasoning_step_timeout))
         self.retrieval_deadline = min(600.0, max(15.0, self.retrieval_deadline))
         self.auto_iterate_rounds = min(5, max(0, self.auto_iterate_rounds))
+        # Each pass is a full generation on a local model, so the ceiling is a
+        # wall-clock guard: six passes of a slow 3B is several minutes of a
+        # turn the user cannot interrupt except by stopping it.
+        self.auto_continue_max = min(6, max(0, self.auto_continue_max))
         self.rag_passages = min(20, max(1, self.rag_passages))
 
         # --- Skills ----------------------------------------------------------- #

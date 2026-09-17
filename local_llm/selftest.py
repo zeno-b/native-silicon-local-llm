@@ -1122,6 +1122,60 @@ def selftest() -> int:
             failures.append(f"a document follow-up was misjudged: {_text!r} "
                             f"reset={_reset}, expected {_new}")
 
+    # Auto-continue is on by default and bounded: each pass is a full
+    # generation, so an unbounded loop is minutes of a turn nobody asked for.
+    _ac = Config(skills_dir=tempfile.mkdtemp(prefix="local-llm-selftest-skills-"))
+    if not _ac.auto_continue:
+        failures.append("auto-continue is off by default; a cut-off answer would "
+                        "wait for the user to type 'continue'")
+    if Config(auto_continue_max=99).auto_continue_max != 6:
+        failures.append("auto_continue_max is not clamped")
+    if "auto_continue" not in Config.MUTABLE:
+        failures.append("auto_continue cannot be changed from Settings")
+
+    # A document request that also asks for a lookup has to search BEFORE it
+    # writes, or the document is a confident page of invented facts.
+    for _text, _wants in [
+        ("create a word document for end of year analysis of www.texcel.be. "
+         "look up as much as you can find about them", True),
+        ("make a deck about https://kubernetes.io", True),
+        ("research the market and give me a word doc", True),
+        ("create a pdf for construction invoice", False),
+        ("write me a pdf about our Q3 numbers", False),
+        ("make a pdf of main.py", False),
+    ]:
+        if document_needs_research(_text) != _wants:
+            failures.append(f"document_needs_research({_text[:40]!r}) returned "
+                            f"{document_needs_research(_text)!r}, expected {_wants!r}")
+
+    # A tool call cut off mid-JSON is not an answer. Treating it as one handed
+    # the user two thousand characters of half-written document.
+    if not is_truncated_tool_call(
+            '{"tool": "create_document", "args": {"path": "x.docx", "content": "# Hi'):
+        failures.append("a cut-off tool call was not recognised as truncated")
+    for _complete in ('{"tool": "create_document", "args": {"path": "x.docx"}}',
+                      "The answer is 42.", ""):
+        if is_truncated_tool_call(_complete):
+            failures.append(f"is_truncated_tool_call({_complete[:30]!r}) was a false positive")
+
+    # The FIRST document turn must not be told to update one, and must not be
+    # handed a made-up path: that is what produced `"path": "the document.docx"`.
+    from .taskstate import TaskState as _TaskState
+    _doc_task = _TaskState()
+    _doc_task.start_document("create a word document for end of year analysis of "
+                             "www.texcel.be", ".docx")
+    _doc_rules = _doc_task.rules()
+    if "the document.docx" in _doc_rules or "updating an existing" in _doc_rules:
+        failures.append("the first document turn was told to update a document "
+                        "that does not exist yet")
+    if not _doc_task.document_path.endswith(".docx") or " " in _doc_task.document_path:
+        failures.append(f"a document task chose a poor default name: "
+                        f"{_doc_task.document_path!r}")
+
+    # A runaway decode loop must not become hundreds of blank pages in the file.
+    if len(documents._tame_runaway("# T" + "\n" * 900)) > 200:
+        failures.append("a runaway generation was not tamed before rendering")
+
     # A revision pass that asks for the draft instead of improving it must not
     # replace the draft: that reply is non-empty, so it used to win.
     for _text, _meta in [

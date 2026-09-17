@@ -191,7 +191,7 @@ every variable with placeholders. Highlights:
 | Office 365 | `O365_TENANT_ID`, `O365_CLIENT_ID`, `O365_CLIENT_SECRET`, `O365_SCOPES` |
 | Cluster/routing | `NODE_ROLE`, `NODE_NAME`, `STUDIO_NODE_URL`, `NODE_TOKEN`, `ROUTE_MAX_ACTIVE`, `ROUTE_QUEUE_DEPTH`, `ROUTE_CPU_PCT`, `ROUTE_LOAD_RATIO`, `ROUTE_MEM_PCT`, `ROUTE_SLA_MS`, `ROUTE_COOLDOWN_S`, `LARGE_MODEL_MARKERS`, `HEARTBEAT_INTERVAL`, `HEARTBEAT_TIMEOUT`, `NODE_PROBE_TIMEOUT` |
 | Admission control | `MAX_CONCURRENT_GENERATIONS`, `GENERATION_QUEUE_DEPTH`, `MAX_CONCURRENT_TASKS`, `AGENT_RUN_TIMEOUT` |
-| Agent/tools | `AGENT_ENABLED`, `AGENT_ESCALATION`, `AGENT_MIN_STEPS`, `AGENT_MAX_STEPS`, `AGENT_TOOLS`, `CODE_MAX_TOKENS`, `PROJECT_DIR`, `ALLOW_SHELL`, `ALLOW_PYTHON` |
+| Agent/tools | `AGENT_ENABLED`, `AGENT_ESCALATION`, `AUTO_CONTINUE`, `AUTO_CONTINUE_MAX`, `AGENT_MIN_STEPS`, `AGENT_MAX_STEPS`, `AGENT_TOOLS`, `CODE_MAX_TOKENS`, `PROJECT_DIR`, `ALLOW_SHELL`, `ALLOW_PYTHON` |
 | Task continuity | `TASK_STATE_ENABLED`, `TASK_ARTIFACT_CHARS`, `DRIFT_CHECK_ENABLED`, `ARTIFACT_REPLY_HEADROOM`, `DEBUG_PROMPTS` (see [Multi-turn task continuity](#multi-turn-task-continuity)) |
 | Training | `TRAIN_MIN_EXAMPLES`, `TRAIN_EPOCHS`, `TRAIN_ITERS`, `TRAIN_LR`, `TRAIN_SEQ_LEN`, `TRAIN_BATCH_SIZE`, `TRAIN_NUM_LAYERS`, `TRAIN_FINE_TUNE_TYPE`, `TRAIN_LORA_RANK`, `TRAIN_TOOL_RATIO`, `TRAIN_TOOL_QUALITY`, `TRAIN_REPLAY_RATIO`, `TRAIN_VAL_SPLIT`, `TRAIN_VAL_CHECK`, `TRAIN_TIMEOUT`, `TRAIN_MAX_BACKUPS`, `AUTO_RETRAIN_THRESHOLD` (see [Feedback and LoRA retraining](#feedback-and-lora-retraining)) |
 | Import | `IMPORT_MAX_ZIP_BYTES`, `IMPORT_MAX_FILES`, `IMPORT_MAX_UNCOMPRESSED_BYTES`, `IMPORT_MAX_FILE_BYTES` |
@@ -243,10 +243,37 @@ A question about the document ("what does it say?") is answered, not rendered,
 and a code request after a document drops the document task rather than briefing
 the model to re-render it.
 
-On a 4096-token context the tool prompt alone is about 2000 tokens, so a
-document over roughly 3000 characters starts to squeeze the reply budget the
-`create_document` call has to fit in. Raise `CONTEXT_SIZE` if you generate long
-documents.
+**Ask it to look something up and it will, before it writes.** "Look up as much
+as you can find about them, then draft the document" is half the request; a
+document turn that skips it produces a confident page of invented facts, which
+is worse than no document. Naming a site (`www.example.be`, a URL) counts as
+asking. The turn then works in two steps — search, then write — and is told to
+say where the sources were thin rather than filling the gaps in.
+
+**A document turn carries only the tools it can use.** The full catalogue is
+~2200 tokens of a 4096-token window, and a turn that can only call
+`create_document` was spending 1600 of them describing twenty-one tools it would
+never touch — leaving barely a thousand tokens for the document to fit inside
+the tool call, where it was cut off mid-JSON and no file was produced. Narrowing
+the catalogue roughly doubles the room the document gets. If a call is cut off
+anyway, the turn says so and asks for a shorter document rather than showing you
+the half-written JSON as an answer.
+
+`AUTO_CONTINUE` (default 1) finishes an answer that stopped at the reply limit,
+without being asked. The reply budget is a property of the context window, not
+of the request — a program that needs 2000 tokens on a 4096-token context is
+going to be cut off however it is phrased — so printing "ask me to continue" and
+stopping made finishing the work your job, one "go on" at a time, and every one
+of those round trips re-prefills the whole prompt. It reuses the same
+continuation lane a typed "continue" does; it just stops waiting to be asked.
+
+`AUTO_CONTINUE_MAX` (default 3, capped at 6) is how many passes one turn may
+spend. Each is a full generation, so this is a wall-clock budget as much as a
+quality one. The loop also stops early when a pass adds nothing, or when two
+passes in a row add the same text — a model looping a phrase should not make the
+answer longer and worse. If the answer is still unfinished when the passes run
+out, the turn says so and the cut-off marker stays, so a typed "continue" still
+picks up where it left off. `AUTO_CONTINUE=0` restores the old behaviour.
 
 `AGENT_ESCALATION` (default 1) lets a turn switch into agent mode partway
 through. The router decides answer-vs-tool from one short call *before* the

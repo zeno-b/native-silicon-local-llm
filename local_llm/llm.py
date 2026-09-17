@@ -11,6 +11,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
+from typing import Sequence
 
 from .core import *  # noqa: F401,F403
 from .config import *  # noqa: F401,F403
@@ -126,10 +127,48 @@ def skills_block(registry: ToolRegistry) -> str:
     return block
 
 
+# A tool call the model ran out of reply budget partway through. The JSON never
+# closes, so parse_tool_call refuses it -- and the loop then hands two thousand
+# characters of half-written document to the user as though it were the answer.
+def is_truncated_tool_call(text: str, known: "set[str] | None" = None) -> bool:
+    """True when `text` is the start of a tool call that never finished."""
+    body = strip_reasoning(text or "").strip()
+    if body.startswith("```"):
+        body = re.sub(r"^```[a-zA-Z]*\s*", "", body)
+    if not body.startswith("{"):
+        return False
+    if body.rstrip().endswith("}") and body.count("{") == body.count("}"):
+        return False                # balanced: it failed to parse for some other reason
+    if not re.search(r'"(?:tool|action|name)"\s*:', body):
+        return False
+    if known:
+        return any(f'"{name}"' in body for name in known)
+    return True
+
+
 def build_agent_system_prompt(base_prompt: str, registry: ToolRegistry,
-                              reasoning: bool = False) -> str:
+                              reasoning: bool = False,
+                              only: Sequence[str] | None = None) -> str:
+    """The tool-lane prompt: the protocol plus one spec per tool.
+
+    `only` narrows the catalogue to the tools a turn can actually use. Every
+    spec is ~65 tokens and the full list is ~2200 of a 4096-token window, so a
+    document turn that can only ever call create_document was spending 1600
+    tokens describing twenty-one tools it would not touch -- and then had barely
+    a thousand tokens left to write the document itself into a tool call. It got
+    cut off mid-JSON, the call never parsed, and the turn produced no file.
+    """
     lines = []
-    for tool in registry.specs():
+    specs = registry.specs()
+    if only:
+        wanted = set(only)
+        narrowed = [t for t in specs if t["name"] in wanted]
+        # Never narrow to nothing: an empty catalogue with the protocol still in
+        # front of it is the worst of both, a model told to reply with a tool
+        # call and given no tool to name.
+        if narrowed:
+            specs = narrowed
+    for tool in specs:
         params = ", ".join(
             f"{name} ({desc})" for name, desc in tool["parameters"].items()
         ) or "no arguments"
@@ -140,7 +179,11 @@ def build_agent_system_prompt(base_prompt: str, registry: ToolRegistry,
     prompt += skills_block(registry)
     if reasoning:
         prompt += REASONING_INSTRUCTION
-    note_prefix(prompt, lane="tools")
+    # A narrowed catalogue is its own cached prefix. Reporting it on the "tools"
+    # lane would log "the tool set changed" every time a document turn followed
+    # an ordinary one, which is routine alternation and not the edit that
+    # warning exists to catch.
+    note_prefix(prompt, lane="tools-subset" if only else "tools")
     return prompt
 
 
@@ -442,6 +485,7 @@ async def has_internet(recheck_after: float = 30.0) -> bool:
 # Re-exported explicitly: the original file was one flat namespace, so private
 # helpers (leading underscore) must cross module boundaries too.
 __all__ = [
+    'is_truncated_tool_call',
     'SKILL_PREAMBLE',
     'project_block',
     'skills_block',

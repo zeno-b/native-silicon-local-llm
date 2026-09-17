@@ -143,8 +143,25 @@ def _split_row(line: str) -> list[str]:
     return [cell.strip() for cell in line.split("|")]
 
 
+# A model that loses its place emits the same token until the budget runs out.
+# One turn produced a document whose content was several thousand consecutive
+# newlines; rendered literally that is hundreds of blank pages. Markdown needs at
+# most one blank line between blocks, so collapsing runs costs nothing real and
+# turns a runaway into a short document.
+_RUNAWAY_BLANKS = re.compile(r"\n{3,}")
+_RUNAWAY_REPEAT = re.compile(r"(.{1,40}?)\1{9,}", re.S)
+
+
+def _tame_runaway(text: str) -> str:
+    text = _RUNAWAY_BLANKS.sub("\n\n", text or "")
+    # Any short fragment repeated ten times or more in a row is a decode loop,
+    # not content. Keep two copies so a legitimate repeated row survives.
+    return _RUNAWAY_REPEAT.sub(lambda m: m.group(1) * 2, text)
+
+
 def parse_markdown(text: str) -> list[Block]:
     """Turn Markdown into the block list every writer consumes."""
+    text = _tame_runaway(text)
     lines = (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
     blocks: list[Block] = []
     para: list[str] = []
@@ -1527,6 +1544,7 @@ __all__ = [
     "Run",
     "Block",
     "parse_markdown",
+    "_tame_runaway",
     "parse_runs",
     "document_title",
     "render",

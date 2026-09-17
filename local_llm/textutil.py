@@ -578,6 +578,39 @@ def starts_new_document(message: str, objective: str) -> bool:
     return not (fresh & _subject_words(objective or ""))
 
 
+# "look up as much as you can find about them, then draft the document" -- an
+# explicit instruction to research before writing. Without it the document
+# directive sends the model straight to create_document and the lookup the user
+# asked for never happens.
+_LOOKUP_ASK = re.compile(
+    r"(?i)\b(?:look\s+(?:it|them|this|that|these|those)?\s*up|look\s+into|"
+    r"research|find\s+out|search\s+(?:for|the\s+web|online|it)|check\s+online|"
+    r"google\s+|find\s+(?:as\s+much|everything|all\s+you|what\s+you\s+can|"
+    r"information|info|details)|"
+    r"(?:from|based\s+on|using)\s+(?:their|the|its)\s+(?:website|site|page))\b")
+# A bare domain the user typed without a scheme ("www.texcel.be", "texcel.be").
+# Restricted to real TLDs so "main.py" and "v1.2" are not read as web addresses.
+_BARE_DOMAIN = re.compile(
+    r"(?i)\b(?:www\.[a-z0-9-]+\.[a-z]{2,}"
+    r"|[a-z0-9][a-z0-9-]{1,}\.(?:com|be|nl|fr|de|org|net|io|co|eu|uk|dev|ai|"
+    r"info|biz|es|it|lu|ch|at|se|dk|no|fi|pl|pt|ie)\b)")
+
+
+def document_needs_research(message: str) -> bool:
+    """True when a document request also asks for something to be looked up.
+
+    Either explicitly ("look up as much as you can find about them") or by
+    naming a site the document is supposed to be about. A document turn that
+    ignores this produces a confident page of invented facts, which is worse
+    than no document.
+    """
+    text = (message or "").strip()
+    if not text:
+        return False
+    return bool(_LOOKUP_ASK.search(text) or _URL_IN_TEXT.search(text)
+                or _BARE_DOMAIN.search(text))
+
+
 def document_request(message: str) -> str | None:
     """The file extension a message asks to be produced, or None.
 
@@ -1322,6 +1355,9 @@ __all__ = [
     'is_thin_page',
     'is_time_sensitive',
     'document_request',
+    'document_needs_research',
+    '_LOOKUP_ASK',
+    '_BARE_DOMAIN',
     'document_subject',
     'starts_new_document',
     '_DOC_SUBJECT',

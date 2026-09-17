@@ -45,13 +45,16 @@ from local_llm.model_client import ModelClient  # noqa: E402
 from local_llm.skills import SkillLibrary  # noqa: E402
 from local_llm.checkpoints import CheckpointStore  # noqa: E402
 from local_llm.mcp import MCP, parse_mcp_spec  # noqa: E402
-from local_llm.llm import skills_block, build_plain_system_prompt  # noqa: E402
+from local_llm.llm import (  # noqa: E402
+    skills_block, build_plain_system_prompt, build_agent_system_prompt,
+    is_truncated_tool_call)
 from local_llm.obslog import set_acting_user  # noqa: E402
 from local_llm.textutil import (  # noqa: E402
     append_below_answer, is_code_request, is_continue_request,
     classify_implicit_feedback, is_explanation_request, is_reasoning_question,
     refers_to_active_task, truncation_note, was_truncated,
-    document_request, starts_new_document, is_missing_draft_reply)
+    document_request, starts_new_document, is_missing_draft_reply,
+    document_needs_research)
 from local_llm.taskstate import (  # noqa: E402
     TaskState, canonical_language, code_language, detect_drift,
     drifted_languages, extract_code_blocks, is_reset_request, parse_correction,
@@ -4033,6 +4036,264 @@ def test_a_document_task_survives_a_reload_from_the_database():
     stored.note_answer("I updated it.\n\n```python\nprint(1)\n```")
     assert "Construction Invoice" in stored.artifact, "the answer clobbered the source"
     db.close()
+
+
+class _BudgetedClient(_ScriptedClient):
+    """A scripted client that reports finish_reason="length" for the first N
+    generations, so a turn can be driven into the reply limit on purpose."""
+
+    def __init__(self, replies, cuts=0, **kw):
+        super().__init__(replies, **kw)
+        self.cuts = cuts
+        self.generations = 0
+
+    def stream(self, messages, *a, **kw):
+        self.prompts.append(messages)
+        self.kinds.append(kw.get("kind"))
+        text = self._next()
+        self.generations += 1
+        stats = a[2] if len(a) > 2 else kw.get("stats")
+        if stats is not None:
+            stats.prompt_tokens, stats.completion_tokens = 100, 50
+            if self.generations <= self.cuts:
+                stats.finish_reason = "length"
+
+        async def gen():
+            yield text
+
+        return gen()
+
+
+def _cut_agent(replies, cuts, **overrides):
+    base = dict(agent_enabled=True, knowledge_triage=False, fast_path=False,
+                incremental_reasoning=False, chunk_large_prompts=False,
+                agent_max_steps=2, agent_min_steps=1, resilient_retries=0,
+                ready_wait_timeout=0.01, auto_iterate_rounds=0,
+                skills_dir=tempfile.mkdtemp(prefix="local-llm-test-skills-"))
+    base.update(overrides)
+    cfg = Config(**base)
+    db = Database(Path(tempfile.mkdtemp()) / "cut.db")
+    reg = ToolRegistry(cfg, db)
+    client = _BudgetedClient(replies, cuts=cuts)
+    return Agent(cfg, reg, client), cfg, db, reg, client
+
+
+async def _drive(agent, message, history=None):
+    events = []
+    async for ev in agent.run_iterating(message, history or [], "t", 512, 0.0):
+        events.append(ev)
+    return events
+
+
+def test_an_answer_cut_off_at_the_limit_finishes_itself():
+    """Defect: the reply budget is a property of the context window, not of the
+    request -- a program that needs 2000 tokens on a 4096-token context gets cut
+    off however it is phrased. The turn printed "ask me to continue" and stopped,
+    making finishing the work the user's job one "go on" at a time, and every one
+    of those round trips re-prefills the whole prompt."""
+    agent, cfg, db, reg, client = _cut_agent(
+        ["```bash\n#!/bin/bash\necho part one\n", "echo part two\n```"], cuts=1)
+    events = asyncio.run(_drive(agent, "write a bash script that checks disks"))
+    notices = [e["message"] for e in events if e.get("type") == "notice"]
+    assert any("continuing automatically" in n for n in notices), notices
+    final = [e for e in events if e["type"] == "final"][-1]
+    assert not was_truncated(final["answer"]), final["answer"][-120:]
+    assert "part two" in final["answer"], final["answer"]
+    assert final["continued"] == 1, final["continued"]
+    # The continuation is a real generation and has to be in the turn's totals,
+    # or the footer under the answer understates what the turn cost.
+    assert final["completion_tokens"] == 100, final["completion_tokens"]
+    assert final["prompt_tokens"] == 200, final["prompt_tokens"]
+    db.close()
+
+
+def test_auto_continue_chains_and_is_bounded():
+    agent, cfg, db, reg, client = _cut_agent(
+        ["one ", "two ", "three\n"], cuts=2)
+    final = [e for e in asyncio.run(_drive(agent, "write a long essay"))
+             if e["type"] == "final"][-1]
+    assert final["continued"] == 2, final["continued"]
+    assert not was_truncated(final["answer"]), final["answer"]
+
+    # A model that never finishes is capped, and the turn says so rather than
+    # pretending the answer is complete.
+    agent, cfg, db, reg, client = _cut_agent(
+        [f"chunk {n} " for n in range(9)], cuts=99, auto_continue_max=2)
+    events = asyncio.run(_drive(agent, "write a very long essay"))
+    final = [e for e in events if e["type"] == "final"][-1]
+    assert final["continued"] <= 2, final["continued"]
+    assert was_truncated(final["answer"]), "an unfinished answer lost its marker"
+    assert any("still unfinished" in e.get("message", "")
+               for e in events if e.get("type") == "notice"), \
+        [e for e in events if e.get("type") == "notice"]
+    db.close()
+
+
+def test_auto_continue_stops_when_the_model_starts_repeating():
+    """A model looping a phrase must not spend the rest of the budget making the
+    answer longer and worse. stitch_continuation catches a restart and a
+    duplicated seam; a short phrase repeated forever gets past both."""
+    agent, cfg, db, reg, client = _cut_agent(["same text "] * 6, cuts=99,
+                                             auto_continue_max=4)
+    final = [e for e in asyncio.run(_drive(agent, "write an essay"))
+             if e["type"] == "final"][-1]
+    # It takes one repeat to know it is a repeat, so two passes, never four.
+    assert final["continued"] == 2, final["continued"]
+    assert final["answer"].count("same text") <= 3, final["answer"]
+
+    # And a pass that adds nothing at all stops immediately.
+    agent, cfg, db, reg, client = _cut_agent(["body text", ""], cuts=99)
+    final = [e for e in asyncio.run(_drive(agent, "write an essay"))
+             if e["type"] == "final"][-1]
+    assert final["continued"] == 1, final["continued"]
+    db.close()
+
+
+def test_auto_continue_can_be_turned_off():
+    agent, cfg, db, reg, client = _cut_agent(
+        ["```bash\necho one\n", "echo two\n```"], cuts=1, auto_continue=False)
+    events = asyncio.run(_drive(agent, "write a bash script"))
+    final = [e for e in events if e["type"] == "final"][-1]
+    assert was_truncated(final["answer"]), "the marker the manual lane needs is gone"
+    assert not any("continuing automatically" in e.get("message", "")
+                   for e in events if e.get("type") == "notice")
+    assert "auto_continue" in Config.MUTABLE and "auto_continue_max" in Config.MUTABLE
+    # Clamped: each pass is a full generation on a local model, so the ceiling
+    # is a wall-clock guard.
+    assert Config(auto_continue_max=99).auto_continue_max == 6
+    assert Config(auto_continue_max=-3).auto_continue_max == 0
+    db.close()
+
+
+def test_the_first_document_turn_is_never_told_to_update_one():
+    """Defect, from a real session: the document rules fired on the FIRST turn,
+    with the path falling back to the literal words "the document" -- so the
+    model was told to update a file that did not exist, at a made-up name, and
+    obediently wrote `"path": "the document.docx"`."""
+    task = TaskState()
+    task.start_document("create a word document for end of year analysis of "
+                        "www.texcel.be", ".docx")
+    rules = task.rules()
+    assert "the document.docx" not in rules, rules
+    assert "updating an existing document" not in rules, rules
+    assert "Write the document the objective asks for" in rules, rules
+    # A real name is chosen for it, so nothing has to invent one.
+    assert task.document_path.endswith(".docx"), task.document_path
+    assert "texcel" in task.document_path, task.document_path
+    assert task.document_path in rules, rules
+
+    # Once one exists, the rules switch to updating it by name.
+    task.record_document(task.document_path, ".docx", "# Analysis\n\nBody.\n", "Word document")
+    rules = task.rules()
+    assert "updating an existing document" in rules, rules
+    assert task.document_path in rules, rules
+
+
+def test_a_document_turn_is_not_charged_for_tools_it_cannot_call():
+    """Defect: a document turn carried all 25 tool specs -- ~1600 tokens of a
+    4096-token window describing tools it will never touch. The document itself
+    then had barely a thousand tokens to fit into the create_document call, was
+    cut off mid-JSON, and the turn produced no file at all."""
+    agent, cfg, db, reg, client = _agent([], context_size=4096)
+    full = build_agent_system_prompt(cfg.system_prompt_with_identity, reg)
+    narrow = build_agent_system_prompt(cfg.system_prompt_with_identity, reg,
+                                       only=agent.document_tool_subset(False))
+    assert estimate_tokens(narrow) < estimate_tokens(full) / 2, (
+        estimate_tokens(narrow), estimate_tokens(full))
+    assert "create_document" in narrow and "final_answer" in narrow
+    for absent in ("- remember:", "- forget:", "- edit_file:", "- run_tests:"):
+        assert absent not in narrow, absent
+    # Research turns get the lookup tools back, and nothing else.
+    research = build_agent_system_prompt(cfg.system_prompt_with_identity, reg,
+                                         only=agent.document_tool_subset(True))
+    assert "web_search" in research and "fetch_url" in research
+    assert "- edit_file:" not in research
+    # Narrowing to nothing would leave the protocol with no tool to name.
+    assert build_agent_system_prompt(cfg.system_prompt_with_identity, reg,
+                                     only=["nonexistent"]).count("- web_search:") == 1
+    db.close()
+
+
+def test_a_document_request_that_asks_for_research_searches_first():
+    """Defect: "look up as much as you can find about them, then draft the
+    document" is half the request. The directive sent the model straight to
+    create_document, so the lookup never happened and the document was a
+    confident page of invented facts."""
+    import local_llm.agent as agent_mod
+
+    async def _online(*_a, **_kw):
+        return True
+
+    previous = agent_mod.has_internet
+    agent_mod.has_internet = _online
+    try:
+        agent, cfg, db, reg, client = _agent(
+            [json.dumps({"tool": "web_search", "args": {"query": "texcel.be"}}),
+             _doc_call("end-year-analysis-texcel.docx", "# Texcel\n\nFindings.\n"),
+             "I looked them up and drafted the analysis."],
+            knowledge_triage=True, agent_max_steps=4)
+        _stub_tool(reg, "web_search", "1. Texcel\n   https://www.texcel.be\n   IT staffing")
+        events = asyncio.run(_run(
+            agent,
+            "create a word document for end of year analysis of www.texcel.be. "
+            "look up as much as you can find about them, then draft it", []))
+    finally:
+        agent_mod.has_internet = previous
+
+    calls = [e["name"] for e in events if e.get("type") == "tool_call"]
+    assert calls == ["web_search", "create_document"], calls
+    prompt = "\n".join(m["content"] for p in client.prompts for m in p)
+    assert "STEP 1" in prompt and "RESEARCH" in prompt, "never told to look it up"
+    final = [e for e in events if e["type"] == "final"][-1]
+    assert final["documents"] == ["end-year-analysis-texcel.docx"], final["documents"]
+    db.close()
+
+    # A request with nothing to look up does not pay for the lookup tools.
+    assert document_needs_research("create a pdf for construction invoice") is False
+    assert document_needs_research("make a deck about https://kubernetes.io") is True
+
+
+def test_a_tool_call_cut_off_mid_json_is_not_shown_as_the_answer():
+    """Defect: the create_document call ran out of reply budget partway through
+    its content argument. parse_tool_call correctly refused the broken JSON, and
+    the loop then handed two thousand characters of half-written document to the
+    user as though it were the answer. No file was produced and nothing said
+    why."""
+    assert is_truncated_tool_call(
+        '{"tool": "create_document", "args": {"path": "x.docx", "content": "# Hi')
+    assert not is_truncated_tool_call(
+        '{"tool": "create_document", "args": {"path": "x.docx", "content": "# Hi"}}')
+    assert not is_truncated_tool_call("The answer is 42.")
+
+    agent, cfg, db, reg, client = _agent(
+        ['{"tool": "create_document", "args": {"path": "x.docx", "content": "# Big'
+         + "\n\nlorem " * 40,
+         _doc_call("x.docx", "# Big\n\nShort version.\n"),
+         "I shortened it and saved x.docx."],
+        knowledge_triage=True, agent_max_steps=4)
+    events = asyncio.run(_run(agent, "write me a word document about lorem ipsum", []))
+    notices = [e["message"] for e in events if e.get("type") == "notice"]
+    assert any("cut off" in n for n in notices), notices
+    final = [e for e in events if e["type"] == "final"][-1]
+    assert final["documents"] == ["x.docx"], final["documents"]
+    assert "lorem" not in final["answer"], "the half-written call leaked into the answer"
+    db.close()
+
+
+def test_a_runaway_generation_does_not_become_a_thousand_blank_pages():
+    """Observed: a model that lost its place emitted several thousand
+    consecutive newlines into the content argument. Rendered literally that is
+    hundreds of blank pages in the file the user opens."""
+    from local_llm import documents
+    runaway = "## Analysis of [www.texcel.be" + "\n" * 900 + "](https://www.texcel.be)"
+    tamed = documents._tame_runaway(runaway)
+    assert len(tamed) < 200, len(tamed)
+    body = zipfile.ZipFile(io.BytesIO(documents.render(runaway, ".docx", "A"))).read(
+        "word/document.xml").decode()
+    assert body.count("<w:p>") < 10, body.count("<w:p>")
+    # A legitimately repeated table row is not a decode loop.
+    rows = "| a | b |\n|---|---|\n" + "| x | y |\n" * 6
+    assert documents._tame_runaway(rows).count("| x | y |") == 6
 
 
 def test_the_revision_pass_cannot_discard_a_finished_draft():
