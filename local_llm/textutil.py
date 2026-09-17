@@ -412,6 +412,35 @@ _NEEDS_FILES = re.compile(
 REFUSAL_MAX_CHARS = 700
 
 
+# The revision pass asking for the draft instead of improving it. Handed
+# REVISE_DRAFT with its own draft immediately above, a small model sometimes
+# answers "I don't see any draft or previous response to compare against" --
+# and that reply, being non-empty, then REPLACED a finished 1800-character
+# answer with a question the user cannot act on.
+_NO_DRAFT_REPLY = re.compile(
+    r"(?i)(?:"
+    r"(?:do\s*n[o']?t|don'?t|cannot|can'?t|could\s+not|couldn'?t|unable\s+to)\s+"
+    r"(?:see|find|locate|access)\s+(?:any\s+|a\s+|the\s+|your\s+)?"
+    r"(?:draft|previous\s+(?:response|answer|message)|prior\s+\w+|text\s+to\s+review)"
+    r"|"
+    r"(?:please\s+)?(?:provide|share|paste|post|send)\s+(?:me\s+)?(?:the|your|a)\s+"
+    r"(?:draft|text|response|answer|content)\s+(?:you\s+)?(?:want|for|to)\b"
+    r"|"
+    r"there\s+(?:is|was)\s+no\s+(?:draft|previous\s+(?:response|answer))"
+    r")")
+# A meta-reply is short by nature: it has no content of its own. Past this it is
+# an answer that happens to mention a draft.
+NO_DRAFT_MAX_CHARS = 400
+
+
+def is_missing_draft_reply(text: str) -> bool:
+    """True when a reply asks for the draft rather than being the improved one."""
+    body = (text or "").strip()
+    if not body or len(body) > NO_DRAFT_MAX_CHARS or "```" in body:
+        return False
+    return bool(_NO_DRAFT_REPLY.search(body))
+
+
 def missing_capability(answer: str) -> str | None:
     """Which capability an answer says it lacked: "lookup", "files", or None.
 
@@ -503,6 +532,50 @@ def _doc_patterns() -> tuple[list, list]:
 
 
 _DOC_TARGET, _DOC_OTHER = _doc_patterns()
+
+
+# The subject a document request is ABOUT, which is how a new document is told
+# apart from an edit to the current one. Anchored at the end of the message so
+# it takes the operative phrase: "create a powerpoint about kubernetes" is a new
+# document, "make it a word document" names no subject at all and is a format
+# change to the one in hand.
+_DOC_SUBJECT = re.compile(
+    r"(?i)\b(?:about|regarding|concerning|covering|detailing|for|of|on)\s+(.{3,90})$")
+# Words too generic to be evidence of a different subject.
+_SUBJECT_STOP = {
+    "document", "documents", "file", "files", "report", "reports", "version",
+    "copy", "export", "deck", "presentation", "summary", "output", "page",
+    "pages", "word", "excel", "powerpoint", "spreadsheet", "workbook",
+    "markdown", "please", "thanks", "again", "instead", "same", "thing",
+    "this", "that", "them", "these", "those", "with", "from", "into", "onto",
+    "style", "format", "layout", "template", "design", "branding",
+}
+
+
+def document_subject(message: str) -> str:
+    """The trailing "about/for/of X" phrase of a message, or ""."""
+    match = _DOC_SUBJECT.search(" ".join((message or "").split()))
+    return match.group(1).strip(" .?!,;:") if match else ""
+
+
+def _subject_words(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z]{4,}", (text or "").lower())
+            if w not in _SUBJECT_STOP}
+
+
+def starts_new_document(message: str, objective: str) -> bool:
+    """True when a document request is for a DIFFERENT document, not an edit.
+
+    Deliberately hard to satisfy, and the caller pairs it with "does not refer
+    back to the active task". Resetting wrongly throws away the document source
+    the user has been building up, which is the worse of the two mistakes -- the
+    codebase makes the same call for code tasks in should_reset -- so it needs a
+    subject of its own that shares nothing with what is already being made.
+    """
+    fresh = _subject_words(document_subject(message))
+    if not fresh:
+        return False
+    return not (fresh & _subject_words(objective or ""))
 
 
 def document_request(message: str) -> str | None:
@@ -1249,6 +1322,11 @@ __all__ = [
     'is_thin_page',
     'is_time_sensitive',
     'document_request',
+    'document_subject',
+    'starts_new_document',
+    '_DOC_SUBJECT',
+    '_SUBJECT_STOP',
+    '_subject_words',
     '_DOC_FORMAT_WORDS',
     '_DOC_TARGET',
     '_DOC_OTHER',
@@ -1257,6 +1335,9 @@ __all__ = [
     '_DOC_TARGET_EXTRA',
     '_DOC_MAKE',
     'missing_capability',
+    'is_missing_draft_reply',
+    'NO_DRAFT_MAX_CHARS',
+    '_NO_DRAFT_REPLY',
     'REFUSAL_MAX_CHARS',
     '_NEEDS_LOOKUP',
     '_NEEDS_FILES',

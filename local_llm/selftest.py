@@ -1101,6 +1101,39 @@ def selftest() -> int:
             failures.append(f"document_request({text!r}) returned "
                             f"{document_request(text)!r}, expected {expected!r}")
 
+    # A follow-up edit to a document names no format, no file and no subject:
+    # what makes it a document turn is that a document is being worked on. The
+    # two classifiers that decide are these.
+    _obj = "create a pdf for construction invoice"
+    for _text, _new in [
+        # Edits and format changes keep the document being worked on.
+        ("now make it in the style of texcel.be", False),
+        ("now make it a word document", False),
+        ("same thing but as a deck", False),
+        ("turn the invoice into a word doc", False),
+        ("add the VAT line", False),
+        # A subject of its own, with no back-reference, is a different document.
+        ("now create a powerpoint about kubernetes", True),
+        ("make a new pdf about our security policy", True),
+    ]:
+        _reset = bool(document_request(_text)) and not refers_to_active_task(_text) \
+            and starts_new_document(_text, _obj)
+        if _reset != _new:
+            failures.append(f"a document follow-up was misjudged: {_text!r} "
+                            f"reset={_reset}, expected {_new}")
+
+    # A revision pass that asks for the draft instead of improving it must not
+    # replace the draft: that reply is non-empty, so it used to win.
+    for _text, _meta in [
+        ("Sorry, but I don't see any draft or previous response to compare against.", True),
+        ("There is no draft to review.", True),
+        ("I don't see any issues with the draft; it is correct as written.", False),
+        ("The invoice total is the subtotal plus tax.", False),
+    ]:
+        if is_missing_draft_reply(_text) != _meta:
+            failures.append(f"is_missing_draft_reply({_text[:40]!r}) returned "
+                            f"{is_missing_draft_reply(_text)!r}, expected {_meta!r}")
+
     # Every offered format actually renders, and renders something a reader will
     # open: a PDF with a header and an xref, an OOXML package whose parts are all
     # well-formed XML. A format in the menu that produces a broken file is worse

@@ -538,7 +538,13 @@ class TaskState:
     # and how far it got, so "continue" does not have to rediscover the task.
     generation_id: str = ""
     partial_chars: int = 0
-    output_kind: str = "prose"          # code | prose
+    output_kind: str = "prose"          # code | document | prose
+    # Where the last create_document call wrote, and in what format. The
+    # artifact fields carry the document's Markdown SOURCE, because the rendered
+    # .pdf/.docx is bytes the model can never read back -- so the source is what
+    # a follow-up edits, and these two say which file to write it to again.
+    document_path: str = ""
+    document_format: str = ""
     updated_at: float = 0.0
 
     # -- lifecycle ------------------------------------------------------- #
@@ -549,6 +555,9 @@ class TaskState:
 
     def is_code_task(self) -> bool:
         return self.task_type == "code_generation"
+
+    def is_document_task(self) -> bool:
+        return self.task_type == "document"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -609,6 +618,67 @@ class TaskState:
             self.artifact_name = name
         if self.is_code_task():
             self.output_kind = "code"
+
+    def start_document(self, message: str, suffix: str) -> None:
+        """Adopt this message as a DOCUMENT task.
+
+        set_objective deliberately starts a task only for a code request, so
+        "create a pdf for construction invoice" left the state inactive -- and
+        the follow-up "now make it in the style of texcel.be" then arrived with
+        no objective, no artifact and nothing saying a document was under
+        construction. It was answered as a fresh question, in prose, with no
+        tools, and no file was produced.
+        """
+        if self.is_active() and not self.is_document_task():
+            return                      # a code task is already running
+        self.task_type = "document"
+        self.output_kind = "document"
+        if not self.objective:
+            self.objective = " ".join((message or "").split())[:800]
+        if suffix and suffix != self.document_format:
+            # A format change on the same document ("now make it a word
+            # document") keeps the source and moves the file, so the brief, the
+            # rules and the next create_document call all name the new path
+            # rather than telling the model to write a .docx to a .pdf.
+            if self.document_path and "." in self.document_path:
+                self.document_path = self.document_path.rsplit(".", 1)[0] + suffix
+                self.artifact_name = self.document_path
+            self.document_format = suffix
+            self.artifact_type = ""
+        self.updated_at = time.time()
+
+    def record_document(self, path: str, suffix: str, source: str,
+                        type_name: str = "") -> None:
+        """Store the Markdown a create_document call rendered, as the artifact.
+
+        Versioned through the same history as a code artifact, so the previous
+        wording of a document is recoverable after a bad edit. Deliberately does
+        NOT go through record_artifact: that one is about code, and its loss
+        guard, filename detection and language bookkeeping would all be applied
+        to prose they were not written for.
+        """
+        body = (source or "").strip()
+        if not body:
+            return
+        self.task_type = "document"
+        self.output_kind = "document"
+        if path:
+            self.document_path = path
+            self.artifact_name = path
+        if suffix:
+            self.document_format = suffix
+        if type_name:
+            self.artifact_type = type_name
+        self.rejected_reason = ""
+        if body == self.artifact:
+            return                      # same source rendered again
+        self._push_history()
+        self.artifact = body
+        self.artifact_version += 1
+        self.artifact_complete = True
+        self.partial_artifact = ""
+        self.partial_chars = 0
+        self.updated_at = time.time()
 
     def apply_correction(self, update: dict) -> None:
         """A correction is a state update, not just another message."""
@@ -978,6 +1048,13 @@ class TaskState:
 
     def note_answer(self, answer: str) -> None:
         """Fold an assistant turn into the state: its artifact and completeness."""
+        # A document task's artifact is the Markdown handed to create_document,
+        # recorded from the tool call itself. The visible answer is one sentence
+        # about it, and a stray fenced block in that sentence must not be
+        # adopted as "the document" -- that would replace the real source with a
+        # fragment, and the next edit would build on the fragment.
+        if self.is_document_task():
+            return
         found = self._artifact_in(answer)
         if found is not None:
             self.record_artifact(*found)
@@ -1002,7 +1079,8 @@ class TaskState:
             return ""
         lines = ["ACTIVE TASK (this is what you are working on; it survives "
                  "trimmed history)"]
-        pretty = {"code_generation": "code generation"}.get(self.task_type, self.task_type)
+        pretty = {"code_generation": "code generation",
+                  "document": "document"}.get(self.task_type, self.task_type)
         lines.append(f"Type: {pretty}")
         if self.language:
             lines.append(f"Language: {self.language}")
@@ -1031,11 +1109,13 @@ class TaskState:
         if self.latest_request:
             lines.append("\nLATEST USER REQUEST:\n" + self.latest_request)
         if self.artifact:
-            fence = self.language or ""
+            document = self.is_document_task()
+            fence = "markdown" if document else (self.language or "")
             body = self._artifact_for_prompt(artifact_chars)
             purpose = ("this is what the user's question is about"
                        if mode == "explain" else "this is the thing to modify")
-            lines.append(f"\nCURRENT ARTIFACT (v{self.artifact_version}) — {purpose}:"
+            label = ("CURRENT DOCUMENT SOURCE" if document else "CURRENT ARTIFACT")
+            lines.append(f"\n{label} (v{self.artifact_version}) — {purpose}:"
                          f"\n```{fence}\n{body}\n```")
         lines.append("\n" + self.rules(verify_hint=verify_hint, mode=mode))
         return "\n".join(lines)
@@ -1086,6 +1166,19 @@ class TaskState:
                          "lines you are actually talking about.")
             rules.append("- If the honest answer is that the code above is wrong "
                          "or does not do what its comments claim, say so plainly.")
+            return "\n".join(rules)
+        if self.is_document_task():
+            name = self.document_path or f"the document{self.document_format}"
+            rules.append(f"- You are updating an existing document: {name}. Its "
+                         "current Markdown source is above.")
+            rules.append("- Apply the user's latest request to that source, then call "
+                         f"create_document with path \"{name}\" and the COMPLETE "
+                         "revised Markdown in content. Keep everything the user did "
+                         "not ask you to change, including the existing headings, "
+                         "tables and placeholder fields.")
+            rules.append("- Do NOT write the document into your reply and do NOT use "
+                         "write_file. Once the tool succeeds, say in one or two "
+                         "sentences what you changed.")
             return "\n".join(rules)
         if self.artifact:
             rules.append(f"- Continue working on the existing {language} artifact above. "

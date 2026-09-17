@@ -226,6 +226,28 @@ authentication, resolves the path through the same confinement the file tools
 use, and serves only the formats above — it is a download link, not an arbitrary
 file read.
 
+**Follow-up edits work on the document, not on a memory of it.** "Now make it in
+the style of texcel.be", "add the VAT line", "now make it a Word document" name
+no format, no file and no subject — what makes them document turns is that a
+document is what is being worked on. So the Markdown handed to `create_document`
+is recorded as the task's artifact (the rendered `.pdf` is bytes the model can
+never read back) and the next turn is briefed with that source and told to
+re-render the same path. A format change keeps the source and moves the file.
+
+Telling an edit from a new document is deliberately biased toward the edit,
+because losing the source is the worse mistake. A new document needs a message
+that *both* fails to point back at the current one ("it", "that", "the
+invoice") *and* names a subject sharing nothing with it — "now create a
+powerpoint about kubernetes" starts fresh, "same thing but as a deck" does not.
+A question about the document ("what does it say?") is answered, not rendered,
+and a code request after a document drops the document task rather than briefing
+the model to re-render it.
+
+On a 4096-token context the tool prompt alone is about 2000 tokens, so a
+document over roughly 3000 characters starts to squeeze the reply budget the
+`create_document` call has to fit in. Raise `CONTEXT_SIZE` if you generate long
+documents.
+
 `AGENT_ESCALATION` (default 1) lets a turn switch into agent mode partway
 through. The router decides answer-vs-tool from one short call *before* the
 model has seen how hard the question is, and on "answer" the prompt is rebuilt

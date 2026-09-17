@@ -50,7 +50,8 @@ from local_llm.obslog import set_acting_user  # noqa: E402
 from local_llm.textutil import (  # noqa: E402
     append_below_answer, is_code_request, is_continue_request,
     classify_implicit_feedback, is_explanation_request, is_reasoning_question,
-    refers_to_active_task, truncation_note, was_truncated)
+    refers_to_active_task, truncation_note, was_truncated,
+    document_request, starts_new_document, is_missing_draft_reply)
 from local_llm.taskstate import (  # noqa: E402
     TaskState, canonical_language, code_language, detect_drift,
     drifted_languages, extract_code_blocks, is_reset_request, parse_correction,
@@ -3889,6 +3890,168 @@ def test_the_documents_list_is_per_turn():
     assert [e for e in first if e["type"] == "final"][-1]["documents"] == ["one.pdf"]
     second = asyncio.run(_run(agent, "how do tcp handshakes work", []))
     assert [e for e in second if e["type"] == "final"][-1]["documents"] == []
+    db.close()
+
+
+def _doc_call(path, content):
+    return json.dumps({"tool": "create_document",
+                       "args": {"path": path, "content": content}})
+
+
+INVOICE_MD = "# Construction Invoice\n\n**Client:** [Name]\n\n**Total:** [Total]\n"
+
+
+def test_an_edit_to_a_generated_document_produces_a_new_file():
+    """Defect, from a real session: "create a pdf for construction invoice" made
+    the PDF, then "now make it in the style of texcel.be" was answered as a fresh
+    question -- router said "answer", the prompt was rebuilt with no tools, and
+    the model replied in prose. No file was produced, and the user had no way to
+    ask for one that would work.
+
+    The follow-up names no format, no file and no subject. What makes it a
+    document turn is that a document is what is being worked on, which means it
+    needs task state of its own."""
+    agent, cfg, db, reg, client = _agent(
+        [_doc_call("construction-invoice.pdf", INVOICE_MD), "Created the invoice PDF.",
+         _doc_call("construction-invoice.pdf", INVOICE_MD + "\nTexcel BV\n"),
+         "Restyled it with the Texcel header."],
+        knowledge_triage=True, agent_max_steps=3)
+    history = []
+    first = asyncio.run(_run(agent, "create a pdf for construction invoice", history))
+    answer = [e for e in first if e["type"] == "final"][-1]["answer"]
+    history += [{"role": "user", "content": "create a pdf for construction invoice"},
+                {"role": "assistant", "content": answer}]
+
+    second = asyncio.run(_run(agent, "now make it in the style of texcel.be", history))
+    calls = [e["name"] for e in second if e.get("type") == "tool_call"]
+    assert calls == ["create_document"], f"the edit produced no file: {calls}"
+    final = [e for e in second if e["type"] == "final"][-1]
+    assert final["documents"] == ["construction-invoice.pdf"], final["documents"]
+    # The edit is applied to the document's SOURCE, which only ever existed in
+    # the previous turn's tool call -- the rendered PDF is bytes the model cannot
+    # read back, so without recording it the "edit" is a rewrite from memory.
+    prompt = "\n".join(m["content"] for p in client.prompts[-2:] for m in p)
+    assert "Construction Invoice" in prompt, "the document source was not carried"
+    assert "construction-invoice.pdf" in prompt, "the target path was not carried"
+    assert "You are a router" not in prompt, "the edit went to the router"
+    db.close()
+
+
+def test_a_format_change_keeps_the_source_and_moves_the_file():
+    """"now make it a word document" is the same document in another format. The
+    source has to survive and the path has to follow, or the model is told to
+    write a .docx to a .pdf."""
+    agent, cfg, db, reg, client = _agent(
+        [_doc_call("invoice.pdf", INVOICE_MD), "Created invoice.pdf.",
+         _doc_call("invoice.docx", INVOICE_MD), "Converted it to Word."],
+        knowledge_triage=True, agent_max_steps=3)
+    asyncio.run(_run(agent, "create a pdf for construction invoice", []))
+    events = asyncio.run(_run(agent, "now make it a word document", []))
+    prompt = "\n".join(m["content"] for p in client.prompts[-2:] for m in p)
+    assert "Construction Invoice" in prompt, "the source was lost in the conversion"
+    assert "invoice.docx" in prompt, "the brief still names the old .pdf path"
+    final = [e for e in events if e["type"] == "final"][-1]
+    assert final["documents"] == ["invoice.docx"], final["documents"]
+    db.close()
+
+
+def test_a_genuinely_new_document_does_not_inherit_the_previous_source():
+    """The other direction. should_reset cannot judge this one -- a document task
+    has no language to conflict and always has an artifact, which is exactly the
+    case it answers "keep going" to -- so the invoice's Markdown would be handed
+    to a deck about something else."""
+    agent, cfg, db, reg, client = _agent(
+        [_doc_call("invoice.pdf", INVOICE_MD), "Created invoice.pdf.",
+         _doc_call("k8s.pptx", "# Kubernetes\n\n- pods\n"), "Made the deck."],
+        knowledge_triage=True, agent_max_steps=3)
+    asyncio.run(_run(agent, "create a pdf for construction invoice", []))
+    asyncio.run(_run(agent, "now create a powerpoint about kubernetes", []))
+    prompt = "\n".join(m["content"] for p in client.prompts[-2:] for m in p)
+    assert "Construction Invoice" not in prompt, "the old document was carried over"
+
+    # And the rule is hard to satisfy on purpose: losing the source is the worse
+    # mistake, so a message that points back at the document, or shares its
+    # subject, is an edit.
+    for message in ("now make it a word document", "same thing but as a deck",
+                    "turn the invoice into a word doc", "add the VAT line"):
+        assert not (document_request(message)
+                    and not refers_to_active_task(message)
+                    and starts_new_document(message, "create a pdf for construction invoice")), \
+            f"{message!r} would have thrown the document away"
+    db.close()
+
+
+def test_a_question_about_a_document_does_not_rewrite_it():
+    """"what does it say?" points at the document as plainly as "make it blue"
+    does. Rewriting the file to answer a question about it is a change nobody
+    asked for -- and it bumps the version, so the next edit builds on it."""
+    agent, cfg, db, reg, client = _agent(
+        [_doc_call("invoice.pdf", INVOICE_MD), "Created invoice.pdf.",
+         '{"action":"answer"}', "It lists the client and the total."],
+        knowledge_triage=True, agent_max_steps=3)
+    asyncio.run(_run(agent, "create a pdf for construction invoice", []))
+    events = asyncio.run(_run(agent, "what does it say?", []))
+    assert not [e for e in events if e.get("type") == "tool_call"], "rewrote the document"
+    final = [e for e in events if e["type"] == "final"][-1]
+    assert final["documents"] == [], final["documents"]
+    db.close()
+
+
+def test_a_code_request_after_a_document_is_not_answered_with_the_document():
+    """A document task has no language to conflict with and always has an
+    artifact, so should_reset keeps it -- and "write a python script to parse it"
+    was then briefed with the invoice's Markdown and the rule "call
+    create_document again with the complete revised Markdown"."""
+    agent, cfg, db, reg, client = _agent(
+        [_doc_call("invoice.pdf", INVOICE_MD), "Created invoice.pdf.",
+         '{"action":"answer"}', "```python\nprint(1)\n```"],
+        knowledge_triage=True, agent_max_steps=3)
+    asyncio.run(_run(agent, "create a pdf for construction invoice", []))
+    events = asyncio.run(_run(agent, "now write a python script to parse it", []))
+    prompt = "\n".join(m["content"] for p in client.prompts[-2:] for m in p)
+    assert "create_document again" not in prompt, "the document rules leaked"
+    assert not [e for e in events if e.get("type") == "tool_call"]
+    db.close()
+
+
+def test_a_document_task_survives_a_reload_from_the_database():
+    """The source lives only in the tool call, so it has to be persisted: a
+    follow-up on the next request loads the task from the row, not the
+    transcript, and the transcript never contained the document."""
+    agent, cfg, db, reg, client = _agent(
+        [_doc_call("invoice.pdf", INVOICE_MD), "Created invoice.pdf."],
+        knowledge_triage=True, agent_max_steps=3)
+    asyncio.run(_run(agent, "create a pdf for construction invoice", []))
+    stored = agent.load_task("t", [])
+    assert stored.is_document_task(), stored.task_type
+    assert stored.document_path == "invoice.pdf", stored.document_path
+    assert stored.document_format == ".pdf", stored.document_format
+    assert "Construction Invoice" in stored.artifact, stored.artifact[:80]
+    assert stored.artifact_version == 1, stored.artifact_version
+    # A prose answer must never be adopted as the document: a stray fenced block
+    # in "here is what I changed" would replace the source with a fragment.
+    stored.note_answer("I updated it.\n\n```python\nprint(1)\n```")
+    assert "Construction Invoice" in stored.artifact, "the answer clobbered the source"
+    db.close()
+
+
+def test_the_revision_pass_cannot_discard_a_finished_draft():
+    """Defect, from the same session: handed REVISE_DRAFT with its own 1814-char
+    draft immediately above it, the model answered "Sorry, but I don't see any
+    draft or previous response to compare against." Being non-empty, that reply
+    replaced the finished answer with a question the user cannot act on."""
+    good = "The TCP handshake is SYN, SYN-ACK, ACK. " * 12
+    agent, cfg, db, reg, client = _agent(
+        ['{"action":"answer"}', good,
+         "Sorry, but I don't see any draft or previous response to compare against."],
+        knowledge_triage=True, agent_min_steps=2, agent_max_steps=3)
+    events = asyncio.run(_run(agent, "explain the tcp handshake in detail", []))
+    answer = [e for e in events if e["type"] == "final"][-1]["answer"]
+    assert "SYN-ACK" in answer, f"the draft was discarded: {answer[:120]!r}"
+    # A reply that merely mentions a draft is a real answer and is left alone.
+    assert not is_missing_draft_reply(
+        "I don't see any issues with the draft; it is correct as written.")
+    assert is_missing_draft_reply("There is no draft to review.")
     db.close()
 
 

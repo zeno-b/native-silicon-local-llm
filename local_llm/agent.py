@@ -449,6 +449,13 @@ class Agent:
         # that JSON is cut off mid-string, the call never parses, and the turn
         # produces nothing at all -- so it needs the same room a program does.
         document = bool(document_request(message))
+        if not document and task is not None and task.is_document_task():
+            # Same reasoning as the code branch above: a follow-up edit names no
+            # format, and the whole revised document still has to fit inside the
+            # create_document call this turn makes.
+            document = bool(is_modification_request(message)
+                            or is_continue_request(message)
+                            or parse_correction(message))
         if not code and not document:
             return requested
         wanted = max(requested, self.config.code_max_tokens)
@@ -1778,7 +1785,39 @@ class Agent:
         # should_reset, not starts_new_task: mid-task, "write a helper function
         # that parses the output" is the next piece of the same job, and
         # throwing the artifact away there is the same failure in reverse.
+        # What format, if any, this message asks to be produced. Computed before
+        # the reset decision because it is part of it: mid-document, "create a
+        # deck about kubernetes" is a NEW document, and should_reset cannot tell
+        # -- a document task has no language to change and always has an
+        # artifact, which is exactly the case it answers "keep going" to.
+        doc_request = (document_request(user_message)
+                       if self.registry.get("create_document") else None)
         reset = bool(self.config.task_state_enabled and task.should_reset(user_message))
+        if (not reset and self.config.task_state_enabled and task.is_document_task()
+                and doc_request and task.artifact
+                and not refers_to_active_task(user_message)
+                and not is_explanation_request(user_message)
+                and starts_new_document(user_message, task.objective)):
+            # Both halves are required, and the bias is deliberately toward
+            # keeping: dropping the source the user has been building up is the
+            # worse mistake, the same call should_reset makes for code. So this
+            # needs a message that neither points back at the current document
+            # nor shares a subject with it.
+            log(f"a different document was requested ({doc_request}); the previous "
+                f"one ({task.document_path or 'unnamed'}) is not carried over.",
+                logging.INFO)
+            reset = True
+        if (not reset and self.config.task_state_enabled and task.is_document_task()
+                and not doc_request and is_code_request(user_message)
+                and starts_new_task(user_message)):
+            # A code request after a document. should_reset says keep -- a
+            # document task has no language to conflict and always has an
+            # artifact, which is the case it answers "keep going" to -- so
+            # "write a python script to parse it" would be briefed with the
+            # invoice's Markdown and the rule "call create_document again".
+            log("a code task was requested; the active document is not carried over.",
+                logging.INFO)
+            reset = True
         if reset:
             log(f"new task requested; dropping the previous one ({task.summary()}).",
                 logging.INFO)
@@ -1911,22 +1950,70 @@ class Agent:
         # prompt is rebuilt with no tools at all -- and the model then writes a
         # perfectly good report into the chat while the file the user actually
         # asked for is never created.
-        doc_format = (document_request(user_message)
-                      if self.registry.get("create_document") else None)
+        doc_format = doc_request
+        # A follow-up edit names no format at all. "now make it in the style of
+        # texcel.be" carries no word this or any other detector could key on --
+        # what makes it a document turn is that a document is what we are
+        # working on. Without this the turn went to the router, the router quite
+        # reasonably said "answer", the prompt was rebuilt with no tools, and the
+        # user's edit produced prose instead of the new file they asked for.
+        editing_document = False
+        if (self.config.task_state_enabled and task.is_document_task()
+                and task.artifact and self.registry.get("create_document")
+                # "what does it say?" points at the document just as plainly as
+                # "make it blue" does, and rewriting the file to answer a
+                # question about it would be a change nobody asked for.
+                and not is_explanation_request(user_message)):
+            if doc_format:
+                # A document is in hand and a format was named: either the same
+                # one again or a conversion ("now make it a word document").
+                # Either way the source is what gets re-rendered, not rewritten
+                # from the model's memory of the transcript.
+                editing_document = True
+            elif (not is_code_request(user_message)
+                  and (is_modification_request(user_message)
+                       or parse_correction(user_message)
+                       or refers_to_active_task(user_message))):
+                # is_code_request excluded belt-and-braces: the reset above
+                # already catches a fresh code request, and this stops a
+                # narrower one ("add a loop to it") from being answered by
+                # re-rendering the document instead.
+                doc_format = task.document_format
+                editing_document = True
         document_directive = ""
         if doc_format:
+            # Register the task NOW, not after the tool call: a turn whose tool
+            # call fails still leaves the next turn knowing what was being made.
+            # It also re-suffixes the path on a format change, which the
+            # directive and the brief below both quote.
+            if self.config.task_state_enabled:
+                task.start_document(user_message, doc_format)
             name = describe_document(doc_format)
-            document_directive = (
-                f"The user is asking you to PRODUCE A FILE: a {name}. Call the "
-                f"create_document tool with a path ending in {doc_format} and the "
-                "whole document in its content argument, written as Markdown "
-                "(# headings, **bold**, - bullets, | tables |). Do not write the "
-                "document into your reply and do not use write_file. After the "
-                "tool succeeds, answer with one or two sentences saying what you "
-                "made; the user gets a download link automatically."
-            )
-            yield {"type": "notice", "info": True,
-                   "message": f"writing a {name} for you"}
+            if editing_document:
+                # The rules block in the task brief already spells out the path
+                # and "keep what was not asked to change"; repeating it here
+                # would put two sets of instructions in front of a 3B model.
+                target = task.document_path or f"the {name}"
+                document_directive = (
+                    f"This is an edit to the existing {name} ({target}). Apply the "
+                    "user's request to the document source shown above and call "
+                    f"create_document again with path \"{target}\" and the complete "
+                    "revised Markdown. Do not answer in prose instead."
+                )
+                yield {"type": "notice", "info": True,
+                       "message": f"updating {target}"}
+            else:
+                document_directive = (
+                    f"The user is asking you to PRODUCE A FILE: a {name}. Call the "
+                    f"create_document tool with a path ending in {doc_format} and the "
+                    "whole document in its content argument, written as Markdown "
+                    "(# headings, **bold**, - bullets, | tables |). Do not write the "
+                    "document into your reply and do not use write_file. After the "
+                    "tool succeeds, answer with one or two sentences saying what you "
+                    "made; the user gets a download link automatically."
+                )
+                yield {"type": "notice", "info": True,
+                       "message": f"writing a {name} for you"}
 
         # Classify the kind of work once, so the cluster router can steer heavy
         # reasoning/code generation toward the more capable (Studio) node while
@@ -1984,7 +2071,9 @@ class Agent:
             if task.artifact_version:
                 yield {"type": "notice", "info": True,
                        "message": (f"continuing the active task: "
-                                   f"{task.language or 'code'}"
+                                   f"{describe_document(task.document_format)
+                                      if task.is_document_task()
+                                      else (task.language or 'code')}"
                                    + (f" — {task.artifact_name}"
                                       if task.artifact_name else "")
                                    + f" (v{task.artifact_version})")}
@@ -3125,6 +3214,15 @@ class Agent:
                 # a revision step polishing the wording of a refusal and the
                 # drift check has no opinion about one.
                 if answer:
+                    # The revision pass came back asking for the draft instead of
+                    # improving it. Returning that discards a finished answer in
+                    # favour of a question the user cannot act on, and the draft
+                    # is still right here.
+                    if draft and is_missing_draft_reply(answer):
+                        log(f"step {step}: the revision pass asked for the draft "
+                            f"instead of improving it ({answer[:60]!r}); keeping "
+                            "the draft.", logging.WARNING)
+                        answer = draft
                     switched = False
                     async for ev in switch_to_agent(answer, step):
                         if "__switched__" in ev:
@@ -3275,6 +3373,17 @@ class Agent:
             result_for_model, was_summarised = await self.compress_tool_result(name, result, budget)
 
             trace.append({"name": name, "args": args, "result": result[:1000], "error": error})
+            # The document's SOURCE is only ever here, in the call the model just
+            # made: the rendered .pdf is bytes it can never read back. Recording
+            # it is what makes the next turn's "now make it look like X" an edit
+            # of this document rather than a fresh guess at what it said.
+            if name == "create_document" and not error and self.config.task_state_enabled:
+                task.record_document(str(args.get("path") or ""),
+                                     Path(str(args.get("path") or "")).suffix.lower(),
+                                     str(args.get("content") or ""),
+                                     describe_document(
+                                         Path(str(args.get("path") or "")).suffix.lower()))
+                self.save_task(conversation_id, task)
             yield {"type": "tool_result", "name": name, "result": result, "error": error,
                    "step": step, "context_chars": len(result_for_model),
                    "summarised": was_summarised}
